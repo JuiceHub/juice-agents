@@ -1,24 +1,22 @@
-# Core 测试
+# Core tests
 
-`tests/core/` 按 SDK 的功能域组织回归测试；端到端适配层、示例和包构建测试分别位于
-`tests/adapters/`、`tests/examples/` 和 `tests/sdk/`。
+> [简体中文](README.zh-CN.md)
 
-| 目录 | 主要验证内容 |
+`tests/core/` organizes regression tests by SDK domain. End-to-end adapter, example, and package-build tests live in `tests/adapters/`, `tests/examples/`, and `tests/sdk/`.
+
+| Directory | Main coverage |
 | --- | --- |
-| `agent/` | Agent 会话、模型协议与内置工具 |
-| `registry/` | 声明解析、校验与运行时边界 |
-| `runner/` | 请求、恢复、后台任务与多 Agent 调度 |
-| `graph/` | StateGraph 流程和 checkpoint |
-| `team/` | Team 任务与成员协作 |
+| `agent/` | Agent sessions, model protocols, and built-in tools |
+| `registry/` | Declaration resolution, validation, and runtime boundaries |
+| `runner/` | Requests, recovery, background tasks, and multi-Agent scheduling |
+| `graph/` | StateGraph flows and checkpoints |
+| `team/` | Team tasks and member collaboration |
 
-从仓库根目录运行：
+Run from the repository root:
 
 ```bash
 conda activate juice-agents
 python -m pytest tests/core -q
 ```
 
-测试应调用被测行为，使用临时工作区并在结束时清理文件。只有目录结构、依赖方向
-等无法通过运行时行为验证的约束才使用源码或目录检查；这类检查必须先断言确实扫到
-目标文件。不要用 `skip` 掩盖回归，也不要保留一次性迁移测试。新增 `test_*.py`
-的目录需含 `__init__.py`，避免 `unittest discover` 漏收。
+Tests should exercise behavior, use temporary workspaces, and clean up files. Use source or directory checks only for contracts that cannot be verified at runtime, such as layout and dependency direction; first assert that the target files were found. Do not hide regressions with `skip` or keep one-off migration tests. A directory containing new `test_*.py` files must include `__init__.py` so `unittest discover` also collects it.

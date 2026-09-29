@@ -1,5 +1,7 @@
 # Prebuilt factory
 
+> [简体中文](README.zh-CN.md)
+
 `prebuilt.factory` is a static composition helper. It seeds missing built-in
 Agent declarations, selects a declarative `RunnerConfig`, then calls
 `Runner.create()` or `Runner.resume()`.
@@ -25,8 +27,8 @@ runner = create_prebuilt_runner(runner_config="team", base_dir=".")
 Existing workspace declarations win over built-in defaults; seeding is
 missing-only.
 
-## 开发约束
+## Development conventions
 
-- `build_prebuilt_agent_declarations()` 只返回内存中的默认声明；仅 `seed_prebuilt_declarations()` 在 Runner 创建边界写入缺失 YAML。
-- 工厂只接受 `RunnerConfig` 与 binding 声明，不接收活 Agent 或协调器回调；创建后 `AgentManager.live_agents` 应仍为空。
-- 模式切换在 Runner 空闲时应用不可变目标配置，恢复使用当前 schema 的 `Runner.resume()`。
+- `build_prebuilt_agent_declarations()` returns detached in-memory defaults only; only `seed_prebuilt_declarations()` writes missing YAML at the Runner creation boundary.
+- The factory accepts `RunnerConfig` and binding declarations only. It does not accept live Agents or coordinator callbacks; `AgentManager.live_agents` remains empty after creation.
+- Apply mode changes at an idle Runner boundary using an immutable target configuration, and recover with the current-schema `Runner.resume()`.

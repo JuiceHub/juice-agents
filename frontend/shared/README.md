@@ -1,23 +1,24 @@
 # Frontend shared
 
-`frontend/shared` 是 CLI 与 Web 共用的 TypeScript 包，提供网关协议类型、会话消息状态和展示模型。
-安装步骤见[项目 README](../../README.md)。
+> [简体中文](README.zh-CN.md)
 
-| 导出 | 用途 |
+`frontend/shared` is the TypeScript package shared by the CLI and Web UI. It provides gateway protocol types, conversation state, and presentation models. See the [project README](../../README.md) for installation.
+
+| Export | Purpose |
 | --- | --- |
-| `@juice-agents/shared/gateway/types` | 网关请求、响应和事件类型 |
-| `@juice-agents/shared/conversation` | 流式消息与会话状态 |
-| `@juice-agents/shared/presenter/stream` | 将流事件转换成消息块 |
-| `@juice-agents/shared/presenter/command` | 将命令结果转换成展示内容 |
+| `@juice-agents/shared/gateway/types` | Gateway request, response, and event types |
+| `@juice-agents/shared/conversation` | Streaming messages and conversation state |
+| `@juice-agents/shared/presenter/stream` | Convert stream events into message blocks |
+| `@juice-agents/shared/presenter/command` | Convert command results into presentation content |
 
-## 开发约定
+## Development conventions
 
-- 网关类型与 Python 网关序列化结果保持一致；CLI 和 Web 不分别维护协议副本。
-- presenter 只根据输入生成展示模型，不修改 Runner 或任务状态。Team 更新从 `team_event.snapshot` 读取任务、成员和完成进度；`eligible_members` 表示可执行范围，`claimed_by` 表示实际领取人。
-- 会话状态和取消行为由 `conversation` 统一处理；界面组件只负责显示和交互。
-- 新增跨界面逻辑时先判断能否放入此包，并为纯逻辑添加有意义的回归测试。
+- Keep gateway types aligned with Python gateway serialization; CLI and Web must not maintain separate protocol copies.
+- Presenters generate view models from input only and never mutate Runner or task state. Read Team updates from `team_event.snapshot`; `eligible_members` is the execution scope and `claimed_by` is the actual claimant.
+- `conversation` owns message state and cancellation behavior; UI components only render and interact.
+- Put new cross-interface logic here when appropriate, and add meaningful regression tests for pure logic.
 
-在仓库根目录验证：
+Verify from the repository root:
 
 ```bash
 conda activate juice-agents

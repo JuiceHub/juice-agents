@@ -1,49 +1,49 @@
-# 终端界面（CLI）
+# Terminal interface (CLI)
 
-`./juice` 在终端中运行 Agent，支持会话恢复、工具审批、任务委派和 Git worktree。
-安装与启动步骤见[项目 README](../../README.md)。输入 `/help` 可查看当前版本的完整命令。
+> [简体中文](README.zh-CN.md)
 
-## 常用操作
+`./juice` runs an Agent in a terminal with session recovery, tool approvals, task delegation, and Git worktrees. See the [project README](../../README.md) for installation and startup. Enter `/help` for the complete command list.
 
-| 操作 | 作用 |
+## Common operations
+
+| Operation | Effect |
 | --- | --- |
-| `Enter` / `Alt+Enter` | 提交输入 / 在输入框内换行；运行中的新输入按顺序排队 |
-| `PgUp` / `PgDn` | 浏览当前会话记录 |
-| `Esc` / `Ctrl+C` | 中断当前回合 |
-| `Ctrl+S` / `Ctrl+T` | 查看子 Agent / 后台任务 |
-| `/resume` | 恢复已有会话 |
-| `/mode` / `/permissions` | 切换运行模式 / 审批策略 |
-| `/model` / `/config` | 选择模型 / 编辑工作区配置 |
-| `/agents` / `/teams` | 查看可用 Agent / Team |
-| `/worktree` | 查看或切换当前 Git worktree |
+| `Enter` / `Alt+Enter` | Submit input / insert a newline; input during a run is queued |
+| `PgUp` / `PgDn` | Browse the current session |
+| `Esc` / `Ctrl+C` | Interrupt the current turn |
+| `Ctrl+S` / `Ctrl+T` | View child Agents / background tasks |
+| `/resume` | Resume an existing session |
+| `/mode` / `/permissions` | Change the execution mode / approval policy |
+| `/model` / `/config` | Select a model / edit workspace configuration |
+| `/agents` / `/teams` | View available Agents / Teams |
+| `/worktree` | View or switch the current Git worktree |
 
-输入 `/` 可补全命令及参数。`./juice --worktree [name]` 会在独立 worktree 中启动任务；
-退出时默认保留未合并的改动。
+Type `/` for command and argument completion. `./juice --worktree [name]` starts a task in an isolated worktree; unmerged changes are kept when the process exits.
 
-## 代码入口与边界
+## Code entry points and boundaries
 
-| 位置 | 职责 |
+| Location | Responsibility |
 | --- | --- |
-| `src/entry.tsx`、`src/app.tsx` | 启动、会话状态、界面组装 |
-| `src/gateway/client.ts` | stdio 网关通信与请求路由 |
-| `src/components/` | 输入框、选择器和任务面板 |
-| `src/ink-ext/` | 备用屏和行级滚动；详见[模块 README](src/ink-ext/README.md) |
-| `src/lib/` | 命令调度、文本布局和展示模型 |
-| `../shared/` | CLI/Web 共用的协议、会话状态和展示逻辑 |
+| `src/entry.tsx`, `src/app.tsx` | Startup, session state, and UI composition |
+| `src/gateway/client.ts` | stdio gateway communication and request routing |
+| `src/components/` | Input, selectors, and task panels |
+| `src/ink-ext/` | Alternate screen and row scrolling; see the [module README](src/ink-ext/README.md) |
+| `src/lib/` | Command dispatch, text layout, and view models |
+| `../shared/` | Protocol, session state, and presentation shared by CLI and Web |
 
-### 开发约定
+### Development conventions
 
-- 会话消息生命周期复用 `@juice-agents/shared/conversation`；网关协议和 stream/command 展示逻辑复用 shared 包。CLI 只管理终端交互。
-- 所有 transcript 和输入区域由 Ink 在备用屏中渲染。消息先转换成视觉行，再用 `VirtualScrollList` 截取可见行；总高度由 `computeOverlayBudget` 控制，避免触发 Ink 的清屏路径。不要向 stdout 另写一套消息渲染。
-- 选择器、审批和任务面板使用独占输入焦点。面板打开时隐藏输入框；`ask_request` 只通过 `answer_ask` 回复，接受成功后再关闭提问。
-- 普通 `Enter` 提交输入，只有 `Alt/Meta+Enter` 换行。正在运行时普通消息按 FIFO 排队；取消会清除当前提问和等待状态，不应阻塞后续消息。
-- `/mode` 改变当前 Runner 的 Agent 模式，`/permissions` 改变审批策略；`/agent-type` 只修改以后创建的默认 Agent。工作区配置写入 `.juice/config.yaml` 的 `runtime` 节。
-- `--worktree` 和 `/worktree` 通过网关操作 worktree，不在 CLI 中直接调用 Git。会话和子 Agent 的输入、取消分别使用对应的网关请求。
-- 新的视觉状态使用 `src/components/design-system/` 的主题 token 和组件；`JUICE_NO_ANIMATION=1` 时动画组件提供静态显示。
+- Reuse `@juice-agents/shared/conversation` for message lifecycle, and the shared package for gateway protocol and stream/command presentation. The CLI owns terminal interaction only.
+- Ink renders the transcript and input area in the alternate screen. Convert messages to visual rows, then use `VirtualScrollList` for the visible range; `computeOverlayBudget` controls total height to avoid Ink's clear-screen path. Do not add a second message renderer on stdout.
+- Selectors, approvals, and task panels own input focus. Hide the input while a panel is open; answer `ask_request` only through `answer_ask`, then close it after acceptance.
+- Plain `Enter` submits; only `Alt/Meta+Enter` inserts a newline. Queue ordinary messages FIFO while a run is active. Cancellation clears the current question and waiting state without blocking later messages.
+- `/mode` changes the current Runner Agent mode, `/permissions` changes approval policy, and `/agent-type` changes only the default for future Agents. Workspace configuration is stored in the `runtime` section of `.juice/config.yaml`.
+- `--worktree` and `/worktree` operate through the gateway rather than calling Git from the CLI. Use the corresponding gateway requests for session and child-Agent input and cancellation.
+- Use theme tokens and components from `src/components/design-system/` for new visual state. Animation components must provide a static display when `JUICE_NO_ANIMATION=1`.
 
-## 验证
+## Verification
 
-在仓库根目录运行：
+Run from the repository root:
 
 ```bash
 conda activate juice-agents
@@ -52,4 +52,4 @@ npm test --workspace juice-cli
 npm run typecheck --workspace juice-cli
 ```
 
-涉及网关请求或会话语义时，还需运行相关的 `tests/adapters/stdio_gateway/` 测试。
+When changing gateway requests or session semantics, also run the relevant tests under `tests/adapters/stdio_gateway/`.

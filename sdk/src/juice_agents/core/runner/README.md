@@ -1,7 +1,10 @@
 # Runner
 
-`Runner` 是单个对话请求的统一入口。它不保存 Agent、Tool、Graph 或后台任务的 live
-实例；这些可变对象分别由 Manager 持有。静态声明只由 Registry 解析与 fresh 构造。
+> [简体中文](README.zh-CN.md)
+
+`Runner` is the unified entry point for one conversation request. It does not retain live Agent, Tool, Graph, or background-task instances; Managers own those mutable objects. Registry resolves and freshly constructs static declarations.
+
+> [Chinese](README.zh-CN.md)
 
 ```text
 Agent / Tool / Graph declarations
@@ -108,10 +111,10 @@ When changing this boundary, add architectural tests that prove Registry has no
 live state, Manager owns lifecycle, and Runner does not directly instantiate or
 execute domain objects.
 
-## 开发约束
+## Development conventions
 
-- `RunnerConfig` 是可序列化数据；内置及自定义 mode 共用 `stream()/run()/stop()`，不注册动态 factory、callback 或独立循环。Runner 可保存请求锁、取消状态和监听器，不能持有活 Agent/Tool/Graph/Task。
-- mode 切换先验证目标，且只在 root、后台任务和 Graph 都空闲时应用；保留 Runner ID 与快照，忙碌时拒绝切换。未完成 Team 工作阻止切换。旧 manifest schema 明确报错，不自动迁移。
-- Team 任务状态先保存再发事件；成员轮次由共享 `AsyncTaskManager` 调度，session 由 `AgentManager` checkpoint；收件消息 ID 在接收 step 保存后确认。请求流在 `round_end` 前等待活跃成员调用并送出 `team_update`。
-- `AgentManager.acquire()` 依次加载快照、Registry fresh 构造、恢复 session、绑定 context、checkpoint。`stop()` 协作取消，`close()` 释放资源；终态与恢复日志包含 Runner、Agent/任务/Graph ID 和原因。持久化只含数据，不序列化活 Python 对象。
-- 边界、生命周期与布局测试放 `tests/core/runner/`，并覆盖内置 mode 共用执行链、并发/取消/恢复及旧 schema 拒绝。
+- `RunnerConfig` is serializable data. Built-in and custom modes share `stream()`, `run()`, and `stop()`; do not register a dynamic factory, callback, or separate loop. Runner may keep request locks, cancellation state, and listeners, but never live Agent, Tool, Graph, or Task objects.
+- Validate a mode target before applying it, and change modes only when root, background tasks, and Graphs are idle. Preserve the Runner ID and snapshot; reject a busy change and any unfinished Team work. Reject old manifest schemas explicitly instead of migrating them.
+- Persist Team task state before emitting events. Schedule member turns through the shared `AsyncTaskManager`, checkpoint sessions through `AgentManager`, and acknowledge inbox IDs only after the receiving step is saved. The request stream waits for active member calls and emits `team_update` before `round_end`.
+- `AgentManager.acquire()` loads a snapshot, constructs a fresh Registry object, restores its session, binds context, and checkpoints. `stop()` cancels cooperatively; `close()` releases resources. Terminal and recovery logs include Runner, Agent/task/Graph IDs and the reason. Persistence contains data only, never live Python objects.
+- Put boundary, lifecycle, and layout tests in `tests/core/runner/`, covering the shared execution chain, concurrency, cancellation, recovery, and old-schema rejection across built-in modes.

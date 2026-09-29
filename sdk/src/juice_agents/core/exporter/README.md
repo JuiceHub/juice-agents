@@ -1,31 +1,31 @@
 # Trajectory Exporter
 
-把 juice-agents 持久化的运行轨迹导出为可直接用于 post-training 的数据集。
+> [简体中文](README.zh-CN.md)
 
-## 核心能力
+Export persisted `juice-agents` run trajectories as datasets that can be used for post-training.
 
-- **OpenAI Chat Completions 格式**：JSONL，每行一条样本，user / assistant 严格交替，适用于所有支持 chat 模板的模型
-- **三种导出粒度**：单个 runner、多个 runner、整个 workspace
-- **可控的内容保留**：通过 `ExportConfig` 控制保留哪些会话、保留哪些内容
-- **流式写入**：大数据集不会撑爆内存
+## Capabilities
 
-## 数据来源
+- **OpenAI Chat Completions format**: JSONL with strict user/assistant alternation, suitable for models using chat templates.
+- **Three export scopes**: one Runner, multiple Runners, or a whole workspace.
+- **Configurable retention**: `ExportConfig` controls which sessions and content are retained.
+- **Streaming writes**: large datasets do not need to fit in memory.
 
-读取 workspace 下 `.juice/runners/<runner_id>/agents/<agent_id>/session.json`。快照由
-`AgentManager` 持久化，导出器通过 `JsonAgentSnapshotStore` 与 sessions 反序列化层读取，
-不重复实现磁盘格式解析。
+## Data source
 
-## 输出格式
+The exporter reads `.juice/runners/<runner_id>/agents/<agent_id>/session.json` in the workspace. `AgentManager` persists snapshots; the exporter reads them through `JsonAgentSnapshotStore` and session deserialization instead of reimplementing the disk format.
 
-每行一个 JSON 对象：
+## Output format
+
+Each line is a JSON object:
 
 ```json
 {
   "messages": [
-    {"role": "system",    "content": "<system prompt>"},
-    {"role": "user",      "content": "<task>用户任务</task>"},
-    {"role": "assistant", "content": "<thought>...</thought>\n<actions>[...]</actions>"},
-    {"role": "user",      "content": "<observations>\n<result_of_action_0>...</result_of_action_0>\n</observations>"}
+    {"role": "system", "content": "<system prompt>"},
+    {"role": "user", "content": "<task>user task</task>"},
+    {"role": "assistant", "content": "<thought>...</thought>\\n<actions>[...]</actions>"},
+    {"role": "user", "content": "<observations>...</observations>"}
   ],
   "metadata": {
     "runner_id": "11a94b3a",
@@ -39,9 +39,7 @@
 }
 ```
 
-会话 → 消息映射：
-
-| 来源 | 消息 |
+| Source | Message |
 | --- | --- |
 | `AgentSession.system_prompt` | `{"role": "system"}` |
 | `TaskStep` | `{"role": "user", "content": "<task>...</task>"}` |
@@ -49,90 +47,76 @@
 | `ActionStep.observations` | `{"role": "user", "content": "<observations>...</observations>"}` |
 | `SummaryStep` | `{"role": "user"}` |
 
-转换后会自动合并相邻同 role 消息，保证 user/assistant 严格交替（post-training 框架硬性要求）。
+Adjacent messages with the same role are merged after conversion to preserve the strict user/assistant alternation required by post-training frameworks.
 
-## 快速开始
+## Quick start
 
 ```python
 from juice_agents.core.exporter import TrajectoryExporter
 
 exporter = TrajectoryExporter(base_dir=".")
-
-# 1) 导出单个 runner
 exporter.export_runner("11a94b3a", "out/r1.jsonl")
-
-# 2) 批量导出
 exporter.export_multiple_runners(["r1", "r2"], "out/batch.jsonl")
-
-# 3) 导出整个 workspace
 result = exporter.export_workspace("out/all.jsonl")
 print(result.num_samples, result.num_messages)
 ```
 
-## 配置项
+## Configuration
 
-`ExportConfig`（或等价的 dict）控制三类决策：
+`ExportConfig` or an equivalent dictionary controls session filters, content inclusion, and cleanup:
 
 ```python
 from juice_agents.core.exporter import ExportConfig, TrajectoryExporter
 
 config = ExportConfig(
-    # —— 会话级过滤 ——
-    success_only=True,        # 只保留 terminal 且无 error 的会话
-    min_action_steps=2,       # 至少有 2 个 ActionStep
-    max_action_steps=20,      # 最多 20 个 ActionStep
-
-    # —— 内容级开关 ——
+    success_only=True,
+    min_action_steps=2,
+    max_action_steps=20,
     include_system_prompt=True,
     include_observations=True,
-    include_reasoning=False,  # 是否前置 <think> 块
+    include_reasoning=False,
     include_summary_steps=True,
-
-    # —— 清理选项 ——
-    truncate_observations=8000,  # 单条观测最大字符数
-    drop_error_steps=False,      # 丢弃带 error 的 ActionStep
+    truncate_observations=8000,
+    drop_error_steps=False,
 )
 
 TrajectoryExporter(".").export_workspace("out.jsonl", config=config)
-
-# 也支持 dict（未知键会被忽略）
 TrajectoryExporter(".").export_workspace(
-    "out.jsonl",
-    config={"success_only": True, "min_action_steps": 2},
+    "out.jsonl", config={"success_only": True, "min_action_steps": 2}
 )
 ```
 
-默认是「完整保留」：所有会话 + 所有内容都导出，调用方按需收紧。
+The default retains every session and all content. Callers can narrow it as needed.
 
-## 返回值
+## Return value
 
 ```python
 result = exporter.export_workspace("out.jsonl", config={"success_only": True})
 
-result.output_path           # 实际写出的文件路径
-result.num_samples           # 写出的样本数
-result.num_messages          # 所有样本的消息总数
-result.num_sessions_scanned  # 扫描过的会话数（含被过滤的）
-result.num_sessions_skipped  # 被会话级过滤丢弃的会话数
-result.runner_ids            # 实际贡献样本的 runner id 列表
-result.as_dict()             # 转 dict 便于打印 / 序列化
+result.output_path           # output path
+result.num_samples           # number of samples written
+result.num_messages         # total messages across samples
+result.num_sessions_scanned # sessions scanned, including filtered ones
+result.num_sessions_skipped # sessions dropped by session-level filters
+result.runner_ids           # Runner IDs that contributed samples
+result.as_dict()             # dictionary form for printing or serialization
 ```
 
-## 注意事项
+## Notes
 
-- 图片观测无法进入纯文本序列，降级为 `[image: <description>]` 占位
-- 没有 `ActionStep` 的会话或合并后无对话内容（只有 system）的样本会被自动跳过
-- 输出文件父目录会自动创建；空导出也会生成空文件，便于流水线统一处理
-- **隐私提醒**：导出数据不会自动脱敏。导出后请人工审视 `system_prompt` / `observations` 是否包含敏感信息（凭据、绝对路径、用户数据）再用于训练
+- Image observations are represented by text placeholders such as `[image: <description>]`.
+- Sessions with no `ActionStep`, or no conversation content after merging (system-only), are skipped.
+- The output parent directory is created automatically. An empty export creates an empty file for consistent pipelines.
+- **Privacy**: exported data is not automatically redacted. Review `system_prompt` and observations for credentials, absolute paths, and user data before training.
 
-## 开发约束
+## Development conventions
 
-| 文件 | 职责 |
+| File | Responsibility |
 | --- | --- |
-| `filters.py` | 不可变 `ExportConfig` 与无副作用过滤判断 |
-| `formats.py` | `AgentSession` 到对话样本的纯转换 |
-| `exporters.py` | 快照读取、过滤和流式 JSONL 写出 |
+| `filters.py` | Immutable `ExportConfig` and side-effect-free filtering |
+| `formats.py` | Pure conversion from `AgentSession` to conversation samples |
+| `exporters.py` | Snapshot reads, filtering, and streaming JSONL writes |
 
-- 读取 Runner manifest 与 `JsonAgentSnapshotStore` 快照，再由 session 反序列化层恢复数据；不重新解析或复制旧磁盘格式。损坏的 manifest/快照记录 warning 并跳过。
-- 保持消息转换后 user/assistant 交替。新 step 类型必须覆盖消息进出；默认过滤配置保持完整保留语义。图片只输出文本占位，`tool_calls` 默认保留在协议文本里。
-- 顺序写入每条样本，不缓存整个数据集。新增格式时在 `formats.py` 平行实现并由 `exporters.py` 分发；测试放 `tests/core/exporter/`，fixture 使用生产持久化 API。
+- Read Runner manifests and `JsonAgentSnapshotStore` snapshots through session deserialization. Do not reparse or copy older disk formats. Log a warning and skip damaged manifest/snapshot records.
+- Preserve user/assistant alternation after conversion. Cover new step types in both input and output paths; the default filter retains all content. Images become text placeholders, and `tool_calls` remain in protocol text by default.
+- Write one sample at a time; do not cache the dataset. Add formats in parallel in `formats.py` and dispatch them from `exporters.py`. Put tests in `tests/core/exporter/` and build fixtures through production persistence APIs.

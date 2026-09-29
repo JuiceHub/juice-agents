@@ -1,19 +1,23 @@
-# Models 模块说明
+# Models
 
-`sdk/src/juice_agents/core/models/` 是 Juice 的统一模型层，负责 provider 适配和模型级组合策略。
+> [简体中文](README.zh-CN.md)
 
-## 能力
+`sdk/src/juice_agents/core/models/` is Juice's unified model layer for provider adapters and model-composition strategies.
 
-| 模型 | 用途 |
+> [Chinese](README.zh-CN.md)
+
+## Models
+
+| Model | Use |
 | --- | --- |
-| `DoubaoModel` | 火山 Ark / Doubao Chat Completions |
-| `OpenAIModel` | OpenAI SDK 兼容 Chat Completions |
+| `DoubaoModel` | Volcengine Ark / Doubao Chat Completions |
+| `OpenAIModel` | OpenAI SDK-compatible Chat Completions |
 | `AnthropicModel` | Anthropic Messages API |
-| `CompositeModel` | 聚合多个逻辑模型输出 |
+| `CompositeModel` | Aggregate outputs from multiple logical models |
 
-## 返回契约
+## Return contract
 
-所有内置模型的 `generate()` 返回 `{"role", "content", "reasoning_content", "usage"}`。`usage` 只记录 provider/模型引擎原始返回的 token 统计，不做本地估算；缺失时为 `None`。
+Every built-in model's `generate()` returns `{"role", "content", "reasoning_content", "usage"}`. `usage` records token counts returned by the provider/model engine without local estimation; it is `None` when the provider omits statistics.
 
 ```python
 {
@@ -27,17 +31,17 @@
 }
 ```
 
-`CompositeModel` 的 `usage` 会汇总所有成功子调用，并在 `calls` 中保留每次调用的 `phase/name/usage` 明细。
+`CompositeModel.usage` aggregates successful subcalls and keeps each call's `phase`, `name`, and `usage` details in `calls`.
 
-`CompositeModel` 支持三种策略：
+`CompositeModel` supports three strategies:
 
-| strategy | 行为 |
+| Strategy | Behavior |
 | --- | --- |
-| `judge_select` | 候选模型生成回复，裁判模型返回 JSON winner，选择最佳候选 |
-| `synthesize` | 候选模型生成回复，最终回复模型综合成一个答案 |
-| `iterative_refine` | 生成器先答，评审模型逐个验收；拒绝时带 critique 修正 |
+| `judge_select` | Candidate models answer; a judge returns a JSON winner and the best candidate is selected |
+| `synthesize` | Candidate models answer; a final model synthesizes one response |
+| `iterative_refine` | A generator answers, a reviewer checks each response, and rejected responses are revised with critique |
 
-## 配置示例
+## Configuration example
 
 ```yaml
 models:
@@ -54,11 +58,11 @@ models:
     fail_fast: false
 ```
 
-`backend: composite` 只引用 `models.*` 中已有逻辑模型，不直接配置密钥。
+`backend: composite` references existing logical models under `models.*` and does not configure credentials directly.
 
-## 开发约束
+## Development conventions
 
-- `generate(messages, stop_sequence=None, *, cancel_event=None)` 的 provider 实现集中在模型层。`BaseChatModel` 负责校验、调用、解析、重试和取消；provider 子类只处理各自 API 边界。
-- `reasoning_content` 与 `content` 分开返回。`normalize_token_usage()` 只归一化引擎实际返回的统计并保留 `provider_usage`；复合模型汇总成功子调用，失败且无结果的调用不计入。
-- 复合模型不读 YAML 或环境变量，解析与递归引用检查交给 model catalog。裁判和评审结果经 `parse_model_json` 解析；候选失败可降级，裁判、综合、评审或修正失败则抛错。
-- 固定策略流程放 system message，原始对话、候选回答和 critique 等动态数据放 user message。
+- Provider implementations of `generate(messages, stop_sequence=None, *, cancel_event=None)` stay in the model layer. `BaseChatModel` handles validation, calls, parsing, retries, and cancellation; provider subclasses handle only their API boundary.
+- Return `reasoning_content` separately from `content`. `normalize_token_usage()` normalizes engine statistics and preserves `provider_usage`; the composite model counts successful subcalls only.
+- Composite models do not read YAML or environment variables. Model catalog handles parsing and recursive-reference checks. Judge and reviewer results go through `parse_model_json`; candidate failures may degrade, while judge, synthesis, review, or revision failures raise.
+- Put fixed strategy instructions in the system message and dynamic conversations, candidate answers, and critiques in the user message.

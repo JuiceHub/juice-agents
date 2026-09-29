@@ -1,5 +1,7 @@
 # Registry
 
+> [简体中文](README.zh-CN.md)
+
 Registries own static definitions only. They are the boundary between workspace
 declarations and fresh domain construction; runtime ownership starts only when
 a Manager receives the new object.
@@ -49,9 +51,9 @@ In Team mode, root's read-only `agents_list` and `agent_view` additionally
 show eligible shared declarations so an empty Team can select its first member.
 That inspection scope does not expand Team dispatch or Agent write authority.
 
-## 开发约束
+## Development conventions
 
-- Registry 只做 `resolve()`、`validate()`、`instantiate()`。前两者不导入可执行 Graph/Plugin 代码或创建 session；后者每次返回新对象，不缓存或执行。
-- 声明写入需原子完成。Agent、Team 的静态定义与 Runner/Manager 的 session、任务、工具记录分开保存；不做旧布局的隐式迁移。
-- `allowed_modes` 可省略表示全部模式，显式值为非空列表，允许自定义 mode 名称。Agent 可用性统一复用 `agents.availability.is_agent_available()`；`root` 只在 Runner 内存中存在，不能写入 YAML 或列入 `/agents`。
-- 删除被 Team 引用的共享 Agent，或移除它的 Team 可用性时，报告所有引用的 Team。测试放 `tests/core/registry/`，覆盖独立校验、fresh 构造和无 live 状态。
+- Registry only implements `resolve()`, `validate()`, and `instantiate()`. The first two must not import executable Graph/Plugin code or create sessions; the third returns a fresh object every time without caching or executing it.
+- Write declarations atomically. Keep static Agent and Team definitions separate from Runner/Manager sessions, tasks, and tool records; do not silently migrate the old layout.
+- An omitted `allowed_modes` allows every mode; an explicit value is a non-empty list and may contain custom mode names. Reuse `agents.availability.is_agent_available()` for availability. `root` exists only in Runner memory and must not be written to YAML or listed by `/agents`.
+- When deleting a shared Agent referenced by a Team, or removing its Team availability, report every referencing Team. Put tests in `tests/core/registry/` covering independent validation, fresh construction, and the absence of live state.

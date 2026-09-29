@@ -1,46 +1,48 @@
-# 业务示例（examples）
+# Examples
 
-四个示例使用真实模型演示完整业务流程。每个示例文件夹既是独立入口，也是固定工作区；配置、Runner 状态和模型产物保存在该文件夹的 `.juice/` 中。
+> [简体中文](README.zh-CN.md)
 
-| 场景 | 命令 | 结果 |
+The four examples use a real model to demonstrate complete workflows. Each example is an independent entry point and workspace; its configuration, Runner state, and model artifacts live under that example's `.juice/` directory.
+
+| Scenario | Command | Result |
 | --- | --- | --- |
-| 可追溯研究 | `python -m examples.agent_research` | 报告、sources、claims 和 Graph trace |
-| 能力演化 | `python -m examples.agent_evolution` | 创建并调用可复用 Tool 或 specialist |
-| 反馈运营 | `python -m examples.group_operations` | 反馈分类、优先级和行动建议 |
-| 团队交付 | `python -m examples.team_delivery` | Team task/inbox、代码产物和验证结果 |
+| Traceable research | `python -m examples.agent_research` | Report, sources, claims, and a Graph trace |
+| Capability evolution | `python -m examples.agent_evolution` | Reusable tools or specialists that are created and called |
+| Feedback operations | `python -m examples.group_operations` | Feedback classification, priority, and action suggestions |
+| Team delivery | `python -m examples.team_delivery` | Team tasks/inbox, code artifacts, and verification results |
 
-## 运行
+## Run an example
 
-先在仓库根目录进入环境，并为**要运行的示例**配置模型和 provider 密钥：
+From the repository root, enter the environment and configure a model and provider key for the example you want to run:
 
 ```bash
 conda activate juice-agents
 python -m pip install -e ./sdk
 mkdir -p examples/agent_research/.juice
 cp sdk/src/juice_agents/_assets/config.example.yaml examples/agent_research/.juice/config.yaml
-# 编辑 config.yaml，填写模型配置；按所用 provider 设置对应环境变量
-python -m examples.agent_research "比较客户门户的托管与自管部署方案"
+# Edit config.yaml and set the provider environment variables.
+python -m examples.agent_research "Compare hosted and self-managed deployment for a customer portal"
 ```
 
-其他示例的 `.juice/config.yaml` 要分别配置。示例不会清理或覆盖已有 Runner 状态。常用命令：
+Configure `.juice/config.yaml` separately for other examples. Commands commonly used are:
 
 ```bash
-python -m examples.agent_evolution "为支持升级创建 release note 检查能力"
-python -m examples.group_operations "审阅反馈并给出本周运营计划"
-python -m examples.team_delivery "实现 TASK.md 中的需求并完成验证"
-python -m examples.team_delivery --resume <runner_id> "继续未完成任务并报告验证结果"
+python -m examples.agent_evolution "Create release-note review capability for upgrade support"
+python -m examples.group_operations "Review feedback and propose this week's operations plan"
+python -m examples.team_delivery "Implement the requirement in TASK.md and verify it"
+python -m examples.team_delivery --resume <runner_id> "Continue the unfinished task and report verification"
 ```
 
-四个入口均支持 `--model`、`--model-effort`、`--agent-type react|codeact`、`--permission-mode default|accept` 和 `--resume RUNNER_ID`。不传 `--resume` 时新建 Runner；运行时输出 Runner ID 和事件进度，结束时释放 Runner。需要恢复时使用输出的 ID。示例只使用真实模型，没有离线模拟分支。
+All four entry points support `--model`, `--model-effort`, `--agent-type react|codeact`, `--permission-mode default|accept`, and `--resume RUNNER_ID`. Without `--resume`, a new Runner is created. The process prints the Runner ID and progress events, then releases the Runner. The examples use a real model and have no offline mock path.
 
-## 开发约定
+## Development conventions
 
 ```text
-动态业务输入 ──> 场景系统指令 ──> Juice(workspace=示例目录) ──> Runner stream
-                                                           └──> .juice/ 状态与产物
+Dynamic business input → scenario system instruction → Juice(workspace=example) → Runner stream
+                                                                            └── .juice/ state and artifacts
 ```
 
-- 用户提示词只放动态业务信息；流程、边界和验收标准写入场景系统指令。
-- 每个场景从 `__main__.py` 进入，使用公开的 `Juice(...).runners.create/resume`，并以自身目录作为 workspace；不增加 `--workspace` 选项。通用参数、事件渲染和 Runner 生命周期复用 `examples/_runtime.py`。
-- 场景使用专属工作区配置的真实模型；不加入 mock、假产物或静默降级。共享运行时在成功和异常路径都调用 `runner.stop()`。
-- 新增或修改场景时，在 `tests/examples/` 加功能测试，并更新本 README 与[项目 README](../README.md)。
+- User prompts contain only dynamic business information; workflow, boundaries, and acceptance criteria belong in the scenario system instruction.
+- Each scenario enters through `__main__.py`, uses the public `Juice(...).runners.create/resume` API, and uses its own directory as the workspace. Do not add a `--workspace` option. Reuse common arguments, event rendering, and Runner lifecycle code from `examples/_runtime.py`.
+- Scenarios use a real model configured in their dedicated workspace. Do not add mocks, fake artifacts, or silent fallbacks. Call `runner.stop()` on both success and error paths.
+- Add behavior tests under `tests/examples/` for new or changed scenarios, and update this README and the [project README](../README.md).

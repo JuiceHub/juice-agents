@@ -1,17 +1,21 @@
 # Memory
 
-`sdk/src/juice_agents/core/memory` 提供 workspace-local 持久记忆能力。它管理当前 workspace 下的 `.juice/memory/`，保存项目约定、用户偏好与跨会话仍有价值的事实。
+> [简体中文](README.zh-CN.md)
 
-## 能力边界
+`sdk/src/juice_agents/core/memory` provides workspace-local persistent memory. It manages `.juice/memory/` in the current workspace and stores project conventions, user preferences, and facts that remain useful across sessions.
 
-| 模块 | 职责 |
+> [Chinese](README.zh-CN.md)
+
+## Scope
+
+| Module | Responsibility |
 | --- | --- |
-| `MemoryStore` | `.juice/memory/` 初始化、`MEMORY.md` 与 `topics/*.md` 读写、路径隔离、dream metadata/lock |
-| `MemoryConfig` | 读 `memory.enabled`、`memory.auto_extract_enabled`、`memory.dream.*`，叠加 workspace `.juice/config.yaml` 覆盖值 |
-| `memory_tools` | `memory_read`、`memory_search`、`memory_write`、`memory_forget`、`memory_status` |
-| `prompt context` | 把 `MEMORY.md` 索引注入 root agent prompt |
+| `MemoryStore` | Initialize `.juice/memory/`, read and write `MEMORY.md` and `topics/*.md`, enforce path isolation, and manage dream metadata/locks |
+| `MemoryConfig` | Read `memory.enabled`, `memory.auto_extract_enabled`, and `memory.dream.*`, then merge workspace `.juice/config.yaml` overrides |
+| `memory_tools` | `memory_read`, `memory_search`, `memory_write`, `memory_forget`, and `memory_status` |
+| Prompt context | Inject the `MEMORY.md` index into the root Agent prompt |
 
-## 运行目录
+## Runtime layout
 
 ```text
 .juice/memory/
@@ -22,11 +26,11 @@
   .dream.last
 ```
 
-`MEMORY.md` 是索引文件，topic 文件存放具体事实。`memory_search` 默认只搜索 `topics/*.md`，避免索引行重复污染搜索结果。
+`MEMORY.md` is an index; topic files store concrete facts. `memory_search` searches only `topics/*.md` by default so index lines do not duplicate search results.
 
-## 配置
+## Configuration
 
-默认值来自 SDK 内的 `config.example.yaml`；workspace 覆盖值写入 `.juice/config.yaml`。配置命令只修改 workspace 覆盖文件。
+Defaults come from the SDK's `config.example.yaml`; workspace overrides are stored in `.juice/config.yaml`. Configuration commands modify only the workspace override file.
 
 ```yaml
 memory:
@@ -38,11 +42,11 @@ memory:
     min_sessions: 5
 ```
 
-- `memory.enabled=false` 关闭 memory prompt 注入与 memory tools
-- `memory.dream.*` 作为 workspace memory maintenance 的保留策略字段；当前不由 memory 模块启动后台循环
-- `memory.auto_extract_enabled` 是预留字段，不会自动把每轮对话写入长期记忆
+- `memory.enabled=false` disables memory prompt injection and memory tools.
+- `memory.dream.*` stores retention-policy fields for workspace memory maintenance; this module does not start a background loop.
+- `memory.auto_extract_enabled` is reserved and does not automatically write each conversation turn to long-term memory.
 
-## CLI 与 RPC
+## CLI and RPC
 
 ```text
 /memory
@@ -50,21 +54,19 @@ memory:
 /memory view [path]
 ```
 
-memory/dream 总开关由 `/config` 写 workspace YAML（CLI / Web 共享）。
+The `/config` command writes the memory/dream switches to workspace YAML shared by CLI and Web.
 
-CLI 调用 stdio gateway：`memory_status`、`memory_search`、`memory_view`、`set_memory_config`。
-真实读写、路径隔离和配置写入都在后端；后台 Agent 调度属于 Runner 组合的
-`AgentManager`/`AsyncTaskManager`，不由这个静态 memory 模块持有。
+The CLI calls the stdio gateway methods `memory_status`, `memory_search`, `memory_view`, and `set_memory_config`. The backend owns reads, writes, path isolation, and configuration. Background Agent scheduling belongs to the Runner's `AgentManager` and `AsyncTaskManager`, not this static memory module.
 
-## 使用建议
+## Usage guidance
 
-- 只记录跨会话仍有价值的事实：项目约定、稳定偏好、模块边界、已确认决策
-- 不记录密钥、临时错误、猜测、一次性上下文或未经用户确认的敏感信息
-- 修改 memory 必须通过 memory tools 或 `MemoryStore`，不要绕过路径隔离直接写 `.juice/memory/`
+- Record facts that remain useful across sessions: project conventions, stable preferences, module boundaries, and confirmed decisions.
+- Do not record secrets, transient errors, guesses, one-off context, or sensitive information without user confirmation.
+- Modify memory through memory tools or `MemoryStore`; do not bypass path isolation to write `.juice/memory/` directly.
 
-## 开发约束
+## Development conventions
 
-- `MemoryStore._resolve()` 是所有读写、删除操作的路径隔离边界；topic 存在 `topics/*.md`，`MEMORY.md` 只作索引及 prompt context 入口。
-- 默认配置与 workspace 覆盖合并后，配置写入需立即重装配当前 Runner，使 prompt 与工具可见性同步。`memory.enabled=false` 同时关闭两者。
-- Memory 模块只管理存储、配置与工具，不自行启动 daemon 或后台循环；`auto_extract_enabled` 目前只预留配置含义。
-- `.dream.lock` 记录 owner、pid、created_at，读取时兼容旧纯文本 owner，并允许回收过期锁。相关测试放在 `tests/core/memory/` 及 Agent memory 工具和 prompt 测试目录。
+- `MemoryStore._resolve()` is the path-isolation boundary for every read, write, and delete. Topics live in `topics/*.md`; `MEMORY.md` is only an index and prompt-context entry point.
+- After merging defaults with workspace overrides, configuration writes must immediately reassemble the current Runner so prompt and tool visibility stay in sync. `memory.enabled=false` disables both.
+- This module manages storage, configuration, and tools only. It does not start a daemon or background loop; `auto_extract_enabled` is currently reserved.
+- `.dream.lock` records `owner`, `pid`, and `created_at`, accepts legacy plain-text owners, and allows stale locks to be reclaimed. Put related tests in `tests/core/memory/` and the Agent memory-tool and prompt test directories.

@@ -1,5 +1,7 @@
 # Permissions
 
+> [简体中文](README.zh-CN.md)
+
 Permissions combine approval choice with the current RunnerConfig policy:
 
 | Source | Controls |
@@ -20,8 +22,8 @@ The managed Agent identity comes from
 `RunnerContext.agent_id → AgentManager`; editable declarations and tool
 constructor arguments are never authorization proof.
 
-## 开发约束
+## Development conventions
 
-- `policy.py` 集中处理允许、询问、拒绝。只读边界和 Agent 目标限制来自可序列化的 `RunnerConfig.ToolPolicy`，不按 mode 名称分支。
-- 共享配置写入验证 `AgentManager` 管理的调用者身份；一次性批准属于当前请求状态。
-- 在 `Tool.forward()` 前测试策略拒绝，并测试旧的已解析 action 无法绕过新组合的策略上下文。
+- `policy.py` centralizes allow, ask, and deny decisions. Read-only boundaries and Agent-target restrictions come from serializable `RunnerConfig.ToolPolicy`; do not branch on mode names.
+- Validate caller identity managed by `AgentManager` before writing shared configuration; one-time approvals belong to the current request state.
+- Test policy rejection before `Tool.forward()` and verify that an action resolved under an older policy cannot bypass a newly composed policy context.

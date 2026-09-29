@@ -1,28 +1,30 @@
 # juice-agents
 
-`juice-agents` 是一个 Python 智能体框架：用同一套运行时构建 ReAct / CodeAct Agent、
-调用工具、编排 Graph，并在进程重启后恢复会话和任务。
-当前为 `0.1.0` 开发版；持久化状态只支持当前 schema，升级前请备份工作区的 `.juice/`。
+> [简体中文](README.zh-CN.md)
 
-## 能做什么
+`juice-agents` is a lightweight Python agent framework. Build ReAct and CodeAct agents with one runtime, call tools, orchestrate graphs, and resume sessions and tasks after a process restart.
 
-| 能力 | 用途 |
+The project is currently a `0.1.0` development release. Persisted state uses the current schema only; back up `.juice/` before upgrading.
+
+## What it provides
+
+| Capability | Use |
 | --- | --- |
-| Agent 与工具 | 使用 Shell、Python、文件、Web、浏览器、图像、MCP 等工具处理任务 |
-| Graph | 通过分支、并行、循环和 checkpoint 编排多步流程 |
-| 多 Agent | 用 `agent`、`plan`、`group`、`team` 四种内置配置运行任务 |
-| 持久化 | 恢复会话、Graph、后台任务和 Team 任务板 |
-| 多种入口 | 直接调用 Python SDK，或使用终端 CLI 和本地 Web 工作台 |
+| Agents and tools | Shell, Python, file, web, browser, image, MCP, and other tools |
+| Graphs | Branching, parallel work, loops, and checkpoints |
+| Multiple agents | Built-in `agent`, `plan`, `group`, and `team` configurations |
+| Persistence | Resumable sessions, graphs, background tasks, and Team boards |
+| Entry points | Python SDK, terminal CLI, and local Web workbench |
 
 ```text
-用户请求 → Runner → Agent / Graph / Team → 工具
-              │                         │
-              └── 会话、任务、审批与审计 ──┘
+User request → Runner → Agent / Graph / Team → Tools
+                    │                         │
+                    └── sessions, tasks, approvals, and audit ──┘
 ```
 
-## 从源码安装
+## Install from source
 
-需要 Conda。以下命令在仓库根目录运行；环境文件会安装 Python 和 Node.js。
+Conda is required. Run these commands from the repository root; the environment file installs Python and Node.js.
 
 ```bash
 conda env create -f environment.yml
@@ -32,7 +34,7 @@ python -m pip install -r adapters/requirements.txt
 npm ci --prefix frontend
 ```
 
-使用在线模型前，复制配置模板并在 `.env` 或 shell 环境中填写所用服务的密钥：
+Before using an online model, copy the templates and add the credentials for your provider:
 
 ```bash
 mkdir -p .juice
@@ -40,10 +42,9 @@ cp sdk/src/juice_agents/_assets/config.example.yaml .juice/config.yaml
 cp .env.example .env
 ```
 
-`.env` 和 `.juice/` 不应提交。浏览器工具需要额外执行
-`python -m playwright install chromium`。
+Do not commit `.env` or `.juice/`. Browser tools also require `python -m playwright install chromium`.
 
-## 第一个 SDK 程序
+## First SDK program
 
 ```python
 from juice_agents import Juice
@@ -51,61 +52,52 @@ from juice_agents import Juice
 juice = Juice(workspace=".")
 runner = juice.runners.create(runner_config="agent", permission_mode="default")
 
-for event in runner.stream("分析这个项目的模块边界"):
+for event in runner.stream("Analyze this project's module boundaries"):
     print(event)
 
-# runner_id 可用于在之后的进程中恢复同一会话。
+# runner_id can restore the same session in a later process.
 runner = juice.runners.resume(runner_id=runner.runner_id)
-print(runner.run("把建议整理成实施顺序"))
+print(runner.run("Turn the recommendations into an implementation order"))
 ```
 
-四种内置配置共享 Runner 执行链路：
+All four built-in configurations share the Runner execution path:
 
-| 配置 | 适合的任务 |
+| Configuration | Best for |
 | --- | --- |
-| `agent` | 单个 Agent 直接执行，可按需委派 |
-| `plan` | 先调查和制定计划，再经审批执行 |
-| `group` | 由 root 调度一组专职 Agent |
-| `team` | 持久任务板、成员认领和消息协作 |
+| `agent` | One Agent executing directly, with optional delegation |
+| `plan` | Investigating and planning before approval and execution |
+| `group` | A root coordinating a group of specialist Agents |
+| `team` | A persistent task board, member claims, and messages |
 
-Team 由 root 创建或选择，再添加成员；已有成员定义可以在新的任务板中复用。
-更多配置与运行时规则见 [Runner](sdk/src/juice_agents/core/runner/README.md)
-和 [Team](sdk/src/juice_agents/core/team/README.md)。
+A Team is created or selected by root, then populated with members. Existing member definitions can be reused on a new board. See the [Runner](sdk/src/juice_agents/core/runner/README.md) and [Team](sdk/src/juice_agents/core/team/README.md) documentation for configuration and runtime rules.
 
-## CLI 与 Web
+## CLI and Web
 
 ```bash
-./juice       # 终端界面
-./juice-web   # 本地网页工作台
+./juice       # terminal interface
+./juice-web   # local Web workbench
 ```
 
-Web 网关仅供本机使用，未提供远程访问认证，入口拒绝非本机监听地址。
-Python SDK 可以独立构建；CLI、Web 和适配层目前通过仓库源码运行，
-尚未作为独立安装包发布。
+The Web gateway is local-only and has no remote authentication; it rejects non-loopback bind addresses. The Python SDK can be built independently. CLI, Web, and adapters currently run from the repository source and are not published as separate packages.
 
-## 开发约定
+## Development conventions
 
 ```text
-Registry（静态声明） → Manager（运行时对象与状态） ← Runner（请求调度）
+Registry (static declarations) → Manager (runtime objects and state) ← Runner (request scheduling)
 ```
 
-| 边界 | 约定 |
+| Boundary | Convention |
 | --- | --- |
-| Registry | 解析、校验并新建对象；不保存活动会话或执行状态 |
-| Manager | 管理 Agent、工具、Graph、后台任务的生命周期、持久化与取消 |
-| Runner | 组合 Manager 并调度请求；各运行配置共用同一执行路径 |
-| Adapter | 只映射 stdio / HTTP / WebSocket 协议；SDK 核心不导入 `adapters/` |
+| Registry | Resolve, validate, and instantiate objects; never keep active sessions or execution state |
+| Manager | Own Agent, tool, graph, and background-task lifecycles, persistence, and cancellation |
+| Runner | Compose Managers and schedule requests; every mode uses the same execution path |
+| Adapter | Map stdio / HTTP / WebSocket protocols; the SDK core must not import `adapters/` |
 
-Agent 通过 Runner 提供的执行上下文调用工具，使权限、取消和审计作用于同一请求。
-`RunnerConfig` 是运行配置的数据契约；自定义配置不能注入另一套执行循环。
-Team 的任务、成员消息和状态由 Manager 持久化，只有 root 可以创建任务和修改任务资格。
-Plan 的审批只由当前 Runner 的 root 发起；旧版 Runner manifest 不会自动迁移。
+Agents call tools through the Runner context so permissions, cancellation, and audit apply to one request. `RunnerConfig` is the execution contract; a custom configuration cannot install another execution loop. Team tasks, messages, and state are persisted by Managers, and only root can create tasks or change task eligibility. Plan approval is initiated by the current Runner root; old Runner manifests are not migrated automatically.
 
-运行状态写在调用方工作区的 `.juice/`；新增写入需保持原子性，并对取消、恢复和
-失败记录可关联 Runner ID 的日志。实现变更应复用现有接口，在 `tests/` 添加针对
-行为的测试，并更新受影响模块的 README。
+Runtime state is written to `.juice/` in the caller workspace. New writes must be atomic, and cancellation, recovery, and failures must produce logs that can be associated with the Runner ID. Reuse existing interfaces, add behavior tests under `tests/`, and update affected module READMEs.
 
-## 测试与参与
+## Testing and contributing
 
 ```bash
 conda activate juice-agents
@@ -113,19 +105,14 @@ python -m pytest tests -q
 cd frontend && npm test --workspaces --if-present
 ```
 
-提交改动时请附上相关测试、文档更新和验证结果。
-一般问题和功能建议可使用 GitHub Issues；安全问题请使用仓库的私密漏洞报告入口，
-不要发布公开 Issue。
+Changes should include relevant tests, documentation updates, and verification results. Use GitHub Issues for general questions and feature requests. Report security issues through the repository's private vulnerability channel instead of a public issue.
 
-项目按 [Apache License 2.0](LICENSE) 发布。参与贡献前请确认提交内容
-可按该许可证分发；第三方依赖仍遵循各自的许可证。
+The project is released under the [Apache License 2.0](LICENSE). Confirm that contributions can be distributed under that license; third-party dependencies retain their own licenses.
 
-发布前在干净环境执行 Python 与前端测试、类型检查和构建，检查 SDK wheel 的文件
-与元数据。公开仓库应从审查过的源码快照建立，不携带私有 Git 历史；再启用 CI、
-密钥扫描、依赖告警和私密漏洞报告。SDK wheel 不包含 CLI 和 Web。
+Before a release, run Python and frontend tests, type checks, and builds in a clean environment. Inspect SDK wheel files and metadata. Build public artifacts from a reviewed source snapshot without private Git history, then enable CI, secret scanning, dependency alerts, and private vulnerability reporting. SDK wheels do not contain CLI or Web code.
 
-## 模块说明
+## Module documentation
 
-- [SDK](sdk/README.md) · [适配层](adapters/README.md) · [示例](examples/README.md)
+- [SDK](sdk/README.md) · [Adapters](adapters/README.md) · [Examples](examples/README.md)
 - [Core](sdk/src/juice_agents/core/README.md) · [Graph](sdk/src/juice_agents/core/graph/README.md)
-- [CLI](frontend/cli/README.md) · [Web](frontend/web/README.md) · [前端共享模块](frontend/shared/README.md)
+- [CLI](frontend/cli/README.md) · [Web](frontend/web/README.md) · [Frontend shared](frontend/shared/README.md)

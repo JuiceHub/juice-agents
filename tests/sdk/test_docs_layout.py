@@ -27,6 +27,10 @@ def test_core_docs_live_beside_their_modules() -> None:
     assert not list(SDK_ROOT.rglob("docs"))
     assert not list(SDK_ROOT.rglob("DEVELOP.md"))
     assert not list(SDK_ROOT.rglob("CLAUDE.md"))
+    assert (SDK_ROOT / "README.zh-CN.md").is_file()
+    assert (CORE_SOURCE / "README.zh-CN.md").is_file()
+    for module_name in MODULES:
+        assert (CORE_SOURCE / module_name / "README.zh-CN.md").is_file()
 
 
 def test_sdk_readme_links_resolve() -> None:

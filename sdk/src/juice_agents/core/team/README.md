@@ -1,5 +1,7 @@
 # Team
 
+> [简体中文](README.zh-CN.md)
+
 `TeamRegistry` stores Team declarations and reusable member definitions. The
 Runner root coordinates durable work with Team tools; `TeamManager` stores the
 current run's tasks, inbox messages, members and completion status.
@@ -27,9 +29,9 @@ does not stop the member, and root decides whether to close it.
 
 `/teams [name]` reads declarations without starting a Runner.
 
-## 开发约束
+## Development conventions
 
-- Team 声明和可复用成员定义由 Registry 保存；本次运行的任务板、领取、消息和完成状态由 TeamManager 保存。新 Team 无自动成员；再次选择已有 Team 会使用原成员定义启动新任务板。
-- 成员创建只接受一个来源。Team 本地配置只允许角色字段，默认持久生命周期和 Team 可见性；共享 Agent 必须自行声明这些属性。固定协作规则放 system prompt，用户任务只传当前动态上下文。
-- Team 工具经 ToolManager 并验证 live Agent 身份。仅 root 可管理成员和任务、调用 `team_finish`；成员可查看、领取并完成自己的任务及发消息。
-- 创建任务时将 `eligible_members="all"` 在锁下展开为当前非 root 成员；领取时同锁检查资格、依赖和状态。失败任务由 root 审核，运行中的成员任务不能改派或删除。停止请求是结构化 `member_stop_request`，普通消息不能触发停止。
+- Registry stores Team declarations and reusable member definitions; TeamManager stores the current board, claims, messages, and completion state. New Teams have no automatic members; selecting an existing Team starts a new board from its saved member definitions.
+- Member creation accepts exactly one source. Team-local configuration allows role fields only and supplies persistent lifecycle and Team visibility; shared Agents declare those properties themselves. Put fixed collaboration rules in the system prompt and pass only dynamic task context in user messages.
+- Team tools go through ToolManager and verify live Agent identity. Only root manages members and tasks or calls `team_finish`; members can inspect, claim, complete their own tasks, and send messages.
+- Expand `eligible_members="all"` to current non-root members under the creation lock. Check eligibility, dependencies, and state under the same lock when claiming. Root reviews failures; running member tasks cannot be reassigned or deleted. Stopping uses a structured `member_stop_request`; ordinary messages cannot stop a member.
