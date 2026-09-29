@@ -1,0 +1,14 @@
+[
+  {
+    "id": "tech-001",
+    "category": "tech",
+    "setup": "为什么程序员喜欢暗黑模式？",
+    "punchline": "因为光会吸引 bug。"
+  },
+  {
+    "id": "dad-001",
+    "category": "dad",
+    "setup": "有一天 0 对 8 说：",
+    "punchline": "“不错的新腰带！”"
+  }
+]

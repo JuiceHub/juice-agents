@@ -1,0 +1,137 @@
+models:
+  doubao_lite:
+    backend: doubao
+    api_base: https://ark.cn-beijing.volces.com/api/v3
+    api_key_env: DOUBAO_API_KEY
+    provider_model_name: doubao-seed-2-0-lite-260215
+    supported_efforts: [disabled, low, medium, high, auto]
+    thinking_mode: none
+    supports_budget_tokens: false
+
+  doubao_pro:
+    backend: doubao
+    api_base: https://ark.cn-beijing.volces.com/api/v3
+    api_key_env: DOUBAO_API_KEY
+    provider_model_name: doubao-seed-2-0-pro-260215
+    supported_efforts: [disabled, low, medium, high, auto]
+    thinking_mode: none
+    supports_budget_tokens: false
+
+  gpt4o_mini:
+    backend: openai
+    api_base: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    provider_model_name: gpt-4o-mini
+    supported_efforts: [disabled, low, medium, high, auto]
+    thinking_mode: none
+    supports_budget_tokens: false
+
+  claude-opus-4-7:
+    backend: anthropic
+    api_base: https://api.anthropic.com
+    api_key_env: ANTHROPIC_AUTH_TOKEN
+    provider_model_name: claude-opus-4-7
+    supported_efforts: [disabled, low, medium, high, xhigh, max]
+    thinking_mode: adaptive
+    supports_budget_tokens: false
+
+  claude-sonnet-4-6:
+    backend: anthropic
+    api_base: https://api.anthropic.com
+    api_key_env: ANTHROPIC_AUTH_TOKEN
+    provider_model_name: claude-sonnet-4-6
+    supported_efforts: [disabled, low, medium, high, max]
+    thinking_mode: adaptive
+    supports_budget_tokens: true
+
+  claude-haiku-4-5-20251001:
+    backend: anthropic
+    api_base: https://api.anthropic.com
+    api_key_env: ANTHROPIC_AUTH_TOKEN
+    provider_model_name: claude-haiku-4-5-20251001
+    supported_efforts: [disabled]
+    thinking_mode: manual
+    supports_budget_tokens: true
+
+  composite_best:
+    backend: composite
+    strategy: judge_select
+    candidates:
+      - model: doubao_lite
+      - model: gpt4o_mini
+        model_effort: medium
+    judge:
+      model: doubao_pro
+      model_effort: high
+    fail_fast: false
+
+tools:
+  tavily:
+    api_key_env: TAVILY_API_KEY
+    base_url: https://api.tavily.com/search
+
+  serpapi:
+    api_key_env: SERPAPI_API_KEY
+    base_url: https://serpapi.com/search.json
+    search_engine: google
+
+browser:
+  enabled: true
+  backend: in_app
+  permissions:
+    default_policy: ask_for_sensitive
+    allow_hosts:
+      - localhost
+      - 127.0.0.1
+    block_hosts: []
+  risky_tools:
+    enabled: false
+    require_confirmation: true
+    js_timeout_ms: 3000
+    max_eval_result_chars: 20000
+    storage_state_dir: .juice/browser_state
+    recording_dir: .juice/browser_recordings
+  chrome:
+    enabled: false
+    transport: native_messaging
+
+image:
+  enabled: false
+
+memory:
+  enabled: true
+  auto_extract_enabled: false
+  dream:
+    enabled: true
+    min_hours: 24
+    min_sessions: 5
+
+skills:
+  enabled: true
+  external_dirs: []
+  disabled: []
+  platform_disabled:
+    cli: []
+  guard_agent_created: false
+  template_vars: true
+  inline_shell: false
+  inline_shell_timeout: 10
+  config: {}
+
+self_evolution:
+  enabled: true
+
+plugins:
+  enabled: true
+  disabled: []
+
+permissions:
+  rules: []
+
+graphs:
+  enabled: true
+  deep_research:
+    max_concurrent_research_units: 5
+    max_research_rounds: 3
+    max_tool_calls_per_researcher: 10
+    max_sources: 40

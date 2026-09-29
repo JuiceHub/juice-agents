@@ -1,0 +1,1 @@
+"""Explicit capability activation helpers."""

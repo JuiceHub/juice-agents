@@ -1,0 +1,30 @@
+{
+  "name": "@juice-agents/shared",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/**/*.test.ts"
+  },
+  "exports": {
+    "./conversation": "./src/conversation/index.ts",
+    "./gateway/types": "./src/gateway/types.ts",
+    "./presenter/command": "./src/presenter/command.ts",
+    "./presenter/stream": "./src/presenter/stream.ts"
+  },
+  "peerDependencies": {
+    "react": "^18.3.1"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.18",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

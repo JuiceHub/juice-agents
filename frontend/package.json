@@ -1,0 +1,9 @@
+{
+  "name": "juice-agents-frontend",
+  "private": true,
+  "workspaces": [
+    "cli",
+    "shared",
+    "web"
+  ]
+}

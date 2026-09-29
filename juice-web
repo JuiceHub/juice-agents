@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Juice Web - local browser workspace for juice-agents
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+WEB_DIR="$SCRIPT_DIR/frontend/web"
+FRONTEND_DIR="$SCRIPT_DIR/frontend"
+WORKSPACE_DIR="$(pwd -P)"
+GATEWAY_HOST="${JUICE_WEB_HOST:-127.0.0.1}"
+GATEWAY_PORT="${JUICE_WEB_PORT:-8003}"
+VITE_PORT="${JUICE_WEB_VITE_PORT:-5173}"
+
+export PYTHONPATH="$SCRIPT_DIR/sdk/src${PYTHONPATH:+:$PYTHONPATH}"
+
+cd "$SCRIPT_DIR"
+# Validate before starting npm so an unsafe JUICE_WEB_HOST fails immediately.
+python - "$GATEWAY_HOST" <<'PY'
+import argparse
+import sys
+
+from adapters.web_gateway.entry import _loopback_host
+
+try:
+    _loopback_host(sys.argv[1])
+except argparse.ArgumentTypeError as exc:
+    raise SystemExit(str(exc)) from exc
+PY
+
+python -m adapters.web_gateway.entry \
+  --host "$GATEWAY_HOST" \
+  --port "$GATEWAY_PORT" &
+GATEWAY_PID="$!"
+
+cleanup() {
+  kill "$GATEWAY_PID" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+# CLI/Web/shared 必须从 frontend workspace 共享 React，避免 shared Hook
+# 与 React renderer 分别加载不同实例。
+if [ ! -d "$FRONTEND_DIR/node_modules/react" ] || [ -d "$FRONTEND_DIR/shared/node_modules/react" ]; then
+  echo "Installing web dependencies..."
+  (
+    cd "$FRONTEND_DIR"
+    # 清理迁移前 shared 的独立 React 安装，确保 Hook 与 renderer 同源。
+    rm -rf shared/node_modules
+    npm install --workspace juice-web
+  )
+fi
+
+cd "$WEB_DIR"
+URL_HOST="$GATEWAY_HOST"
+if [[ "$URL_HOST" == *:* ]]; then
+  URL_HOST="[$URL_HOST]"
+fi
+export VITE_JUICE_WEB_GATEWAY="http://$URL_HOST:$GATEWAY_PORT"
+echo "Juice Web: http://127.0.0.1:$VITE_PORT/?base_dir=$(python -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$WORKSPACE_DIR")"
+exec npm run dev -- --port "$VITE_PORT"

@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=77.0.3", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "juice-agents"
+version = "0.1.0"
+description = "Lightweight agent runtime and orchestration SDK"
+readme = {file = "README.md", content-type = "text/markdown"}
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+keywords = ["agents", "ai", "orchestration", "sdk"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = [
+    "anthropic==0.107.1",
+    "Jinja2==3.1.6",
+    "json_repair==0.58.0",
+    "jsonschema==4.26.0",
+    "mcp==1.27.2",
+    "openai==2.41.0",
+    "pathspec==0.12.1",
+    "Pillow==12.2.0",
+    "playwright==1.61.0",
+    "PyYAML==6.0.3",
+    "volcengine_python_sdk==5.0.1",
+    "watchdog==6.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/JuiceHub/juice-agents"
+Repository = "https://github.com/JuiceHub/juice-agents"
+Issues = "https://github.com/JuiceHub/juice-agents/issues"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+juice_agents = ["py.typed"]
+"juice_agents._assets" = [
+    "config.example.yaml",
+    "skills/*/SKILL.md",
+    "skills/*/data/*.json",
+    "skills/*/scripts/*.py",
+]

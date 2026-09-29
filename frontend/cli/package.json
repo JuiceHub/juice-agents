@@ -1,0 +1,27 @@
+{
+  "name": "juice-cli",
+  "version": "0.1.0",
+  "description": "TypeScript + Ink CLI for juice-agents",
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/entry.tsx",
+    "dev": "tsx watch src/entry.tsx",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/*.test.ts src/**/*.test.ts"
+  },
+  "dependencies": {
+    "@juice-agents/shared": "file:../shared",
+    "chalk": "^5.3.0",
+    "figures": "^6.1.0",
+    "ink": "^5.2.1",
+    "react": "^18.3.1",
+    "string-width": "^7.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.18",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
