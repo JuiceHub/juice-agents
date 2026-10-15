@@ -107,8 +107,9 @@ function flattenRegularBlock(
   const a = getMessageAppearance(block);
   const headerSym = a.useDot ? "●" : a.prefix;
   const headerColor = a.useDot ? a.dotColor : a.accentColor;
-  const muted = block.kind === "thinking" || block.kind === "system";
-  const bodyColor = muted ? TUI_THEME.message.muted : a.bodyColor;
+  // 仅 system 块使用 dim 样式，thinking 块使用 messageAppearance 中定义的颜色
+  const muted = block.kind === "system";
+  const bodyColor = a.bodyColor;
   // The visible message anchor consumes two terminal cells (`● ` / `⎿ `).
   // The formatted display receives this body width up front so table rows do
   // not get hard-wrapped by the terminal after RowVM rendering.

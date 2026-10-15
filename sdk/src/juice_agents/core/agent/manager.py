@@ -707,14 +707,32 @@ class AgentManager:
         step.round_outcome = "continue" if is_recoverable_agent_error(exc) else "failed"
         return step
 
-    def _perform_step(self, managed: ManagedAgent, step_index: int) -> ActionStep:
+    def _perform_step(self, managed: ManagedAgent, step_index: int) -> Iterator[Any]:
+        """
+        执行 Agent 的 step() 方法，返回流式事件的生成器。
+
+        Yields:
+            - ActionEvent: 统一的流式事件
+        """
+        from juice_agents.core.agent.context import ActionEvent
+
         instance = managed.instance
         if instance is None:
             raise RuntimeError(f"agent 已释放，不能执行: {managed.agent_id}")
         self._raise_if_interrupted(managed)
         step = ActionStep(step_num=step_index, model_output="")
         try:
-            returned = instance.step(step)
+            # Agent.step() 现在是一个生成器，yield 多个事件
+            step_generator = instance.step(step)
+            for event in step_generator:
+                # 透传所有 ActionEvent
+                yield event
+                # 最后一个事件应该是 step_complete
+                if isinstance(event, ActionEvent) and event.event_type == "step_complete":
+                    # 返回完整的 ActionStep 用于后续处理
+                    return event.data.get("step", step)
+            # 如果没有收到 step_complete，返回原始 step
+            return step
         except Exception as exc:
             # A model/provider may observe the callback-bound cancel token and
             # raise its own cancellation exception. Preserve that failure as an
@@ -727,12 +745,14 @@ class AgentManager:
                 managed.agent_id,
                 step_index,
             )
-            return self._normalize_failed_step(instance, step, exc=exc)
-        if returned is None:
-            return step
-        if not isinstance(returned, ActionStep):
-            raise TypeError("Agent.step() 必须返回 ActionStep 或 None")
-        return returned
+            failed_step = self._normalize_failed_step(instance, step, exc=exc)
+            # 对于异常情况，也需要包装为 ActionEvent
+            yield ActionEvent(
+                step_num=step_index,
+                event_type="step_complete",
+                data={"step": failed_step},
+            )
+            return failed_step
 
     def _finish_step(self, managed: ManagedAgent, step: ActionStep, step_index: int) -> ActionStep:
         instance = managed.instance
@@ -856,7 +876,28 @@ class AgentManager:
                     last_index = 0
                     for step_index in range(1, int(instance.max_steps) + 1):
                         last_index = step_index
-                        action_step = self._finish_step(item, self._perform_step(item, step_index), step_index)
+                        # _perform_step 现在是生成器，yield 流式事件
+                        action_step = None
+                        for event in self._perform_step(item, step_index):
+                            # 导入事件类型用于判断
+                            from juice_agents.core.agent.context import ActionEvent
+
+                            # 透传中间事件（thinking, tool_start, tool_end）
+                            if isinstance(event, ActionEvent):
+                                if event.event_type in ("thinking", "tool_start", "tool_end"):
+                                    yield event
+                                elif event.event_type == "step_complete":
+                                    action_step = event.data.get("step")
+                            # 兼容旧版本直接返回 ActionStep 的情况
+                            elif isinstance(event, ActionStep):
+                                action_step = event
+
+                        # 如果没有收到完整的 ActionStep，说明出错了
+                        if action_step is None:
+                            raise RuntimeError(f"step {step_index} 未返回有效的 ActionStep")
+
+                        # 持久化完整的 ActionStep
+                        action_step = self._finish_step(item, action_step, step_index)
                         yield action_step
                         self._raise_if_interrupted(item)
                         if action_step.round_outcome in {"submitted", "failed"}:
@@ -876,11 +917,23 @@ class AgentManager:
                         instance.context.append_step(fallback)
                         item.context = instance.context
                         self.persist(item)
-                        fallback_step = self._finish_step(
-                            item,
-                            self._perform_step(item, max(last_index, 0) + 1),
-                            max(last_index, 0) + 1,
-                        )
+
+                        # fallback step 也需要处理流式事件
+                        fallback_step = None
+                        for event in self._perform_step(item, max(last_index, 0) + 1):
+                            from juice_agents.core.agent.context import ActionEvent
+                            if isinstance(event, ActionEvent):
+                                if event.event_type in ("thinking", "tool_start", "tool_end"):
+                                    yield event
+                                elif event.event_type == "step_complete":
+                                    fallback_step = event.data.get("step")
+                            elif isinstance(event, ActionStep):
+                                fallback_step = event
+
+                        if fallback_step is None:
+                            raise RuntimeError("fallback step 未返回有效的 ActionStep")
+
+                        fallback_step = self._finish_step(item, fallback_step, max(last_index, 0) + 1)
                         yield fallback_step
                     item.status = AgentStatus.IDLE
                     self.persist(item)
@@ -912,11 +965,17 @@ class AgentManager:
 
     def run(self, managed: ManagedAgent | str, task: str, **kwargs: Any) -> Any:
         """Consume :meth:`stream` and return the normal Agent output value."""
+        from juice_agents.core.agent.context import ActionEvent
 
         item = self.get(managed) if isinstance(managed, str) else managed
         last_step: ActionStep | None = None
-        for last_step in self.stream(item, task, **kwargs):
-            pass
+        for event in self.stream(item, task, **kwargs):
+            # 跳过中间事件，只保留最后的 ActionStep
+            if isinstance(event, ActionEvent):
+                continue
+            if isinstance(event, ActionStep):
+                last_step = event
+
         if last_step is None:
             return None
         if last_step.round_outcome == "submitted" and not last_step.error:

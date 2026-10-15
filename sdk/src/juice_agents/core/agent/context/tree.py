@@ -51,18 +51,9 @@ class ContextTree:
     selected_path_id: Optional[str] = None
     # 最终选中的最优路径（Best-of-N 选出）
 
-    # ============================================
-    # 探索策略配置
-    # ============================================
-    strategy: str = "greedy"              # 策略名：greedy/tot
-    strategy_config: Dict[str, Any] = field(default_factory=dict)
-    # strategy_config 示例：
-    # {
-    #     "breadth": 3,
-    #     "depth_limit": 5,
-    #     "keep_top_k": 2,
-    #     "temperature": 0.7,
-    # }
+    # 注意：探索策略不存储在 ContextTree 中
+    # 策略是 Agent 级别的配置，可以动态切换
+    # ContextTree 只负责存储树结构数据
 
     # ============================================
     # 训练数据标注
@@ -419,7 +410,6 @@ class ContextTree:
             "active_nodes": len(active_nodes),
             "max_depth": max((n.depth for n in self.nodes.values()), default=0),
             "success_paths": sum(1 for p in self.all_paths if p.success),
-            "strategy": self.strategy
         }
 
     # ============================================

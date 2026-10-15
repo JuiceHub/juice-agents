@@ -269,7 +269,7 @@ export interface TeamStreamEvent {
 }
 
 export interface RunnerStreamEvent {
-  kind: "action_step" | "team_update" | "runner_lifecycle" | "round_end" | "stream_cancelled";
+  kind: "action_step" | "action_event" | "team_update" | "runner_lifecycle" | "round_end" | "stream_cancelled";
   permission_mode: string;
   agent_mode: string;
   runner_id: string;
@@ -277,6 +277,10 @@ export interface RunnerStreamEvent {
   agent_role: string | null;
   step_num: number | null;
   action_step: ActionStep | null;
+  // action_event 字段
+  event_type?: string; // "thinking" | "tool_start" | "tool_end" | "step_complete"
+  data?: Record<string, any>;
+  // 原有字段
   team_event: TeamStreamEvent | null;
   lifecycle_event?: RunnerLifecycleEvent | null;
   round_id: string;

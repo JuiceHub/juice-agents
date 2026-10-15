@@ -182,9 +182,32 @@ class ActionStep(AgentStep):
         return messages
 
 
+# ============================================================================
+# 流式事件：统一的中间结果传输结构
+# ============================================================================
+
+
+@dataclass
+class ActionEvent:
+    """
+    统一的流式事件，用于传输执行过程中的各种中间状态。
+
+    event_type 决定 data 的内容：
+    - "thinking": data 包含 thought, model_output, reasoning_content
+    - "tool_start": data 包含 tool_name, tool_args, tool_index
+    - "tool_end": data 包含 tool_name, tool_index, observation, error, execution_time
+    - "step_complete": data 包含完整的 ActionStep
+    """
+
+    step_num: int
+    event_type: str  # "thinking" | "tool_start" | "tool_end" | "step_complete"
+    data: dict[str, Any]
+
+
 __all__ = [
     "AgentStep",
     "SummaryStep",
     "TaskStep",
     "ActionStep",
+    "ActionEvent",
 ]

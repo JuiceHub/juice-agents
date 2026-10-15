@@ -48,13 +48,13 @@ export function getMessageAppearance(block: MessageBlock): MessageAppearance {
     };
   }
 
-  // thinking：保留 ✻ 符号 + dim 灰，与 claude-code 中 thinking 的视觉一致
+  // thinking：使用更明显的颜色以便阅读
   if (block.kind === "thinking") {
     return {
       variant: "thinking",
       prefix: "✻",
       accentColor: TUI_THEME.message.thinkingAccent,
-      bodyColor: TUI_THEME.message.muted,
+      bodyColor: TUI_THEME.message.body,  // 改用正文颜色，更清晰
       useDot: false,
       dotColor: TUI_THEME.message.thinkingAccent,
       showLabel: false,

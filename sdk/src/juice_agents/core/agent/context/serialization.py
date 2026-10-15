@@ -269,8 +269,7 @@ def serialize_context_tree(tree: ContextTree) -> dict[str, Any]:
         "all_paths": [serialize_exploration_path(p) for p in tree.all_paths],
         "active_leaf_ids": list(tree.active_leaf_ids),
         "selected_path_id": tree.selected_path_id,
-        "strategy": tree.strategy,
-        "strategy_config": dict(tree.strategy_config),
+        # 注意：不序列化 strategy，策略是 Agent 级别的配置
         "task_metadata": dict(tree.task_metadata),
         "stats": dict(tree.stats),
     }
@@ -292,8 +291,7 @@ def deserialize_context_tree(payload: dict[str, Any]) -> ContextTree:
         system_prompt_dynamic=payload.get("system_prompt_dynamic"),
         include_reasoning_in_context=bool(payload.get("include_reasoning_in_context")),
         root_id=str(payload.get("root_id") or ""),
-        strategy=str(payload.get("strategy") or "greedy"),
-        strategy_config=dict(payload.get("strategy_config") or {}),
+        # 注意：不反序列化 strategy，策略由 Agent 管理
         task_metadata=dict(payload.get("task_metadata") or {}),
         stats=dict(payload.get("stats") or {}),
     )

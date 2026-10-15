@@ -1140,22 +1140,51 @@ class Runner:
                 task = str(message)
                 images = list(task_images or [])
                 for continuation in range(self.config.continuation_policy.max_rounds):
-                    for step in self.agent_manager.stream(
+                    for step_or_event in self.agent_manager.stream(
                         root, task, task_images=images,
                         attachments=self._team_initial_attachments("root"),
                     ):
-                        outcome = str(step.round_outcome or "continue")
-                        if outcome in {"submitted", "failed"}:
-                            output = step.output if step.output is not None else step.model_output
-                        event = {
-                            "kind": "action_step", "runner_id": self.runner_id, "mode_id": self.mode_id,
-                            "permission_mode": self.permission_mode, "agent_name": root.agent_name,
-                            "agent_id": root.agent_id, "agent_role": root.role, "step_num": step.step_num,
-                            "action_step": step, "round_id": round_id,
-                        }
-                        self._publish(event)
-                        yield event
-                        yield from self._drain_team_updates()
+                        # 导入流式事件类型
+                        from juice_agents.core.agent.context import ActionEvent, ActionStep
+
+                        # 处理统一的 ActionEvent
+                        if isinstance(step_or_event, ActionEvent):
+                            event_type = step_or_event.event_type
+                            data = step_or_event.data
+
+                            # 构建统一的 action_event 发送给前端
+                            event = {
+                                "kind": "action_event",
+                                "runner_id": self.runner_id,
+                                "mode_id": self.mode_id,
+                                "permission_mode": self.permission_mode,
+                                "agent_name": root.agent_name,
+                                "agent_id": root.agent_id,
+                                "agent_role": root.role,
+                                "step_num": step_or_event.step_num,
+                                "event_type": event_type,
+                                "data": data,
+                                "round_id": round_id,
+                            }
+                            self._publish(event)
+                            yield event
+                            continue
+
+                        # 处理完整的 ActionStep
+                        if isinstance(step_or_event, ActionStep):
+                            step = step_or_event
+                            outcome = str(step.round_outcome or "continue")
+                            if outcome in {"submitted", "failed"}:
+                                output = step.output if step.output is not None else step.model_output
+                            event = {
+                                "kind": "action_step", "runner_id": self.runner_id, "mode_id": self.mode_id,
+                                "permission_mode": self.permission_mode, "agent_name": root.agent_name,
+                                "agent_id": root.agent_id, "agent_role": root.role, "step_num": step.step_num,
+                                "action_step": step, "round_id": round_id,
+                            }
+                            self._publish(event)
+                            yield event
+                            yield from self._drain_team_updates()
                     # The transport owns only this stream. Keep it open while
                     # member calls are active so completion updates reach
                     # CLI/Web without a separate polling channel.

@@ -48,7 +48,7 @@ from .serialization import (
     serialize_context_tree,
     serialize_exploration_path,
 )
-from .steps import ActionStep, AgentStep, SummaryStep, TaskStep
+from .steps import ActionStep, AgentStep, SummaryStep, TaskStep, ActionEvent
 from .tree import ContextTree
 
 __all__ = [
@@ -62,6 +62,7 @@ __all__ = [
     "TaskStep",
     "ActionStep",
     "SummaryStep",
+    "ActionEvent",
     # 序列化
     "serialize_context_tree",
     "deserialize_context_tree",

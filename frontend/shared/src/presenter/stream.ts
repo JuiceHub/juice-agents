@@ -52,10 +52,46 @@ export interface MessageBlock {
 
 export function presentStreamEvent(event: RunnerStreamEvent): MessageBlock[] {
   if (!event) return [];
+
+  // 处理统一的 action_event
+  if (event.kind === "action_event" && event.event_type && event.data) {
+    const eventType = event.event_type;
+    const data = event.data;
+
+    // 思考事件
+    if (eventType === "thinking") {
+      const thought = String(data.thought || "").trim();
+      return thought ? [{ kind: "thinking", text: thought }] : [];
+    }
+
+    // 工具开始事件
+    if (eventType === "tool_start") {
+      const toolName = String(data.tool_name || "tool");
+      const text = `Running ${toolName}...`;
+      return [{ kind: "tool", title: text, text }];
+    }
+
+    // 工具结束事件
+    if (eventType === "tool_end") {
+      const toolName = String(data.tool_name || "tool");
+      const hasError = data.error && String(data.error).trim();
+      const status = hasError ? "error" : "success";
+      const title = hasError ? `Failed ${toolName}` : `Completed ${toolName}`;
+      const observation = String(data.observation || "").trim();
+      const text = observation || title;
+      return [{ kind: "tool", title, text }];
+    }
+
+    // step_complete 不需要额外展示，等待 action_step 事件
+    return [];
+  }
+
+  // 处理完整步骤事件
   if (event.kind === "action_step") {
     if (!event.action_step) return [];
     return presentStreamStep(event.action_step);
   }
+
   if (event.kind === "round_end") {
     const text = event.outcome === "submitted" ? String(event.output ?? "").trim() : "";
     return text ? [{ kind: "final", text }] : [];

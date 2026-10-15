@@ -59,6 +59,7 @@ from .context import (
     is_recoverable_agent_error,
     observations_to_text,
 )
+from .context.strategies import ExplorationStrategy, GreedyStrategy
 from .context.compression import CompactCompressStrategy, CompressStrategy, RemainCompressStrategy
 from .context.content import (
     CODEACT_OBSERVATION_PROJECTION_CHARS,
@@ -164,7 +165,7 @@ class _RegistryLazyTool(Tool):
     registry tool 的轻量运行时代理。
 
     配置工具只把 tool 名称加入当前 agent 的可调用表；这里在真正调用时再
-    从 ToolRegistry 创建真实 Tool，避免“创建配置”阶段直接挂载运行时对象。
+    从 ToolRegistry 创建真实 Tool，避免"创建配置"阶段直接挂载运行时对象。
     """
 
     def __init__(
@@ -378,7 +379,7 @@ def _strip_thought_blocks(text: str) -> str:
 
     模型经常在 thought 里引用协议名（写出字面量 ``<actions>`` / ``</actions>``），
     若直接全文定位 actions 会把这些字面量误当成真正的块边界。这里用【非贪婪】
-    逐块删除而非“从首个 <thought> 删到末个 </thought>”的贪婪做法：贪婪会在模型
+    逐块删除而非"从首个 <thought> 删到末个 </thought>"的贪婪做法：贪婪会在模型
     尾部幻觉伪造第二轮（thought + actions）时，把中间真实的 actions 一起吞掉，
     只剩伪造的那个且数量恰好为 1，导致校验通过并静默执行伪造动作。逐块删除会让
     这种情况留下 2 个 actions，落到显式协议错误、由模型下一轮自行修复。
@@ -454,7 +455,7 @@ def _validate_submit_output_payload(output: Any, schema: dict[str, Any] | None) 
     """
     对 submit_output 的 payload 做统一的解析与 schema 校验。
 
-    这里将“协议错误”统一提升为 SubmitOutputValidationError，避免下游把
+    这里将"协议错误"统一提升为 SubmitOutputValidationError，避免下游把
     结构/校验失败误判为普通 observation。
     """
     try:
@@ -604,6 +605,7 @@ class MultiStepAgent(ABC):
         skills_enabled: bool = True,
         attachments_hook: Callable[[int, "MultiStepAgent"], list[RuntimeAttachment]] | None = None,
         agent_id: str | None = None,
+        exploration_strategy: ExplorationStrategy | None = None,
     ):
         self.tools = {tool.name: tool for tool in tools}
         self._runtime_tool_refs: dict[str, dict[str, Any]] = {}
@@ -670,6 +672,8 @@ class MultiStepAgent(ABC):
             system_prompt_static=self.system_prompt_static,
             system_prompt_dynamic=self.system_prompt_dynamic,
         )
+        # 探索策略：默认使用贪心策略（原有行为）
+        self.exploration_strategy = exploration_strategy or GreedyStrategy()
         # Tool execution is deliberately not created here.  Fresh Agents are
         # pure step objects until AgentManager binds a RunnerContext; that
         # context forwards every action to the Runner-owned ToolManager.
@@ -994,7 +998,7 @@ class MultiStepAgent(ABC):
         """渲染 (static, dynamic) 两段模板。
 
         当用户传入自定义 system_prompt_template 时，无 section 边界可用，降级为
-        “整段作为 static、dynamic 为空”，行为与单段渲染等价（仍可作缓存前缀）。
+        "整段作为 static、dynamic 为空"，行为与单段渲染等价（仍可作缓存前缀）。
         """
         context = self._build_prompt_context(**extra_context)
         if self.system_prompt_template:
@@ -1027,7 +1031,7 @@ class MultiStepAgent(ABC):
 
         `ActionStep.model_output` 仍然只保存正文，避免污染协议解析与 session 持久化。
         默认 session 不会把 reasoning 回灌给模型，因此默认日志也不把 reasoning
-        混入“模型输出”块；只有显式回灌时，日志才用 `<think>` 与上下文保持一致。
+        混入"模型输出"块；只有显式回灌时，日志才用 `<think>` 与上下文保持一致。
         """
         normalized_content = "" if content is None else str(content)
         normalized_reasoning = "" if reasoning_content is None else str(reasoning_content)
@@ -1149,6 +1153,19 @@ class MultiStepAgent(ABC):
         hook: Callable[[int, "MultiStepAgent"], list[RuntimeAttachment]] | None,
     ) -> None:
         self.attachments_hook = hook
+
+    def set_exploration_strategy(self, strategy: ExplorationStrategy) -> None:
+        """动态切换探索策略
+
+        Args:
+            strategy: 新的探索策略实例
+
+        示例:
+            from juice_agents.core.agent.context.strategies import best_of_n_strategy
+            agent.set_exploration_strategy(best_of_n_strategy(n=5))
+        """
+        self.exploration_strategy = strategy
+        logger.info("探索策略已切换: %s", strategy.__class__.__name__)
 
     def set_session_compression_strategy(self, strategy: CompressStrategy | None) -> None:
         """设置显式的旧式单策略覆盖；None 恢复默认 remain + compact 管线。"""
@@ -1536,7 +1553,7 @@ class ReActAgent(MultiStepAgent):
         校验 ReAct 外层协议，并返回唯一 ``<actions>`` 块的原始内容。
 
         剔除 thought 后要求：actions 块恰好 1 个，且其后不得有非空残留。后者对齐
-        提示词里 “不要在 </actions> 后继续输出内容” 的约束——只查数量挡不住模型在
+        提示词里 "不要在 </actions> 后继续输出内容" 的约束——只查数量挡不住模型在
         唯一 actions 之后追加伪造的 ``<attachments>`` / 工具观测，那些内容会随
         ``step.model_output`` 回放并被下一轮当成真实历史。
         """
@@ -1569,8 +1586,8 @@ class ReActAgent(MultiStepAgent):
         if not stripped_actions:
             return []
         if stripped_actions and not stripped_actions.startswith("["):
-            # 附上实际解析到的内容，便于区分“真的写错了 JSON”与“thought 内字面量
-            # 标签把提取带偏”这两类成因，避免模型只看到抽象规则却无从修复。
+            # 附上实际解析到的内容，便于区分"真的写错了 JSON"与"thought 内字面量
+            # 标签把提取带偏"这两类成因，避免模型只看到抽象规则却无从修复。
             preview = stripped_actions[:200]
             ellipsis = "..." if len(stripped_actions) > 200 else ""
             raise self._build_action_validation_error(
@@ -1870,6 +1887,93 @@ class ReActAgent(MultiStepAgent):
 
         return observations, images, execution_records, terminal_output
 
+    def process_actions_streaming(
+        self, action_specs: List[dict[str, Any]], step_num: int
+    ) -> Iterator[Any]:
+        """
+        逐个执行工具并 yield 流式事件，最终返回聚合结果。
+
+        注意：这个方法会 yield 事件，最后必须通过其他方式获取完整结果。
+        实际使用中，调用者需要收集这些事件并调用 process_actions 获取完整数据。
+        """
+        from .context.steps import ActionEvent
+        import time
+
+        if not action_specs:
+            return
+
+        context = self._tool_execution_context()
+
+        for idx, spec in enumerate(action_specs):
+            # Yield 工具开始事件
+            yield ActionEvent(
+                step_num=step_num,
+                event_type="tool_start",
+                data={
+                    "tool_name": spec["name"],
+                    "tool_args": dict(spec["args"]),
+                    "tool_index": idx,
+                },
+            )
+
+            # 执行单个工具
+            start_time = time.time()
+            resolved_action = ResolvedToolAction(
+                tool=spec["target"],
+                args=dict(spec["args"]),
+                order=int(spec["order"]),
+                max_observation_chars=spec.get("max_observation_chars"),
+            )
+
+            try:
+                result = self._execute_tool_action(resolved_action, order=idx)
+                execution_time = time.time() - start_time
+
+                # 构建 observation 文本
+                texts, imgs = self._split_result(result.observation)
+                if result.status not in {"completed", "background"} and result.error:
+                    if result.status == "denied" and not _policy_allows_tool(self, spec["target"]):
+                        texts = [_policy_denial_message(spec["name"])]
+                    elif result.status == "failed":
+                        detail = str(result.error)
+                        if ": " in detail:
+                            detail = detail.split(": ", 1)[1]
+                        texts = [f"工具 {spec['name']} 执行失败: {detail}"]
+                    else:
+                        texts = [str(result.error)]
+                if not texts and not imgs:
+                    texts = ["执行完成，工具无返回值"] if result.status in {"completed", "background"} else []
+
+                observation_text = "\n".join(texts)
+                error_text = str(result.error) if result.error else None
+
+                # Yield 工具完成事件
+                yield ActionEvent(
+                    step_num=step_num,
+                    event_type="tool_end",
+                    data={
+                        "tool_name": spec["name"],
+                        "tool_index": idx,
+                        "observation": observation_text,
+                        "error": error_text,
+                        "execution_time": execution_time,
+                    },
+                )
+            except Exception as exc:
+                execution_time = time.time() - start_time
+                logger.exception("工具执行异常 tool=%s", spec["name"])
+                yield ActionEvent(
+                    step_num=step_num,
+                    event_type="tool_end",
+                    data={
+                        "tool_name": spec["name"],
+                        "tool_index": idx,
+                        "observation": "",
+                        "error": str(exc),
+                        "execution_time": execution_time,
+                    },
+                )
+
     @staticmethod
     def _tool_call_records_for_display(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         tool_calls: list[dict[str, Any]] = []
@@ -1893,7 +1997,15 @@ class ReActAgent(MultiStepAgent):
             )
         return tool_calls
 
-    def step(self, step: ActionStep) -> ActionStep:
+    def step(self, step: ActionStep) -> Iterator[Any]:
+        """
+        执行单步推理，yield 流式事件。
+
+        Yields:
+            - ActionEvent: 统一的流式事件（thinking, tool_start, tool_end, step_complete）
+        """
+        from .context.steps import ActionEvent
+
         self._prepare_step_execution()
         messages = self.build_messages()
         try:
@@ -1916,12 +2028,29 @@ class ReActAgent(MultiStepAgent):
         if not content.strip():
             raise _build_react_empty_output_protocol_error()
 
+        # → Yield 思考事件（模型生成完成，工具尚未执行）
+        yield ActionEvent(
+            step_num=step.step_num,
+            event_type="thinking",
+            data={
+                "thought": step.thought,
+                "model_output": step.model_output,
+                "reasoning_content": step.reasoning_content,
+            },
+        )
+
         # 外层协议校验（actions 恰好 1 个 + 尾部无残留）在 parse_actions 内完成
         actions = self.parse_actions(content)
         action_specs = self._resolve_action_targets(actions)
-        # 先完成协议级校验，再执行工具，避免“前几个工具已经生效，后面才发现
-        # submit_output/未知工具 不合法”的半成功状态。
+        # 先完成协议级校验，再执行工具，避免"前几个工具已经生效，后面才发现
+        # submit_output/未知工具 不合法"的半成功状态。
         self._validate_actions_protocol(action_specs)
+
+        # → Yield 工具执行的流式事件
+        for tool_event in self.process_actions_streaming(action_specs, step.step_num):
+            yield tool_event
+
+        # 批量执行工具获取完整结果（用于持久化）
         observations, observation_images, execution_records, terminal_output = self.process_actions(
             action_specs
         )
@@ -1957,7 +2086,12 @@ class ReActAgent(MultiStepAgent):
             ):
                 step.observations = [_serialize_submit_output(terminal_output)]
 
-        return step
+        # → Yield 完整步骤事件（用于持久化到 Context）
+        yield ActionEvent(
+            step_num=step.step_num,
+            event_type="step_complete",
+            data={"step": step},
+        )
 
 
 class CodeActAgent(MultiStepAgent):
@@ -2077,7 +2211,16 @@ class CodeActAgent(MultiStepAgent):
                 )
         return wrapped
 
-    def step(self, step: ActionStep) -> ActionStep:
+    def step(self, step: ActionStep) -> Iterator[Any]:
+        """
+        执行单步推理，yield 流式事件。
+
+        Yields:
+            - ActionEvent: 统一的流式事件（thinking, tool_start, tool_end, step_complete）
+        """
+        from .context.steps import ActionEvent
+        import time
+
         self._prepare_step_execution()
         messages = self.build_messages()
         try:
@@ -2094,6 +2237,17 @@ class CodeActAgent(MultiStepAgent):
         if not str(content or "").strip():
             raise _build_codeact_empty_output_protocol_error()
 
+        # → Yield 思考事件
+        yield ActionEvent(
+            step_num=step.step_num,
+            event_type="thinking",
+            data={
+                "thought": step.thought,
+                "model_output": step.model_output,
+                "reasoning_content": step.reasoning_content,
+            },
+        )
+
         code_block = self.parse_code(content)
         if not code_block:
             raise ModelOutputProtocolError(
@@ -2103,9 +2257,24 @@ class CodeActAgent(MultiStepAgent):
             )
         step.code_action = code_block
 
+        # → Yield 代码执行开始事件
+        yield ActionEvent(
+            step_num=step.step_num,
+            event_type="tool_start",
+            data={
+                "tool_name": "Python",
+                "tool_args": {"code": code_block},
+                "tool_index": 0,
+            },
+        )
+
+        # 执行代码
+        start_time = time.time()
         self._codeact_action_order = 0
         self._current_execution_records = []
         code_output = self.executor(code_block)
+        execution_time = time.time() - start_time
+
         # executor 会分别返回标准输出/错误、最终返回值和图片；这里把它们拆回
         # session 能消费的 observation 结构，保持日志和回放一致。
         result_parts = (
@@ -2124,6 +2293,21 @@ class CodeActAgent(MultiStepAgent):
         elif result_parts:
             log_parts.append(f"[result]\n{code_result}")
 
+        observation_text = "\n\n".join(part for part in log_parts if part) if log_parts else ""
+
+        # → Yield 代码执行完成事件
+        yield ActionEvent(
+            step_num=step.step_num,
+            event_type="tool_end",
+            data={
+                "tool_name": "Python",
+                "tool_index": 0,
+                "observation": observation_text,
+                "error": code_output.error if code_output.error else None,
+                "execution_time": execution_time,
+            },
+        )
+
         if code_output.submitted:
             _validate_submit_output_payload(code_result, self.output_schema)
 
@@ -2131,10 +2315,10 @@ class CodeActAgent(MultiStepAgent):
             step,
             # CodeAct 内部工具结果始终保持真实值；这里只把最终 logs/result 合为
             # 一个 canonical observation，并在后续模型投影时统一限制为 20K。
-            observations=["\n\n".join(part for part in log_parts if part)] if log_parts else [],
+            observations=[observation_text] if observation_text else [],
             observation_images=self._wrap_images(code_output.observation_images),
             observation_limits=(
-                [CODEACT_OBSERVATION_PROJECTION_CHARS] if log_parts else []
+                [CODEACT_OBSERVATION_PROJECTION_CHARS] if observation_text else []
             ),
         )
         step.tool_calls = self._tool_call_records_for_display(
@@ -2152,7 +2336,13 @@ class CodeActAgent(MultiStepAgent):
             # 模型调用应读取错误并修正代码，而不是把一次 step 失败升级为
             # 整个 round 失败。
             step.round_outcome = "continue"
-        return step
+
+        # → Yield 完整步骤事件
+        yield ActionEvent(
+            step_num=step.step_num,
+            event_type="step_complete",
+            data={"step": step},
+        )
 
     def init_system_prompt(self) -> str:
         return self._render_system_prompt_with_context(
