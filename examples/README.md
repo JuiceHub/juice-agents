@@ -10,6 +10,7 @@ The four examples use a real model to demonstrate complete workflows. Each examp
 | Capability evolution | `python -m examples.agent_evolution` | Reusable tools or specialists that are created and called |
 | Feedback operations | `python -m examples.group_operations` | Feedback classification, priority, and action suggestions |
 | Team delivery | `python -m examples.team_delivery` | Team tasks/inbox, code artifacts, and verification results |
+| Exploration strategies | `python -m examples.agent_tot` | Demonstrates greedy, best-of-N, beam search, and ToT strategies |
 
 ## Run an example
 
@@ -31,6 +32,25 @@ python -m examples.agent_evolution "Create release-note review capability for up
 python -m examples.group_operations "Review feedback and propose this week's operations plan"
 python -m examples.team_delivery "Implement the requirement in TASK.md and verify it"
 python -m examples.team_delivery --resume <runner_id> "Continue the unfinished task and report verification"
+python -m examples.agent_tot "Optimize this code's performance" --strategy beam_search --breadth 3 --depth 4
+```
+
+### Exploration Strategy Example
+
+The `agent_tot` example demonstrates different exploration strategies:
+
+```bash
+# Default greedy (single path)
+python -m examples.agent_tot "Design a caching strategy"
+
+# Best-of-N: generate 5 candidates, select best
+python -m examples.agent_tot "Design a caching strategy" --strategy best_of_n --breadth 5
+
+# Beam Search: keep 3 parallel paths for 4 layers
+python -m examples.agent_tot "Design a caching strategy" --strategy beam_search --breadth 3 --depth 4 --beam-width 3
+
+# ToT-style: single path with deep exploration
+python -m examples.agent_tot "Design a caching strategy" --strategy tot --breadth 5 --depth 3
 ```
 
 All four entry points support `--model`, `--model-effort`, `--agent-type react|codeact`, `--permission-mode default|accept`, and `--resume RUNNER_ID`. Without `--resume`, a new Runner is created. The process prints the Runner ID and progress events, then releases the Runner. The examples use a real model and have no offline mock path.

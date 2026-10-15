@@ -31,10 +31,10 @@ test("dollar completion includes skill and plugin invocations", () => {
   assert.deepEqual(pluginCandidates.map((candidate) => candidate.label), ["$review-pack"]);
 });
 
-test("web dollar completion reserves graph namespace", () => {
+test("web dollar completion reserves workflow namespace", () => {
   assert.deepEqual(
-    getWebCommandCandidates({ input: "$graph:d" }).map((candidate) => candidate.label),
-    ["$graph:deep_research"],
+    getWebCommandCandidates({ input: "$workflow:d" }).map((candidate) => candidate.label),
+    ["$workflow:deep_research"],
   );
 });
 
@@ -61,26 +61,6 @@ test("slash completion suggests command arguments", () => {
       availableAgentNames: ["research_worker", "reviewer"],
     }).map((candidate) => candidate.label),
     ["research_worker", "reviewer"]
-  );
-  assert.deepEqual(
-    getWebCommandCandidates({ input: "/graph run d" }).map((candidate) => candidate.label),
-    ["deep_research"]
-  );
-  assert.deepEqual(
-    getWebCommandCandidates({ input: "/deep" }).map((candidate) => candidate.label),
-    ["/deep-research"]
-  );
-  assert.deepEqual(
-    getWebCommandCandidates({ input: "/deep-research {" }).map((candidate) => candidate.label),
-    [
-      '{"question":"","source_mode":"web"}',
-      '{"question":"","source_mode":"workspace"}',
-      '{"question":"","source_mode":"web_workspace"}',
-    ]
-  );
-  assert.deepEqual(
-    getWebCommandCandidates({ input: "/deep-research --w" }).map((candidate) => candidate.label),
-    ["--web", "--workspace", "--web-workspace"]
   );
 });
 

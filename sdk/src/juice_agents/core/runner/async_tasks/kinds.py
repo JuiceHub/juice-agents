@@ -19,7 +19,7 @@ from .internal_types import AsyncTaskKind
 ASYNC_TASK_KIND_TO_PUBLIC: dict[AsyncTaskKind, AsyncTaskType] = {
     "agent_dispatch": "local_agent",
     "shell_command": "local_bash",
-    "graph_run": "local_graph",
+    "workflow_run": "local_workflow",
     "teammate": "teammate",
 }
 

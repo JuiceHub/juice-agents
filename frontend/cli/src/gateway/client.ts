@@ -16,7 +16,7 @@ import type {
   SessionStatus,
   SessionSummary,
   WorkspaceRuntimeConfig,
-  ActorSessionsReport,
+  ActiveAgentsReport,
   AskRequest,
   AskResponse,
   SkillsListResponse,
@@ -44,8 +44,8 @@ import type {
   AsyncTaskOutput,
   WorktreeListResponse,
   WorktreeStatus,
-  SendActorMessageResponse,
-  InterruptActorResponse,
+  SendAgentMessageResponse,
+  InterruptAgentResponse,
   StreamStepNotification,
   AskRequestNotification,
 } from "@juice-agents/shared/gateway/types";
@@ -268,24 +268,24 @@ export class GatewayClient {
     return this.sendRequest("worktree_status", params);
   }
 
-  async describeActorSessions(): Promise<ActorSessionsReport> {
-    return this.sendRequest("describe_actor_sessions", {});
+  async describeActiveAgents(): Promise<ActiveAgentsReport> {
+    return this.sendRequest("describe_agent_sessions", {});
   }
 
-  async sendActorMessage(params: {
-    actor_name: string;
+  async sendAgentMessage(params: {
+    agent_name: string;
     message: string;
-  }): Promise<SendActorMessageResponse> {
-    return this.sendRequest("send_actor_message", params);
+  }): Promise<SendAgentMessageResponse> {
+    return this.sendRequest("send_agent_message", params);
   }
 
-  async interruptActor(params: {
-    actor_name: string;
+  async interruptAgent(params: {
+    agent_name: string;
     reason?: string;
-  }): Promise<InterruptActorResponse> {
-    return this.sendRequest("interrupt_actor", {
-      actor_name: params.actor_name,
-      reason: params.reason ?? "user_actor_interrupt",
+  }): Promise<InterruptAgentResponse> {
+    return this.sendRequest("interrupt_agent", {
+      agent_name: params.agent_name,
+      reason: params.reason ?? "user_agent_interrupt",
     });
   }
 
@@ -344,6 +344,15 @@ export class GatewayClient {
     return this.sendRequest("switch_model", params);
   }
 
+  async switchStrategy(params: {
+    breadth?: number | number[];
+    depth?: number;
+    beam_width?: number;
+    reset?: boolean;
+  }): Promise<{ status: string; strategy: any; message: string }> {
+    return this.sendRequest("switch_strategy", params);
+  }
+
   async stopSession(): Promise<{ stopped: boolean }> {
     return this.sendRequest("stop_session", {});
   }
@@ -362,35 +371,6 @@ export class GatewayClient {
     base_dir: string;
   }): Promise<SessionSummary[]> {
     return this.sendRequest("list_sessions", params);
-  }
-
-  async listGraphs(params: { base_dir?: string } = {}): Promise<Record<string, any>> {
-    return this.sendRequest("list_graphs", params);
-  }
-
-  async viewGraph(params: { base_dir?: string; name: string }): Promise<Record<string, any>> {
-    return this.sendRequest("view_graph", params);
-  }
-
-  async runGraph(params: {
-    base_dir?: string;
-    name: string;
-    payload: Record<string, any>;
-    config?: Record<string, any>;
-  }): Promise<Record<string, any>> {
-    return this.sendRequest("run_graph", params);
-  }
-
-  async listGraphRuns(params: { base_dir?: string } = {}): Promise<Record<string, any>> {
-    return this.sendRequest("list_graph_runs", params);
-  }
-
-  async controlGraphRun(params: {
-    base_dir?: string;
-    graph_run_id: string;
-    action: "pause" | "resume" | "stop" | "restart";
-  }): Promise<Record<string, any>> {
-    return this.sendRequest("control_graph_run", params);
   }
 
   async permissionStatus(params: { base_dir?: string } = {}): Promise<Record<string, any>> {
@@ -465,12 +445,12 @@ export class GatewayClient {
     return this.sendRequest("set_self_evolution_config", params);
   }
 
-  async graphsConfigStatus(params: { base_dir?: string } = {}): Promise<{ success: boolean; enabled: boolean }> {
-    return this.sendRequest("graphs_config_status", params);
+  async workflowsConfigStatus(params: { base_dir?: string } = {}): Promise<{ success: boolean; enabled: boolean }> {
+    return this.sendRequest("workflows_config_status", params);
   }
 
-  async setGraphsConfig(params: { base_dir?: string; enabled: boolean }): Promise<{ success: boolean; enabled: boolean }> {
-    return this.sendRequest("set_graphs_config", params);
+  async setWorkflowsConfig(params: { base_dir?: string; enabled: boolean }): Promise<{ success: boolean; enabled: boolean }> {
+    return this.sendRequest("set_workflows_config", params);
   }
 
   async memoryStatus(): Promise<MemoryStatusResponse> {

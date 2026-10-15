@@ -13,13 +13,13 @@ Registry 只持有静态定义，是 workspace 声明与全新领域对象构造
 | --- | --- | --- |
 | `AgentRegistry` | Agent YAML 与类选择 | `AgentManager` |
 | `ToolRegistry` | Tool 声明与类映射 | `ToolManager` |
-| `GraphRegistry` | Graph 源码校验 | `GraphRunManager` |
+| `WorkflowRegistry` | Workflow 源码校验 | `WorkflowRunManager` |
 | `SkillRegistry` / `PluginRegistry` | 元数据发现 | 发起请求的 Manager |
 | `TeamRegistry` | Team 关系声明 | Runner 能力分发 |
 
 Registry 不保留 session、线程池、权限上下文、Runner 引用或 live 对象。`instantiate()` 每次都会返回全新对象；执行、取消和持久化都属于 Manager。
 
-workspace 声明保存在 `.juice/agents`、`.juice/tools`、`.juice/graphs`、`.juice/skills` 和 `.juice/teams` 下，不复制进 Runner snapshot。
+workspace 声明保存在 `.juice/agents`、`.juice/tools`、`.juice/workflows`、`.juice/skills` 和 `.juice/teams` 下，不复制进 Runner snapshot。
 
 Team 声明位于 `.juice/teams/<team_name>/manifest.yaml`，可以先创建空 Team。共享 Agent 声明放在 `.juice/agents/`；可复用的 Team 专属成员定义放在 `.juice/teams/<team_name>/members/`。后续运行会复用这些定义，但创建新的任务板。删除被引用的共享 Agent 时，会报告引用它的 Team 并拒绝删除。
 
@@ -29,7 +29,7 @@ Agent 声明在 workspace 中使用全局唯一名称，并可选 `allowed_modes
 
 ## 开发约定
 
-- Registry 只实现 `resolve()`、`validate()` 和 `instantiate()`。前两者不得导入可执行 Graph/Plugin 代码或创建 session；第三者每次返回全新对象，不缓存也不执行。
+- Registry 只实现 `resolve()`、`validate()` 和 `instantiate()`。前两者不得导入可执行 Workflow/Plugin 代码或创建 session；第三者每次返回全新对象，不缓存也不执行。
 - 声明写入必须原子完成。Agent、Team 静态定义与 Runner/Manager 的 session、任务、工具记录分开保存；不隐式迁移旧布局。
 - 省略 `allowed_modes` 表示全部 mode；显式值必须是非空列表，可包含自定义 mode 名称。Agent 可用性统一复用 `agents.availability.is_agent_available()`。`root` 只存在于 Runner 内存中，不能写入 YAML 或加入 `/agents` 列表。
 - 删除被 Team 引用的共享 Agent，或移除 Agent 对某 Team 的可用资格时，要报告所有引用的 Team。测试放在 `tests/core/registry/`，覆盖独立校验、全新对象构造和无 live 状态。

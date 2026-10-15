@@ -41,11 +41,11 @@ from .builtin.plugins.plugins_tools import PluginViewTool, PluginsListTool
 from .builtin.skills.skills_tools import SkillViewTool, SkillsListTool
 from .builtin.tools.tools_tools import ToolViewTool, ToolsListTool
 from .builtin.evolution.agent_manage import AgentManageTool
-from .builtin.evolution.graph_manage import GraphManageTool
+from .builtin.evolution.workflow_manage import WorkflowManageTool
 from .builtin.evolution.skill_manage import SkillManageTool
 from .builtin.evolution.tool_manage import ToolManageTool
 from .builtin.tasks.async_tasks_tools import AsyncTaskStopTool
-from .builtin.graphs.graphs_tools import GraphListTool, GraphTool, GraphViewTool
+from .builtin.workflows.workflows_tools import WorkflowListTool, WorkflowRunTool, WorkflowViewTool
 from .builtin.filesystem.files_tools import EditTool, FILE_TOOLS, GlobTool, GrepTool, ReadTool, WriteTool
 
 DEFAULT_TOOLS = {
@@ -60,7 +60,7 @@ AGENT_TOOLS = [AgentsListTool, AgentViewTool, AgentManageTool]
 TOOL_TOOLS = [ToolsListTool, ToolViewTool, ToolManageTool]
 SKILL_TOOLS = [SkillsListTool, SkillViewTool, SkillManageTool]
 PLUGIN_TOOLS = [PluginsListTool, PluginViewTool]
-GRAPH_TOOLS = [GraphListTool, GraphViewTool, GraphManageTool, GraphTool]
+WORKFLOW_TOOLS = [WorkflowListTool, WorkflowViewTool, WorkflowManageTool, WorkflowRunTool]
 
 _LAZY_EXPORTS = {"AgentTool"}
 
@@ -81,7 +81,7 @@ __all__ = [
     "ToolExecutionResult", "ToolExecutionRecord", "DEFAULT_TOOLS", "ShellTool",
     "PythonTool", "AsyncTaskStopTool",
     "CronCreateTool", "CronListTool", "CronDeleteTool", "CRON_TOOLS", "AgentTool",
-    "GraphTool", "GraphListTool", "GraphViewTool", "GraphManageTool", "GRAPH_TOOLS",
+    "WorkflowRunTool", "WorkflowListTool", "WorkflowViewTool", "WorkflowManageTool", "WORKFLOW_TOOLS",
     "ReadTool", "WriteTool", "EditTool", "GlobTool", "GrepTool", "FILE_TOOLS",
     "MCPTools", "MCPServerConfig", "SkillsListTool", "SkillViewTool", "SkillManageTool",
     "PluginsListTool", "PluginViewTool", "PLUGIN_TOOLS", "AgentsListTool", "AgentViewTool",

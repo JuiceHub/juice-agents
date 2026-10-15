@@ -91,7 +91,7 @@ export function pickElapsedTip(elapsedMs: number): string | null {
     return "Use /clear to start fresh and free up context";
   }
   if (elapsedMs >= TIP_AFTER_MS) {
-    return "Esc to interrupt, Ctrl+C to exit";
+    return "Esc/Ctrl+C to interrupt";
   }
   return null;
 }

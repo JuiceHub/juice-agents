@@ -15,7 +15,7 @@ from juice_agents.core.config.context import ConfigurationContext
 from juice_agents.core.registry.agents.types import AgentConfig
 from juice_agents.core.registry.tools.types import ToolRef
 from juice_agents.core.registry import AgentRegistry, ToolRegistry
-from juice_agents.core.graph.types import GraphConfig
+from juice_agents.core.workflow.types import WorkflowConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,7 +75,7 @@ def resolve_runtime_workspace(config: Any) -> RuntimeWorkspace:
     因根目录不存在而直接失败。
     """
 
-    runtime_cfg = GraphConfig.from_any(config)
+    runtime_cfg = WorkflowConfig.from_any(config)
     runtime_cfg.validate()
     raw_workspace_dir = runtime_cfg.workspace_dir
     if raw_workspace_dir is None:

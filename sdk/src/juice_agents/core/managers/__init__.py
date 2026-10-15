@@ -13,7 +13,7 @@ from typing import Any
 _EXPORTS = {
     "AsyncTaskManager": (".async_tasks", "AsyncTaskManager"),
     "TaskEventSink": (".async_tasks", "TaskEventSink"),
-    "GraphRunManager": (".graphs", "GraphRunManager"),
+    "WorkflowRunManager": (".workflows", "WorkflowRunManager"),
     "ToolManager": (".tools", "ToolManager"),
     "TeamManager": (".team", "TeamManager"),
 }

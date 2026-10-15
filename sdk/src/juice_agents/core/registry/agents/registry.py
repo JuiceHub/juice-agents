@@ -671,16 +671,16 @@ class AgentRegistry:
         # Visibility is decided before factories run, so hidden capabilities do
         # not leak into prompt schemas, callable maps, or CodeAct executors.
         from juice_agents.core.agent.tools.builtin.evolution.constants import SELF_EVOLUTION_TOOL_NAMES
-        from juice_agents.core.agent.tools.builtin.graphs.constants import GRAPH_TOOL_NAMES
+        from juice_agents.core.agent.tools.builtin.workflows.constants import WORKFLOW_TOOL_NAMES
 
-        graph_tools_enabled = bool(config.enable_graph_tools) and self._automatic_capability_enabled(
-            "graphs", runtime_config_path
+        workflow_tools_enabled = bool(config.enable_workflow_tools) and self._automatic_capability_enabled(
+            "workflows", runtime_config_path
         )
         evolution_enabled = self._automatic_capability_enabled("self_evolution", runtime_config_path)
         tools_config = [
             tool.to_dict()
             for tool in config.tools
-            if (graph_tools_enabled or tool.name not in GRAPH_TOOL_NAMES)
+            if (workflow_tools_enabled or tool.name not in WORKFLOW_TOOL_NAMES)
             and (evolution_enabled or tool.name not in SELF_EVOLUTION_TOOL_NAMES)
         ]
         tools = self._tool_registry.instantiate_batch(
@@ -712,7 +712,7 @@ class AgentRegistry:
             "output_schema": deepcopy(config.output_schema),
             "log_file_path": config.log_file_path,
             "enable_skill_tools": bool(config.enable_skill_tools) and self._skills_enabled(runtime_config_path),
-            "enable_graph_tools": graph_tools_enabled,
+            "enable_workflow_tools": workflow_tools_enabled,
             "enable_self_evolution": evolution_enabled,
         }
 

@@ -106,18 +106,19 @@ class RunnerContext:
             max_observation_chars=max_observation_chars,
         )
 
-    def launch_local_graph(
+    def launch_local_workflow(
         self,
         *,
-        graph_name: str,
-        payload: dict[str, Any],
+        workflow: Any,
+        args: dict[str, Any],
         config: dict[str, Any] | None = None,
         max_observation_chars: int | None = None,
     ) -> dict[str, Any]:
-        return self.runner.launch_local_graph_async_task(
+        # ``workflow`` 可以是名称或已审批的 WorkflowMetadata，原样透传给 Runner。
+        return self.runner.launch_local_workflow_async_task(
             owner_agent_name=self.agent_name,
-            graph_name=graph_name,
-            payload=dict(payload),
+            workflow=workflow,
+            args=dict(args),
             config=None if config is None else dict(config),
             max_observation_chars=max_observation_chars,
         )

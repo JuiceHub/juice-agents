@@ -4,12 +4,13 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import {
-  buildActorSelectorItems,
-  buildActorViewHint,
+  buildActiveSelectorItems,
+  buildActiveViewHint,
   buildCommandStatus,
   getNextAgentMode,
+  resolveCtrlCAction,
   resolveInputLayer,
-  resolveActorTranscriptMessages,
+  resolveActiveTranscriptMessages,
   shouldJumpTranscriptForCommandResult,
   shouldPollCron,
   shouldRenderComposerDock,
@@ -297,18 +298,18 @@ test("cron idle polling is disabled while user-facing work is active", () => {
 
 
 test("Ctrl+S actor session selector lists main and subagent sessions", () => {
-  const items = buildActorSelectorItems(
+  const items = buildActiveSelectorItems(
     {
       runner_id: "team-001",
       permission_mode: "default",
       agent_mode: "team",
-      root_actor_name: "teamlead",
-      actors: [
+      root_agent_name: "teamlead",
+      agents: [
         {
-          actor_id: "root",
-          actor_name: "teamlead",
-          actor_kind: "teamlead",
-          actor_role: "root",
+          agent_id: "root",
+          agent_name: "teamlead",
+          agent_kind: "teamlead",
+          agent_role: "root",
           status: "idle",
           is_root: true,
           current_async_task_id: "",
@@ -317,10 +318,10 @@ test("Ctrl+S actor session selector lists main and subagent sessions", () => {
           steps: [],
         },
         {
-          actor_id: "team:researcher",
-          actor_name: "researcher",
-          actor_kind: "teammate",
-          actor_role: "worker",
+          agent_id: "team:researcher",
+          agent_name: "researcher",
+          agent_kind: "teammate",
+          agent_role: "worker",
           status: "active",
           is_root: false,
           current_async_task_id: "teammate_researcher_0001",
@@ -340,18 +341,18 @@ test("Ctrl+S actor session selector lists main and subagent sessions", () => {
 });
 
 test("Ctrl+S actor session selector still opens before subagents exist", () => {
-  const items = buildActorSelectorItems(
+  const items = buildActiveSelectorItems(
     {
       runner_id: "team-001",
       permission_mode: "default",
       agent_mode: "team",
-      root_actor_name: "teamlead",
-      actors: [
+      root_agent_name: "teamlead",
+      agents: [
         {
-          actor_id: "root",
-          actor_name: "teamlead",
-          actor_kind: "teamlead",
-          actor_role: "root",
+          agent_id: "root",
+          agent_name: "teamlead",
+          agent_kind: "teamlead",
+          agent_role: "root",
           status: "idle",
           is_root: true,
           current_async_task_id: "",
@@ -366,34 +367,34 @@ test("Ctrl+S actor session selector still opens before subagents exist", () => {
 
   assert.deepEqual(
     items.map((item) => item.value),
-    ["", "__empty_actor_sessions__"]
+    ["", "__empty_agent_sessions__"]
   );
   assert.equal(items[1].label, "No subagent sessions yet");
 });
 
 test("Ctrl+S actor session selector has a visible fallback before RPC refresh", () => {
-  const items = buildActorSelectorItems(null, null);
+  const items = buildActiveSelectorItems(null, null);
 
   assert.deepEqual(
     items.map((item) => item.value),
-    ["", "__empty_actor_sessions__"]
+    ["", "__empty_agent_sessions__"]
   );
   assert.equal(items[0].label, "Main · main");
 });
 
 test("Ctrl+S actor session selector does not render blank actor labels", () => {
-  const items = buildActorSelectorItems(
+  const items = buildActiveSelectorItems(
     {
       runner_id: "team-001",
       permission_mode: "default",
       agent_mode: "team",
-      root_actor_name: "teamlead",
-      actors: [
+      root_agent_name: "teamlead",
+      agents: [
         {
-          actor_id: "root",
-          actor_name: "teamlead",
-          actor_kind: "teamlead",
-          actor_role: "root",
+          agent_id: "root",
+          agent_name: "teamlead",
+          agent_kind: "teamlead",
+          agent_role: "root",
           status: "idle",
           is_root: true,
           current_async_task_id: "",
@@ -402,10 +403,10 @@ test("Ctrl+S actor session selector does not render blank actor labels", () => {
           steps: [],
         },
         {
-          actor_id: "team:researcher",
-          actor_name: "",
-          actor_kind: "teammate",
-          actor_role: "worker",
+          agent_id: "team:researcher",
+          agent_name: "",
+          agent_kind: "teammate",
+          agent_role: "worker",
           status: "active",
           is_root: false,
           current_async_task_id: "",
@@ -426,18 +427,18 @@ test("Ctrl+S actor session selector does not render blank actor labels", () => {
 
 test("subagent actor session transcript is interactive while main messages remain separate", () => {
   const mainMessages = [{ kind: "user" as const, text: "main prompt" }];
-  const messages = resolveActorTranscriptMessages(
+  const messages = resolveActiveTranscriptMessages(
     {
       runner_id: "team-001",
       permission_mode: "default",
       agent_mode: "team",
-      root_actor_name: "teamlead",
-      actors: [
+      root_agent_name: "teamlead",
+      agents: [
         {
-          actor_id: "team:researcher",
-          actor_name: "researcher",
-          actor_kind: "teammate",
-          actor_role: "worker",
+          agent_id: "team:researcher",
+          agent_name: "researcher",
+          agent_kind: "teammate",
+          agent_role: "worker",
           status: "idle",
           is_root: false,
           current_async_task_id: "",
@@ -453,7 +454,7 @@ test("subagent actor session transcript is interactive while main messages remai
 
   assert.equal(messages[0].text, "researcher: idle · teammate");
   assert.equal(messages[1].text, "subagent prompt");
-  assert.equal(buildActorViewHint("researcher"), "Viewing: researcher · interactive · Esc return");
+  assert.equal(buildActiveViewHint("researcher"), "Viewing: researcher · interactive · Esc return");
 });
 
 test("streamed actor session reports refresh the actor selector without blocking RPC", () => {
@@ -648,3 +649,11 @@ test("agent type selector saves only the workspace default", () => {
 // resolveLiveBlocks 相关回归测试已删除：alt-screen + VirtualScrollList 单一渲染
 // 管线从根上消除了「两套机制并存导致重复显示」的竞态（P1 端到端实证 0 重复）。
 // 新架构的虚拟滚动算法回归测试见 ink-ext/VirtualScrollList.test.ts。
+
+test("Ctrl+C on empty composer cancels during streaming instead of exiting", () => {
+  // streaming 时同一次按键由 cancel 层取消 stream，composer 侧必须忽略，不能退出 CLI。
+  assert.equal(resolveCtrlCAction({ streaming: true, activeAgentName: null }), "ignore");
+  assert.equal(resolveCtrlCAction({ streaming: true, activeAgentName: "worker" }), "ignore");
+  assert.equal(resolveCtrlCAction({ streaming: false, activeAgentName: "worker" }), "interrupt-actor");
+  assert.equal(resolveCtrlCAction({ streaming: false, activeAgentName: null }), "exit");
+});

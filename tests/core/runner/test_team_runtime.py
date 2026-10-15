@@ -8,7 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from juice_agents.core.agent.sessions import ActionStep, AgentSession
+from juice_agents.core.agent.context import ActionStep, ContextTree
 from juice_agents.core.registry import AgentRegistry
 from juice_agents.core.runner import AgentBinding, Runner, RunnerConfig, TeamRunConfig, mode_registry
 from adapters.stdio_gateway.serialization import serialize_runner_stream_event
@@ -21,7 +21,7 @@ class _SubmittedAgent:
         self.max_steps = 1
         self.tools: dict[str, Any] = {}
         self.tool_executor_max_workers = 1
-        self.session = AgentSession(system_prompt="team test")
+        self.context = ContextTree(tree_id=f"test_{name}", system_prompt="team test")
 
     def bind_manager_infra(self, **_kwargs: Any) -> None:
         pass
@@ -87,10 +87,12 @@ def test_team_dispatch_persists_member_session_and_acknowledges_inbox(tmp_path: 
         _wait_for(lambda: not manager.pending_messages("developer"))
         snapshot = runner.agent_manager.load_snapshot(_member_session_id(runner, "developer"))
         assert snapshot is not None
-        steps = snapshot["session"]["steps"]
+        # 从新的 ContextTree 结构中检查消息是否被接收
+        nodes = snapshot["session"]["nodes"]
         assert any(
             attachment.get("payload", {}).get("message_id") == message["message_id"]
-            for step in steps for attachment in step.get("attachments", [])
+            for node in nodes.values()
+            for attachment in node.get("step", {}).get("attachments", [])
         )
         _wait_for(lambda: not manager.has_pending_work())
     finally:
@@ -278,8 +280,9 @@ def test_member_restart_uses_new_session_and_close_requeues_work(tmp_path: Path)
         old = runner.agent_manager.load_snapshot(_member_session_id(runner, "developer", 1))
         new = runner.agent_manager.load_snapshot(_member_session_id(runner, "developer", 2))
         assert old is not None and new is not None
-        old_text = str(old["session"]["steps"])
-        new_text = str(new["session"]["steps"])
+        # 检查新的 ContextTree 结构：将整个 session 转为字符串来查找 message_id
+        old_text = str(old["session"])
+        new_text = str(new["session"])
         assert first["message_id"] in old_text and first["message_id"] not in new_text
         assert second["message_id"] in new_text and second["message_id"] not in old_text
 
@@ -356,7 +359,8 @@ def test_member_message_wakes_root_continuation_in_same_stream(tmp_path: Path) -
 
     class _CoordinatingRoot(_SubmittedAgent):
         def step(self, step: ActionStep) -> ActionStep:
-            root_calls.append(len(self.session.steps))
+            # 使用 ContextTree 的节点数来追踪调用次数
+            root_calls.append(len(self.context.nodes))
             if len(root_calls) == 1:
                 self.runner_context.runner.team_manager.add_task("Report back", eligible_members=["developer"])
             return super().step(step)
@@ -379,6 +383,7 @@ def test_member_message_wakes_root_continuation_in_same_stream(tmp_path: Path) -
         assert not runner.team_manager.pending_messages("root")
         message_id = runner.team_manager.snapshot()["messages"][0]["message_id"]
         root_snapshot = runner.agent_manager.load_snapshot("root")
-        assert message_id in str(root_snapshot["session"]["steps"])
+        # 检查新的 ContextTree 结构：将整个 session 转为字符串来查找 message_id
+        assert message_id in str(root_snapshot["session"])
     finally:
         runner.close()

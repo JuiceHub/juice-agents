@@ -19,7 +19,7 @@ Open the `http://127.0.0.1:5173/` URL printed in the terminal. The script starts
 | Center | Read conversations, tool results, and approvals; queue input while a run is active |
 | Right | Operate the current Runner Browser or preview workspace files read-only |
 
-Team sessions show task completion, member state, and errors. The input supports `/agents`, `/teams`, `/skills`, `/deep-research`, and other commands, plus model and thinking-effort selection.
+Team sessions show task completion, member state, and errors. The input supports `/agents`, `/teams`, `/skills` and other commands, `$<skill>` / `$workflow:<name> <task>` explicit invocation, plus model and thinking-effort selection.
 
 Browser uses a real Chromium page through Playwright. Run `python -m playwright install chromium` before first use. A desktop session is required for a separate visible window; pure SSH environments can use the embedded preview.
 

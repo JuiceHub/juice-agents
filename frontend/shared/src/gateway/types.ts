@@ -8,7 +8,7 @@ export interface SessionStatus {
   permission_mode: string;
   /** 执行模式维度：agent | plan | team | group */
   agent_mode: string;
-  root_actor_name: string;
+  root_agent_name: string;
   base_dir: string;
   started: boolean;
   resumed: boolean;
@@ -76,7 +76,7 @@ export interface SessionSummary {
   runner_id: string;
   permission_mode: string;
   agent_mode: string;
-  root_actor_name: string;
+  root_agent_name: string;
   updated_at: string;
   root_dir: string;
   first_user_request_preview?: string;
@@ -137,11 +137,11 @@ export interface ActionStep {
   observation_images: ObservationImage[];
   attachments: Record<string, any>[];
   error: string | null;
-  round_outcome: "continue" | "submitted" | "yielded" | "failed";
+  round_outcome: "continue" | "submitted" | "failed";
   output: unknown;
 }
 
-export type ActorSessionStep =
+export type ActiveAgentStep =
   | {
       type: "task";
       task: string;
@@ -157,30 +157,30 @@ export type ActorSessionStep =
     }
   | Record<string, any>;
 
-export interface ActorSessionSnapshot {
-  actor_id: string;
-  actor_name: string;
-  actor_kind: string;
-  actor_role: string;
+export interface ActiveAgentSnapshot {
+  agent_id: string;
+  agent_name: string;
+  agent_kind: string;
+  agent_role: string;
   status: string;
   is_root: boolean;
   current_async_task_id: string;
   metadata: Record<string, any>;
   session: Record<string, any>;
-  steps: ActorSessionStep[];
+  steps: ActiveAgentStep[];
 }
 
-export interface ActorSessionsReport {
+export interface ActiveAgentsReport {
   runner_id: string;
   permission_mode: string;
   agent_mode: string;
-  root_actor_name: string;
-  actors: ActorSessionSnapshot[];
+  root_agent_name: string;
+  agents: ActiveAgentSnapshot[];
 }
 
-export interface SendActorMessageResponse {
+export interface SendAgentMessageResponse {
   accepted: boolean;
-  actor_name: string;
+  agent_name: string;
   message_id: string;
   delivery: "actor_attachment" | string;
   started_async_task_id?: string;
@@ -188,9 +188,9 @@ export interface SendActorMessageResponse {
   error?: string;
 }
 
-export interface InterruptActorResponse {
+export interface InterruptAgentResponse {
   interrupted: boolean;
-  actor_name: string;
+  agent_name: string;
   async_task_id?: string;
   status: "interrupted" | "idle" | "not_live" | string;
   reason: string;
@@ -201,8 +201,8 @@ export interface AsyncTaskState {
   async_task_id: string;
   type: string;
   status: string;
-  owner_actor_id: string;
-  owner_actor_name: string;
+  owner_agent_id: string;
+  owner_agent_name: string;
   description: string;
   output_dir: string;
   created_at: number;
@@ -227,10 +227,10 @@ export interface AsyncTaskOutput {
 export interface RunnerLifecycleEvent {
   scope: string;
   event: string;
-  graph_name?: string;
-  graph_run_id?: string;
+  workflow_name?: string;
+  workflow_run_id?: string;
   node?: string;
-  actor_role?: string;
+  agent_role?: string;
   completed?: number;
   total?: number;
   detail?: string;
@@ -273,18 +273,18 @@ export interface RunnerStreamEvent {
   permission_mode: string;
   agent_mode: string;
   runner_id: string;
-  actor_name: string | null;
-  actor_role: string | null;
+  agent_name: string | null;
+  agent_role: string | null;
   step_num: number | null;
   action_step: ActionStep | null;
   team_event: TeamStreamEvent | null;
   lifecycle_event?: RunnerLifecycleEvent | null;
   round_id: string;
-  outcome?: "submitted" | "yielded" | "failed" | "";
+  outcome?: "submitted" | "failed" | "";
   output?: unknown;
   reason?: string;
   stop_reason?: string;
-  actor_sessions_report?: ActorSessionsReport | null;
+  agent_sessions_report?: ActiveAgentsReport | null;
 }
 
 export interface StreamMessageResult {
@@ -347,7 +347,7 @@ export interface WorkspaceRuntimeConfig {
   self_evolution?: {
     enabled?: boolean;
   };
-  graphs?: {
+  workflows?: {
     enabled?: boolean;
   };
   [key: string]: any;
@@ -643,8 +643,8 @@ export interface ClientCommand {
     | "set_skills_config"
     | "self_evolution_config_status"
     | "set_self_evolution_config"
-    | "graphs_config_status"
-    | "set_graphs_config"
+    | "workflows_config_status"
+    | "set_workflows_config"
     | "set_image_config"
     | "memory_status"
     | "memory_search"
@@ -660,15 +660,13 @@ export interface ClientCommand {
     | "list_cron_tasks"
     | "delete_cron_task"
     | "cron_status"
-    | "list_graphs"
-    | "view_graph"
-    | "run_graph"
-    | "list_graph_runs"
-    | "control_graph_run"
+    | "list_workflows"
+    | "view_workflow"
+    | "run_workflow"
     | "permission_status"
-    | "describe_actor_sessions"
-    | "send_actor_message"
-    | "interrupt_actor";
+    | "describe_agent_sessions"
+    | "send_agent_message"
+    | "interrupt_agent";
   payload?: Record<string, unknown>;
 }
 

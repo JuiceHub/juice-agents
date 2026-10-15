@@ -11,7 +11,8 @@
 | --- | --- |
 | `Enter` / `Alt+Enter` | 提交输入 / 在输入框内换行；运行中的新输入按顺序排队 |
 | `PgUp` / `PgDn` | 浏览当前会话记录 |
-| `Esc` / `Ctrl+C` | 中断当前回合 |
+| `Esc` / `Ctrl+C` | 中断当前回合；空闲且输入为空时 `Ctrl+C` 退出 |
+| `Shift` + 拖拽（iTerm2 用 `Option`） | 选中文本复制（绕过应用内鼠标滚动） |
 | `Ctrl+S` / `Ctrl+T` | 查看子 Agent / 后台任务 |
 | `/resume` | 恢复已有会话 |
 | `/mode` / `/permissions` | 切换运行模式 / 审批策略 |

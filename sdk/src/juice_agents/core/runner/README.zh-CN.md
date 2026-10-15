@@ -2,10 +2,10 @@
 
 # Runner
 
-`Runner` 是单个对话请求的统一入口。它不持有 Agent、Tool、Graph 或后台任务的 live 实例；这些可变对象分别由 Manager 管理。静态声明只由 Registry 解析并构造为全新对象。
+`Runner` 是单个对话请求的统一入口。它不持有 Agent、Tool、Workflow 或后台任务的 live 实例；这些可变对象分别由 Manager 管理。静态声明只由 Registry 解析并构造为全新对象。
 
 ```text
-Agent / Tool / Graph 声明
+Agent / Tool / Workflow 声明
               │ resolve · validate · instantiate
               ▼
            Registry
@@ -13,7 +13,7 @@ Agent / Tool / Graph 声明
               ▼
 Runner ── 持有 ──► AgentManager      session · snapshot · stream · cancel · release
   │                ToolManager        runtime binding · permissions · audit
-  │                GraphRunManager    graph run · checkpoint · recovery
+  │                WorkflowRunManager    workflow call · checkpoint · recovery
   └──────────────► AsyncTaskManager   task state · workers · notification · recovery
 ```
 
@@ -65,7 +65,7 @@ MultiStepAgent
 - `stop()` 协作式取消 Managers；`close()` 释放资源。
 - `resume()` 只接受当前 Runner manifest schema。不会迁移或恢复旧 `.juice/runners/` 数据。
 
-Runner 状态根目录为 `.juice/runners/<runner_id>/`。manifest 保存序列化后的 `RunnerConfig`、所选 Team 和 mode 内禁用的 Agent；Agent 运行快照位于 `agents/`。正式计划文件始终是 `plans/root.md`。对应的 Manager 持有任务、Graph 和工具运行记录。
+Runner 状态根目录为 `.juice/runners/<runner_id>/`。manifest 保存序列化后的 `RunnerConfig`、所选 Team 和 mode 内禁用的 Agent；Agent 运行快照位于 `agents/`。正式计划文件始终是 `plans/root.md`。对应的 Manager 持有任务、Workflow 和工具运行记录。
 
 ## 模块索引
 
@@ -76,14 +76,14 @@ Runner 状态根目录为 `.juice/runners/<runner_id>/`。manifest 保存序列�
 | `execution/context.py` | Agent 到 Runner 的受限能力桥接 |
 | `persistence/store.py` | Runner manifest 和目录布局 |
 | `core/agent/manager.py` | Agent 生命周期与快照 |
-| `core/managers/` | Tool、GraphRun 和 AsyncTask 的运行时所有权 |
+| `core/managers/` | Tool、Workflow 和 AsyncTask 的运行时所有权 |
 
 修改此边界时，增加架构测试证明 Registry 不持有 live 状态、Manager 管理生命周期、Runner 不直接构造或执行领域对象。
 
 ## 开发约定
 
-- `RunnerConfig` 是可序列化数据；内置和自定义 mode 共用 `stream()`、`run()`、`stop()`。不注册动态 factory、callback 或独立循环。Runner 可以持有请求锁、取消状态和监听器，但不能持有 live Agent/Tool/Graph/Task。
-- 切换 mode 前先校验目标，只能在 root、后台任务和 Graph 都空闲时应用；保留 Runner ID 与 snapshot。忙碌时拒绝切换，未完成的 Team 工作也阻止切换。旧 manifest schema 明确报错，不自动迁移。
+- `RunnerConfig` 是可序列化数据；内置和自定义 mode 共用 `stream()`、`run()`、`stop()`。不注册动态 factory、callback 或独立循环。Runner 可以持有请求锁、取消状态和监听器，但不能持有 live Agent/Tool/Workflow/Task。
+- 切换 mode 前先校验目标，只能在 root、后台任务和 Workflow 都空闲时应用；保留 Runner ID 与 snapshot。忙碌时拒绝切换，未完成的 Team 工作也阻止切换。旧 manifest schema 明确报错，不自动迁移。
 - Team 任务状态先持久化再发事件；成员轮次由共享 `AsyncTaskManager` 调度，session 由 `AgentManager` checkpoint；接收方 step 保存后才确认消息 ID。请求流需在 `round_end` 前等待活跃成员调用并发出 `team_update`。
-- `AgentManager.acquire()` 依次加载 snapshot、通过 Registry 构造新对象、恢复 session、绑定 context 并保存 checkpoint。`stop()` 协作取消，`close()` 释放资源；终态与恢复日志包含 Runner、Agent/任务/Graph ID 和原因。持久化只含数据，不序列化 live Python 对象。
+- `AgentManager.acquire()` 依次加载 snapshot、通过 Registry 构造新对象、恢复 session、绑定 context 并保存 checkpoint。`stop()` 协作取消，`close()` 释放资源；终态与恢复日志包含 Runner、Agent/任务/Workflow ID 和原因。持久化只含数据，不序列化 live Python 对象。
 - 边界、生命周期和布局测试放在 `tests/core/runner/`，覆盖内置 mode 共用执行链、并发、取消、恢复及拒绝旧 schema。

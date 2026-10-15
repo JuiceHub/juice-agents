@@ -9,7 +9,7 @@ flowchart LR
   R[Registry\n静态声明] -->|每次创建新对象| M[Manager\n运行状态与持久化]
   U[Runner 请求] --> M
   M --> T[ToolManager\n防护 · 池 · 审计]
-  M --> G[GraphRunManager\n实例 · checkpoint · 结果]
+  M --> W[WorkflowRunManager\n函数调用 · 产物]
   M --> A[AsyncTaskManager\n任务 · 进程 · 通知]
   M --> Tm[TeamManager\n任务板 · 收件箱 · 成员]
 ```
@@ -17,7 +17,7 @@ flowchart LR
 | Manager | 所有权 | 持久数据 | 恢复行为 |
 | --- | --- | --- | --- |
 | `ToolManager` | 工具池、绑定的权限/取消上下文、调用记录 | `tool_calls.jsonl` | 只恢复审计标识；不会从审计记录重建 Tool |
-| `GraphRunManager` | live graph、运行锁/future、取消事件 | manifest、源码快照、events、checkpoint、result | 活跃运行收敛为 `stopped(stale_on_resume)`；显式恢复时重新构造 |
+| `WorkflowRunManager` | workflow context、内部 agent 调度器、产物 | `<runner_root>/workflows/<name>-<id>/` 中的产物 | 无状态函数调用；无持久化或恢复 |
 | `AsyncTaskManager` | 任务状态、线程池、子进程、通知及输出读取 | `registry.json`、任务输出文件 | 不透明的活跃回调变为 `killed(stale_on_recovery)`；重放通知 |
 | `TeamManager` | Team 任务、依赖、资格、领取、收件箱、成员及完成门控 | `team.json` | 失败成员任务保留 `in_progress` 和错误供 root 审核；可对账并确认已保存的消息 ID |
 

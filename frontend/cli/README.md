@@ -10,7 +10,8 @@
 | --- | --- |
 | `Enter` / `Alt+Enter` | Submit input / insert a newline; input during a run is queued |
 | `PgUp` / `PgDn` | Browse the current session |
-| `Esc` / `Ctrl+C` | Interrupt the current turn |
+| `Esc` / `Ctrl+C` | Interrupt the current turn; `Ctrl+C` on an idle empty input exits |
+| `Shift` + drag (iTerm2: `Option`) | Select text to copy (bypasses in-app mouse scrolling) |
 | `Ctrl+S` / `Ctrl+T` | View child Agents / background tasks |
 | `/resume` | Resume an existing session |
 | `/mode` / `/permissions` | Change the execution mode / approval policy |

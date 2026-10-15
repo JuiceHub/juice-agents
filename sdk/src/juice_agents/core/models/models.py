@@ -4,7 +4,7 @@ import threading
 from typing import Any, Dict, List, Optional
 
 from juice_agents.core.runner.execution.cancellation import StreamCancelled, raise_if_cancelled
-from juice_agents.core.agent.sessions.content import CACHE_BOUNDARY_KEY
+from juice_agents.core.agent.context.content import CACHE_BOUNDARY_KEY
 
 logger = logging.getLogger(__name__)
 

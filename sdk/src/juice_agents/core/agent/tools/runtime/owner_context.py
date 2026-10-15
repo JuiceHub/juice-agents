@@ -1,7 +1,7 @@
 """Shared context resolution for owner-bound builtin tools.
 
 五个配置工具基类 (AgentConfigToolBase, ToolConfigToolBase, SkillToolBase,
-GraphToolBase, 以及 evolution/ 里四个 manage) 继承自 Tool，都需要从
+WorkflowToolBase, 以及 evolution/ 里四个 manage) 继承自 Tool，都需要从
 owner_agent 推导 workspace context 以解析 `.juice` 配置位置。
 
 降级链（按优先级）：

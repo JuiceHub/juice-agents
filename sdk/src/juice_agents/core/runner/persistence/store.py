@@ -1,7 +1,7 @@
 """Runner manifest and Manager-owned directory layout.
 
 Runner persistence contains only request metadata and a serializable
-``RunnerConfig``.  Agent sessions, task state, tool audits and graph runs are
+``RunnerConfig``.  Agent sessions, task state, tool audits and workflow runs are
 owned by their respective managers beneath this root.
 """
 
@@ -48,7 +48,6 @@ class RunnerLayout:
     async_tasks_dir: Path
     async_task_registry_path: Path
     tools_dir: Path
-    graphs_dir: Path
     observation_images_dir: Path
     browser_screenshots_dir: Path
     todos_dir: Path
@@ -63,7 +62,6 @@ class RunnerLayout:
             self.agents_dir,
             self.async_tasks_dir,
             self.tools_dir,
-            self.graphs_dir,
             self.observation_images_dir,
             self.browser_screenshots_dir,
             self.todos_dir,
@@ -106,7 +104,6 @@ def build_layout(
         async_tasks_dir=resolved_root / "async_tasks",
         async_task_registry_path=resolved_root / "async_tasks" / "registry.json",
         tools_dir=resolved_root / "tools",
-        graphs_dir=resolved_root / "graphs",
         observation_images_dir=resolved_root / "observation_images",
         browser_screenshots_dir=resolved_root / "browser_screenshots",
         todos_dir=resolved_root / "todos",

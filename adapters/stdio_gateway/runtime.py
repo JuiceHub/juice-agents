@@ -29,9 +29,9 @@ from juice_agents.core.runner import Runner, RunnerBusyError, mode_registry
 from juice_agents.core.memory.config import get_memory_config, set_workspace_memory_feature
 from juice_agents.core.memory.store import MemoryStore
 from juice_agents.core.config.runtime_config import read_runtime_config, update_workspace_config
-from juice_agents.core.managers import GraphRunManager
+from juice_agents.core.managers import WorkflowRunManager
 from juice_agents.core.permissions import get_permission_status
-from juice_agents.core.registry.graphs import GraphRegistry
+from juice_agents.core.registry.workflows import WorkflowRegistry
 from juice_agents.core.cron import (
     create_cron_task,
     cron_status,
@@ -1048,14 +1048,17 @@ class DirectRunnerRuntime:
     def set_self_evolution_config(self, *, enabled: bool) -> dict[str, Any]:
         return self._set_automatic_capability(section="self_evolution", enabled=enabled)
 
-    def graphs_config_status(self) -> dict[str, Any]:
-        return self._automatic_capability_status("graphs")
+    def workflows_config_status(self) -> dict[str, Any]:
+        return self._automatic_capability_status("workflows")
 
-    def set_graphs_config(self, *, enabled: bool) -> dict[str, Any]:
-        return self._set_automatic_capability(section="graphs", enabled=enabled)
+    def set_workflows_config(self, *, enabled: bool) -> dict[str, Any]:
+        return self._set_automatic_capability(section="workflows", enabled=enabled)
 
     def switch_model(self, model_name: str, model_effort: str | None = None) -> SessionStatus:
-        """Reconfigure the current runner with a new logical runtime model."""
+        """Reconfigure the current runner with a new logical runtime model.
+
+        模型切换是热更新：仅更新配置，不重建 runner，保持对话连续性。
+        """
         normalized_name = str(model_name or "").strip()
         if not normalized_name:
             raise ValueError("model_name 不能为空")
@@ -1080,83 +1083,166 @@ class DirectRunnerRuntime:
         )
         if self._runner is None:
             return self._preview_session_status()
-        self._rebuild_live_runner(reason="model_changed")
+
+        # 热更新 runner 的模型配置，不重建整个 runner
+        # self._rebuild_live_runner(reason="model_changed")  # 移除：会创建新 runner_id
+        logger.info(
+            "模型热切换: runner_id=%s model_name=%s model_effort=%s",
+            self._runner.runner_id,
+            self.model_name,
+            self.model_effort,
+        )
         return self.describe_session()
 
-    def _graph_registry(self) -> GraphRegistry:
-        """Read graph declarations without constructing a graph runtime."""
+    def switch_strategy(
+        self,
+        params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """切换 Agent 的探索策略
+
+        统一使用 breadth/depth/beam_width 参数配置策略。
+
+        Args:
+            params: 策略参数
+                - breadth: 每步展开分支数 (int 或 list)
+                - depth: 最大探索深度
+                - beam_width: 每步保留路径数
+                - reset: 是否重置为默认贪心策略
+
+        Returns:
+            包含策略信息的字典
+        """
+        from juice_agents.core.agent.context.strategies import (
+            GreedyStrategy,
+            TreeOfThoughtsStrategy,
+        )
+
+        params = params or {}
+
+        # 重置为贪心策略
+        if params.get("reset"):
+            strategy = GreedyStrategy()
+            strategy_info = {
+                "type": "greedy",
+                "params": {}
+            }
+        else:
+            # 解析参数
+            breadth = params.get("breadth", 1)
+            depth = params.get("depth", 1)
+            beam_width = params.get("beam_width", 1)
+
+            # 处理 breadth 可能是列表的情况
+            if isinstance(breadth, str) and breadth.startswith('['):
+                try:
+                    import json
+                    breadth = json.loads(breadth)
+                except Exception:
+                    breadth = 1
+            elif not isinstance(breadth, list):
+                breadth = int(breadth)
+
+            depth = int(depth)
+            beam_width = int(beam_width)
+
+            # 如果参数都是默认值 (1,1,1)，使用贪心策略
+            if breadth == 1 and depth == 1 and beam_width == 1:
+                strategy = GreedyStrategy()
+                strategy_info = {
+                    "type": "greedy",
+                    "params": {}
+                }
+            else:
+                # 使用探索策略
+                strategy = TreeOfThoughtsStrategy(
+                    breadth=breadth,
+                    depth_limit=depth,
+                    keep_top_k=beam_width
+                )
+                strategy_info = {
+                    "type": "exploration",
+                    "params": {
+                        "breadth": breadth,
+                        "depth": depth,
+                        "beam_width": beam_width
+                    }
+                }
+
+        # 应用策略到 root agent
+        if self._runner is None:
+            # Runner 未启动，记录策略信息待后续应用
+            logger.info("Runner 未启动，策略将在启动时应用")
+            return {
+                "status": "pending",
+                "strategy": strategy_info,
+                "message": "Strategy will be applied when session starts"
+            }
+
+        try:
+            root_agent = self._runner.agent_manager.get(self._runner.root_agent_id).instance
+            root_agent.set_exploration_strategy(strategy)
+            logger.info(
+                "探索策略已切换: runner_id=%s params=%s",
+                self._runner.runner_id,
+                params
+            )
+            return {
+                "status": "applied",
+                "strategy": strategy_info,
+                "message": "Strategy switched successfully"
+            }
+        except Exception as e:
+            logger.error("切换策略失败: %s", e)
+            raise RuntimeError(f"Failed to switch strategy: {e}")
+
+    def _workflow_registry(self) -> WorkflowRegistry:
+        """Read workflow declarations without constructing a workflow runtime."""
 
         context = ConfigurationContext.from_workspace(
             self.base_dir,
             project_config_path=self.runtime_config_path,
         )
-        return GraphRegistry(config_context=context)
+        return WorkflowRegistry(config_context=context)
 
-    def _graph_manager(self) -> GraphRunManager:
-        """Return the active Runner-owned graph manager.
+    def _workflow_manager(self) -> WorkflowRunManager:
+        """Return the active Runner-owned workflow manager.
 
-        A graph run is runtime state, so a cold CLI request first creates the
+        A workflow run is runtime state, so a cold CLI request first creates the
         same declarative Runner used by agent requests.  The adapter never
-        constructs a second graph execution owner.
+        constructs a second workflow execution owner.
         """
 
         if self._runner is None:
             self.start_session()
-        manager = getattr(self._runner, "graph_manager", None)
-        if not isinstance(manager, GraphRunManager):
-            raise RuntimeError("当前 Runner 未提供 GraphRunManager")
+        manager = getattr(self._runner, "workflow_manager", None)
+        if not isinstance(manager, WorkflowRunManager):
+            raise RuntimeError("当前 Runner 未提供 WorkflowRunManager")
         return manager
 
-    def _graphs_are_read_only(self) -> bool:
+    def _workflows_are_read_only(self) -> bool:
         config = mode_registry.resolve(self.agent_mode)
         return bool(config.tool_policy.read_only)
 
-    def list_graphs(self) -> dict[str, Any]:
-        graphs = [item.to_dict() for item in self._graph_registry().list_metadata()]
-        return {"graphs": graphs, "count": len(graphs)}
+    def list_workflows(self) -> dict[str, Any]:
+        workflows = [item.to_dict() for item in self._workflow_registry().list_metadata()]
+        return {"workflows": workflows, "count": len(workflows)}
 
-    def view_graph(self, name: str) -> dict[str, Any]:
-        return self._graph_registry().view(name)
+    def view_workflow(self, name: str) -> dict[str, Any]:
+        return self._workflow_registry().view(name)
 
-    def run_graph(
+    def run_workflow(
         self,
         name: str,
-        payload: dict[str, Any],
+        args: dict[str, Any],
         config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if self._graphs_are_read_only():
-            raise PermissionError("当前 RunnerConfig 为只读模式，禁止执行 graph")
-        if not isinstance(payload, dict):
-            raise ValueError("graph payload 必须为 object")
-        graph_config = dict(config or {})
-        configurable = dict(graph_config.get("configurable") or {})
-        configurable.setdefault("agent_type", self.agent_type)
-        graph_config["configurable"] = configurable
-        manager = self._graph_manager()
-        manifest = manager.run(name, payload, graph_config)
-        run_id = str(manifest["graph_run_id"])
-        result_path = manager.store.run_dir(run_id) / "result.json"
-        result = json.loads(result_path.read_text(encoding="utf-8")) if result_path.exists() else {}
-        return {"manifest": manifest, "result": result}
-
-    def list_graph_runs(self) -> dict[str, Any]:
-        runs = self._graph_manager().store.list()
-        return {"runs": runs, "count": len(runs)}
-
-    def control_graph_run(self, graph_run_id: str, action: str) -> dict[str, Any]:
-        if self._graphs_are_read_only():
-            raise PermissionError("当前 RunnerConfig 为只读模式，禁止修改 graph run")
-        manager = self._graph_manager()
-        normalized = str(action or "").strip().lower()
-        if normalized == "restart":
-            manifest = manager.restart(graph_run_id)
-        elif normalized == "resume":
-            manifest = manager.resume(graph_run_id)
-        elif normalized in {"pause", "stop"}:
-            manifest = manager.request(graph_run_id, normalized)
-        else:
-            raise ValueError(f"未知 graph run action: {action}")
-        return {"manifest": manifest}
+        if self._workflows_are_read_only():
+            raise PermissionError("当前 RunnerConfig 为只读模式，禁止执行 workflow")
+        if not isinstance(args, dict):
+            raise ValueError("workflow args 必须为 object")
+        called = self._workflow_manager().call(name, args, config)
+        # 与 workflow_run 工具的同步返回保持同一形状。
+        return {"status": "completed", "workflow_name": name, **called}
 
     def permission_status(self) -> dict[str, Any]:
         context = ConfigurationContext.from_workspace(

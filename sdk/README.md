@@ -2,59 +2,317 @@
 
 > [简体中文](README.zh-CN.md)
 
-`sdk/` is the independently buildable Python SDK. The package is `juice-agents`, the import name is `juice_agents`, and Python 3.11 or newer is required. It provides Agents, Graphs, Teams, and resumable Runners. CLI and Web code lives in `frontend/`; protocol adapters live in `adapters/`; neither is part of the SDK package.
+The independently buildable Python SDK for creating intelligent agents with persistent sessions, workflow orchestration, and multi-agent collaboration.
 
-## Install
+**Package:** `juice-agents` | **Import:** `juice_agents` | **Python:** 3.11+
+
+## Core Features
+
+| Feature | Description |
+| --- | --- |
+| 🤖 **Agents** | ReAct and CodeAct agents with 20+ built-in tools |
+| 🔄 **Session Resume** | Persist and restore conversations after process restart |
+| 🌐 **Workflows** | Python function workflows with inner agents and artifacts |
+| 👥 **Multi-Agent** | `agent`, `plan`, `group`, `team` — one runtime, four patterns |
+| 🛠️ **Tool Ecosystem** | Shell, filesystem, web, browser, memory, MCP, and custom tools |
+| 💾 **Persistent State** | Sessions, tasks, and team boards survive restarts |
+| 🎯 **Controlled Execution** | Permission modes, approval flows, audit logging |
+
+## Installation
 
 ```bash
 conda activate juice-agents
 python -m pip install -e ./sdk
 ```
 
-Run the command from the repository root. Build a local distribution with `python -m build --sdist --wheel --outdir sdk/dist sdk`, then install a wheel from `sdk/dist/`. Before using a hosted model, configure `.juice/config.yaml` in the workspace and provide its API key through the environment. The template is `src/juice_agents/_assets/config.example.yaml`.
+Run from repository root. For production, build a wheel:
 
-## Use
+```bash
+python -m build --sdist --wheel --outdir sdk/dist sdk
+pip install sdk/dist/juice_agents-*.whl
+```
+
+**Configuration:** Before using hosted models, configure `.juice/config.yaml` and provide API keys via environment:
+
+```bash
+mkdir -p .juice
+cp sdk/src/juice_agents/_assets/config.example.yaml .juice/config.yaml
+cp .env.example .env
+# Edit .env with your API keys
+```
+
+Model entries accept an optional `api_base_env`: when the named variable is set (process env > `.env`), it overrides the YAML `api_base`. Built-in Claude models use `ANTHROPIC_BASE_URL`, so switching to a proxy only needs a `.env` change.
+
+## Quick Start
+
+### Single Agent
 
 ```python
 from juice_agents import Juice
 
 juice = Juice(workspace=".")
-runner = juice.runners.create(permission_mode="default", runner_config="agent")
+runner = juice.runners.create(
+    runner_config="agent",
+    permission_mode="default"
+)
 
-print(runner.run("Analyze the request first"))
-for event in runner.stream("Continue the implementation"):
+# Streaming execution
+for event in runner.stream("Analyze this project's structure"):
     print(event)
 
-runner = juice.runners.resume(runner_id=runner.runner_id)
-runner.run("Continue the conversation")
-
-# The UI owns a long-lived clock; the SDK exposes atomic due/tick primitives.
-juice.cron.tick()
+# Blocking execution
+result = runner.run("Summarize the findings")
+print(result)
 ```
 
-`run()` consumes `stream()` and returns the final result; both append to the current Runner session. Create a new Runner for a new conversation. A Runner handles one user request at a time. Finite background Agents, Graphs, and commands started by a request are awaited and their notifications are injected once. Team members run finite turns for tasks or messages and do not consume a thread while idle. A Team stream waits for the current member call to finish so complete `team_update` progress can be delivered. Cron does not block ordinary requests.
+### Session Resume
 
-## Package boundary
+```python
+# First session
+runner = juice.runners.create(runner_config="agent")
+runner.run("Start analyzing the codebase")
+runner_id = runner.runner_id
 
-The wheel contains `juice_agents`, type markers, and public built-in resources. It does not contain `adapters/`, examples, `.env`, real `config.yaml`, or `.juice` runtime data. Configuration, Runner state, and caches are written to the caller's workspace.
+# After restart (even different process)
+runner = juice.runners.resume(runner_id=runner_id)
+runner.run("Continue with the implementation")
+```
 
-Runtime modules and their boundaries are documented in [Core](src/juice_agents/core/README.md).
+### Plan Mode
 
-## Development and release conventions
+```python
+runner = juice.runners.create(
+    runner_config="plan",
+    permission_mode="default"
+)
 
-| Path | Responsibility |
+# Investigate and plan
+runner.run("Refactor the authentication module")
+# Agent creates plans/root.md
+
+# Review and approve
+plan = runner.get_plan()
+print(plan)
+runner.approve_plan()
+
+# Execute approved plan
+runner.run("Execute the plan")
+```
+
+### Group Coordination
+
+```python
+runner = juice.runners.create(
+    runner_config="group",
+    permission_mode="default"
+)
+
+# Root coordinates specialist agents
+runner.run("Research competitors and write a market analysis report")
+# Root spawns: researcher, analyzer, writer
+```
+
+### Team Collaboration
+
+```python
+runner = juice.runners.create(
+    runner_config="team",
+    permission_mode="default"
+)
+
+# Create persistent team board
+runner.run("Create a team for web scraping project")
+runner.run("Add tasks: design schema, implement crawler, test")
+
+# Members claim and work on tasks
+# Tasks persist across sessions
+```
+
+## Agent Modes
+
+| Mode | Execution Pattern | Best For |
+| --- | --- | --- |
+| `agent` | Single agent with optional delegation | Direct task execution, Q&A |
+| `plan` | Investigate → Plan → Approve → Execute | Large refactors, multi-file changes |
+| `group` | Root coordinates specialist agents | Parallel research, domain expertise |
+| `team` | Persistent board, member task claims | Long-running projects, async work |
+
+All modes use the same `Runner` execution path and share tool, permission, and persistence infrastructure.
+
+## Tools
+
+Agents have access to 20+ built-in tools:
+
+**Filesystem:** `read_file`, `write_file`, `edit_file`, `list_directory`, `search_files`
+
+**Execution:** `shell`, `python_repl`, `python_script`
+
+**Web:** `web_search`, `web_fetch`, `browser_navigate`, `browser_screenshot`
+
+**Memory:** `memory_create`, `memory_update`, `memory_search`, `memory_list`
+
+**Collaboration:** `agent_spawn`, `agent_message`, `task_create`, `team_broadcast`
+
+**Workflows:** `workflow_call` (inner agents via `ctx.agent()`)
+
+**Output:** `submit_output`, `ask_user`
+
+Tools are dynamically available based on agent capabilities and runner policy.
+
+## Workflows
+
+Create Python function workflows:
+
+```python
+# .juice/workflows/research.py
+WORKFLOW_METADATA = {
+    "name": "research",
+    "description": "Multi-step research workflow",
+    "input_schema": {"query": "string"},
+}
+
+def run(ctx, args):
+    """Workflow entry point."""
+    query = args["query"]
+    
+    # Call inner agents
+    search_result = ctx.agent(
+        task=f"Search: {query}",
+        phase="search"
+    )
+    
+    analysis = ctx.agent(
+        task=f"Analyze: {search_result}",
+        phase="analyze"
+    )
+    
+    # Save artifacts
+    ctx.artifact("analysis.md", analysis)
+    
+    return {"report": analysis, "sources": search_result}
+```
+
+Call workflows from agents:
+
+```python
+from juice_agents.core.managers.workflows import WorkflowRunManager
+
+result = workflow_manager.call("research", {"query": "AI trends 2024"})
+```
+
+## Permission Modes
+
+| Mode | Behavior |
 | --- | --- |
-| `pyproject.toml` | Package metadata, dependencies, and build configuration |
-| `src/juice_agents/__init__.py`, `_client.py` | Stable exports and the `Juice` facade |
-| `src/juice_agents/core/` | Agent, Graph, Runner, storage, and module documentation |
-| `src/juice_agents/_assets/` | Templates and built-in Skills loaded through `importlib.resources` |
+| `default` | Prompt for destructive/external actions |
+| `auto` | Auto-approve all actions |
+| `read_only` | Block write operations |
+| `strict` | Prompt for every tool call |
 
-- `Runner.stream()` is the request entry point; `run()` only consumes its events. A Runner request is mutually exclusive and both methods append to the current session. Use `runners.create()` for a new conversation.
-- Runner handles `$skill`, `$plugin`, `$graph`, Goal/Plan continuation, and background tasks associated with the request. Adapters must not simulate continuation with an empty message.
-- Persist terminal task notifications before delivery; on recovery, replay only notifications that have not been consumed.
-- The SDK must not import repository-level `adapters`. Runtime data belongs in the caller workspace's `.juice/`; resources are loaded with `importlib.resources`.
+Configure at runner creation:
 
-Verify from the repository root:
+```python
+runner = juice.runners.create(
+    runner_config="agent",
+    permission_mode="read_only"
+)
+```
+
+## Cron and Scheduling
+
+Schedule recurring tasks:
+
+```python
+# UI owns the clock; SDK provides tick primitives
+juice.cron.tick()
+
+# Cron jobs are configured via workspace .juice/config.yaml
+```
+
+## API Reference
+
+### Juice Client
+
+```python
+juice = Juice(workspace=".", config_path=None)
+```
+
+- `workspace`: Working directory for `.juice/` state
+- `config_path`: Optional path to `config.yaml`
+
+### Runner Creation
+
+```python
+runner = juice.runners.create(
+    runner_config="agent",  # or "plan", "group", "team", or custom config
+    permission_mode="default",
+    model=None  # Optional model override
+)
+```
+
+### Runner Resume
+
+```python
+runner = juice.runners.resume(runner_id="run_abc123")
+```
+
+### Execution
+
+```python
+# Streaming
+for event in runner.stream("Task description"):
+    if event.type == "agent_message":
+        print(event.content)
+
+# Blocking (consumes stream internally)
+result = runner.run("Task description")
+```
+
+### Runner State
+
+```python
+runner.runner_id  # Unique ID for resume
+runner.config     # Immutable RunnerConfig
+runner.stop()     # Cooperative cancellation
+```
+
+## Package Boundary
+
+The SDK wheel contains:
+- `juice_agents` package
+- Type stubs
+- Built-in resources (skills, prompts, configs)
+
+**Not included:**
+- `adapters/` (protocol gateways)
+- `frontend/` (CLI and web UI)
+- Examples
+- `.env` or real `config.yaml`
+- `.juice/` runtime data
+
+Configuration and state are written to the caller's workspace.
+
+## Architecture
+
+```text
+Juice Client
+  └─ runners.create(runner_config) → Runner
+       └─ AgentManager, ToolManager, WorkflowRunManager
+          └─ Agents execute via RunnerContext
+             └─ Tools, permissions, audit
+```
+
+**Key boundaries:**
+- Registry: Static declarations, no live state
+- Manager: Lifecycle, persistence, cancellation
+- Runner: Request orchestration, manager composition
+- Adapter: Protocol mapping (outside SDK)
+
+See [Core](src/juice_agents/core/README.md) for detailed architecture.
+
+## Development
+
+Run tests:
 
 ```bash
 conda activate juice-agents
@@ -62,4 +320,30 @@ python -m pip install -e ./sdk
 python -m pytest tests/sdk -q
 ```
 
-Before release, verify the license, version, and source history. Build from a clean tree and inspect sdist, wheel contents, and resources. `sdk/build/`, `sdk/dist/`, and `sdk/src/*.egg-info/` are local build artifacts.
+Build package:
+
+```bash
+python -m build --sdist --wheel --outdir sdk/dist sdk
+```
+
+Artifacts: `sdk/build/`, `sdk/dist/`, `sdk/src/*.egg-info/`
+
+## Module Documentation
+
+- [Core Runtime](src/juice_agents/core/README.md)
+- [Agent](src/juice_agents/core/agent/README.md)
+- [Runner](src/juice_agents/core/runner/README.md)
+- [Workflow](src/juice_agents/core/workflow/README.md)
+- [Registry](src/juice_agents/core/registry/README.md)
+- [Team](src/juice_agents/core/team/README.md)
+
+## Contributing
+
+SDK development follows core conventions:
+- Registry has no live state
+- Manager owns lifecycle and persistence
+- Runner composes managers, doesn't instantiate domain objects
+- Atomic writes, recovery-safe persistence
+- Tests in `tests/sdk/` and `tests/core/`
+
+See [AGENTS.md](../AGENTS.md) for project guidelines.

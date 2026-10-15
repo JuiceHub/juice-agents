@@ -67,41 +67,6 @@ function jsonBlock(title: string, payload: unknown): MessageBlock {
   return systemBlock(JSON.stringify(payload, null, 2), title);
 }
 
-function parseJsonObject(raw: string): Record<string, unknown> {
-  if (!raw.trim()) return {};
-  const value = JSON.parse(raw);
-  if (!value || Array.isArray(value) || typeof value !== "object") {
-    throw new Error("Graph payload must be a JSON object");
-  }
-  return value as Record<string, unknown>;
-}
-
-function parseDeepResearchRequest(raw: string): Record<string, unknown> {
-  let remaining = raw.trim();
-  let sourceMode = "web";
-
-  if (remaining.startsWith("{")) {
-    const payload = parseJsonObject(remaining);
-    if (typeof payload.question !== "string" || !payload.question.trim()) {
-      throw new Error('Deep research payload must include a non-empty "question" string');
-    }
-    return payload;
-  }
-
-  // Validate the friendly syntax here, then forward the original message so
-  // the root agent can invoke graph_tool in the current Runner.
-  const flag = remaining.match(/^--(web-workspace|workspace|web)\b/);
-  if (flag) {
-    sourceMode = flag[1] === "web-workspace" ? "web_workspace" : flag[1];
-    remaining = remaining.slice(flag[0].length).trim();
-  }
-
-  if (!remaining) {
-    throw new Error("Usage: /deep-research [--web|--workspace|--web-workspace] <question>");
-  }
-  return { question: remaining, source_mode: sourceMode };
-}
-
 function normalizeIntervalUnit(rawUnit: string): string {
   const unit = rawUnit.toLowerCase();
   if (["s", "sec", "secs", "second", "seconds"].includes(unit)) return "s";
@@ -277,50 +242,6 @@ export async function executeWebCommand(
   if (command === "/plugins") {
     if (!parts[1]) return { blocks: [presentPlugins(await client.listPlugins())], clearMessages: false };
     return { blocks: [jsonBlock("Plugin", await client.viewPlugin(parts[1], parts[2]))], clearMessages: false };
-  }
-
-  if (command === "/graph") {
-    const action = (parts[1] || "list").toLowerCase();
-    if (action === "list") return { blocks: [jsonBlock("Graphs", await client.listGraphs(baseDir))], clearMessages: false };
-    if (action === "view") {
-      if (!parts[2]) return { blocks: [errorBlock("Usage: /graph view <name>")], clearMessages: false };
-      return { blocks: [jsonBlock("Graph", await client.viewGraph(baseDir, parts[2]))], clearMessages: false };
-    }
-    if (action === "run") {
-      if (!parts[2]) return { blocks: [errorBlock("Usage: /graph run <name> [json]")], clearMessages: false };
-      try {
-        return { blocks: [jsonBlock("Graph Run", await client.runGraph(baseDir, parts[2], parseJsonObject(parts.slice(3).join(" "))))], clearMessages: false };
-      } catch (error) {
-        return { blocks: [errorBlock(error instanceof Error ? error.message : String(error))], clearMessages: false };
-      }
-    }
-    if (action === "runs") return { blocks: [jsonBlock("Graph Runs", await client.listGraphRuns(baseDir))], clearMessages: false };
-    if (["pause", "resume", "stop", "restart"].includes(action)) {
-      if (!parts[2]) return { blocks: [errorBlock(`Usage: /graph ${action} <run_id>`)], clearMessages: false };
-      return { blocks: [jsonBlock("Graph Run", await client.controlGraphRun(baseDir, parts[2], action))], clearMessages: false };
-    }
-    return { blocks: [errorBlock(`Unknown /graph action: ${action}`)], clearMessages: false };
-  }
-
-  if (command === "/deep-research") {
-    try {
-      const request = parseDeepResearchRequest(commandText.trim().slice(command.length));
-      const graphConfig = await client.graphsConfigStatus(baseDir);
-      if (!graphConfig.enabled) {
-        const question = String(request.question || "").trim();
-        return {
-          blocks: [systemBlock(`Graph automatic tools are disabled. Use $graph:deep_research ${question}`.trim())],
-          clearMessages: false,
-        };
-      }
-      return {
-        blocks: [],
-        clearMessages: false,
-        forwardMessage: commandText.trim(),
-      };
-    } catch (error) {
-      return { blocks: [errorBlock(error instanceof Error ? error.message : String(error))], clearMessages: false };
-    }
   }
 
   if (command === "/permissions") {

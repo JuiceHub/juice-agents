@@ -5,7 +5,7 @@ import type { ActionStep, RunnerStreamEvent } from "@juice-agents/shared/gateway
 import {
   buildIntroPanel,
   presentDreamReceipt,
-  presentActorSession,
+  presentActiveAgent,
   presentMemorySearch,
   presentMemoryStatus,
   presentMemoryView,
@@ -39,8 +39,8 @@ function makeEvent(overrides: Partial<RunnerStreamEvent> = {}): RunnerStreamEven
     permission_mode: "default",
     agent_mode: "agent",
     runner_id: "agent-001",
-    actor_name: "root",
-    actor_role: "root",
+    agent_name: "root",
+    agent_role: "root",
     step_num: 1,
     action_step: makeStep(),
     team_event: null,
@@ -72,11 +72,11 @@ test("renders runner action_step events through the action step presenter", () =
 });
 
 test("actor session presenter renders subagent task and action transcript", () => {
-  const blocks = presentActorSession({
-    actor_id: "runner:researcher",
-    actor_name: "researcher",
-    actor_kind: "teammate",
-    actor_role: "worker",
+  const blocks = presentActiveAgent({
+    agent_id: "runner:researcher",
+    agent_name: "researcher",
+    agent_kind: "teammate",
+    agent_role: "worker",
     status: "active",
     is_root: false,
     current_async_task_id: "teammate_researcher_0001",
@@ -110,11 +110,11 @@ test("actor session presenter renders subagent task and action transcript", () =
 });
 
 test("actor session presenter shows running status when subagent has no transcript yet", () => {
-  const blocks = presentActorSession({
-    actor_id: "runner:worker",
-    actor_name: "worker",
-    actor_kind: "group_worker",
-    actor_role: "worker",
+  const blocks = presentActiveAgent({
+    agent_id: "runner:worker",
+    agent_name: "worker",
+    agent_kind: "group_worker",
+    agent_role: "worker",
     status: "active",
     is_root: false,
     current_async_task_id: "agent_dispatch_root_abcd",
@@ -135,8 +135,8 @@ test("renders phase team update events as compact system blocks", () => {
       kind: "team_update",
       permission_mode: "default",
       agent_mode: "team",
-      actor_name: "runtime",
-      actor_role: "runtime",
+      agent_name: "runtime",
+      agent_role: "runtime",
       action_step: null,
       team_event: {
         actor: "runtime",
@@ -156,8 +156,8 @@ test("hides ordinary team update summaries by default", () => {
       kind: "team_update",
       permission_mode: "default",
       agent_mode: "team",
-      actor_name: "teamlead",
-      actor_role: "teamlead",
+      agent_name: "teamlead",
+      agent_role: "teamlead",
       action_step: null,
       team_event: {
         actor: "teamlead",
@@ -175,8 +175,8 @@ test("renders critical team update status blocks", () => {
       kind: "team_update",
       permission_mode: "default",
       agent_mode: "team",
-      actor_name: "runtime",
-      actor_role: "runtime",
+      agent_name: "runtime",
+      agent_role: "runtime",
       action_step: null,
       team_event: {
         actor: "runtime",
@@ -189,8 +189,8 @@ test("renders critical team update status blocks", () => {
       kind: "team_update",
       permission_mode: "default",
       agent_mode: "team",
-      actor_name: "runtime",
-      actor_role: "runtime",
+      agent_name: "runtime",
+      agent_role: "runtime",
       action_step: null,
       team_event: {
         actor: "runtime",
@@ -203,8 +203,8 @@ test("renders critical team update status blocks", () => {
       kind: "team_update",
       permission_mode: "default",
       agent_mode: "team",
-      actor_name: "teamlead",
-      actor_role: "teamlead",
+      agent_name: "teamlead",
+      agent_role: "teamlead",
       action_step: null,
       team_event: {
         actor: "teamlead",
@@ -238,8 +238,8 @@ test("renders team terminal action steps as thinking-only blocks", () => {
     makeEvent({
       permission_mode: "default",
       agent_mode: "team",
-      actor_name: "teamlead",
-      actor_role: "teamlead",
+      agent_name: "teamlead",
+      agent_role: "teamlead",
       action_step: makeStep({
         round_outcome: "submitted",
         output: "最终答案",
@@ -332,7 +332,7 @@ test("builds an intro panel model for the transcript header", () => {
     runner_id: "runner-123",
     permission_mode: "default",
     agent_mode: "agent",
-    root_actor_name: "root",
+    root_agent_name: "root",
     base_dir: "/tmp/workspace",
     started: true,
     resumed: false,
@@ -356,7 +356,7 @@ test("intro panel warns when accept mode is restored from persisted config", () 
   const base = {
     runner_id: "runner-123",
     agent_mode: "agent",
-    root_actor_name: "root",
+    root_agent_name: "root",
     base_dir: "/tmp/workspace",
     started: true,
     resumed: false,
@@ -384,7 +384,7 @@ test("shouldShowIntroPanel hides the panel until runtime is ready to avoid unkno
     runner_id: "",
     permission_mode: "default",
     agent_mode: "agent",
-    root_actor_name: "root_agent",
+    root_agent_name: "root_agent",
     base_dir: "/tmp/workspace",
     started: false,
     resumed: false,
@@ -398,25 +398,25 @@ test("shouldShowIntroPanel hides the panel until runtime is ready to avoid unkno
 
   // 加载未完成时不显示，避免 "unknown-model · disabled" 闪现
   assert.equal(
-    shouldShowIntroPanel({ introPanel, activeActorName: null, runtimeReady: false }),
+    shouldShowIntroPanel({ introPanel, activeAgentName: null, runtimeReady: false }),
     false,
   );
 
   // 加载完成后正常显示
   assert.equal(
-    shouldShowIntroPanel({ introPanel, activeActorName: null, runtimeReady: true }),
+    shouldShowIntroPanel({ introPanel, activeAgentName: null, runtimeReady: true }),
     true,
   );
 
   // 用户聚焦到某个 actor 时也不显示（与现有逻辑一致）
   assert.equal(
-    shouldShowIntroPanel({ introPanel, activeActorName: "child", runtimeReady: true }),
+    shouldShowIntroPanel({ introPanel, activeAgentName: "child", runtimeReady: true }),
     false,
   );
 
   // introPanel 缺失时不显示
   assert.equal(
-    shouldShowIntroPanel({ introPanel: null, activeActorName: null, runtimeReady: true }),
+    shouldShowIntroPanel({ introPanel: null, activeAgentName: null, runtimeReady: true }),
     false,
   );
 });
@@ -426,7 +426,7 @@ test("formats status blocks with English labels", () => {
     runner_id: "runner-123",
     permission_mode: "default",
     agent_mode: "agent",
-    root_actor_name: "writer",
+    root_agent_name: "writer",
     base_dir: "/tmp/workspace",
     started: true,
     resumed: false,

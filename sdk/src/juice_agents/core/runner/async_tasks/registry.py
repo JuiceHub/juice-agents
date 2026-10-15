@@ -131,6 +131,9 @@ class _AsyncTaskRuntime(
         self._agents: dict[str, RunnerAgentState] = {}
         self._futures: dict[str, concurrent.futures.Future[Any]] = {}
         self._processes: dict[str, subprocess.Popen[str]] = {}
+        # 通用线程任务的协作式取消信号：stop 时 set，runner 回调在边界自行检查。
+        # 线程无法被强杀，这是让运行中的任务（如 workflow）尽快停下的唯一方式。
+        self._cancel_events: dict[str, threading.Event] = {}
         self._lock = threading.RLock()
         self._store_path: Path | None = None
         self._scope_id = ""
@@ -329,6 +332,7 @@ class _AsyncTaskRuntime(
             self._agents = {}
             self._futures = {}
             self._processes = {}
+            self._cancel_events = {}
             self._scope_status = "running"
             self._persist_locked()
             return self._snapshot_store_locked()
@@ -515,6 +519,7 @@ class _AsyncTaskRuntime(
                 if future is not None and not future.done():
                     future.cancel()
                     futures_to_wait.append(future)
+                self._signal_cancel_locked(async_task_id)
                 process = self._processes.get(async_task_id)
                 if process is not None and process.poll() is None:
                     processes.append(process)
@@ -563,6 +568,17 @@ class _AsyncTaskRuntime(
             )
         return [_to_public_async_task(item) for item in stopped]
 
+    def cancel_event_for(self, async_task_id: str) -> threading.Event:
+        """返回任务的协作式取消信号；runner 回调用它在边界检查是否已被 stop。"""
+
+        with self._lock:
+            return self._cancel_events.setdefault(str(async_task_id or "").strip(), threading.Event())
+
+    def _signal_cancel_locked(self, async_task_id: str) -> None:
+        event = self._cancel_events.get(async_task_id)
+        if event is not None:
+            event.set()
+
     def stop_async_task(self, async_task_id: str, *, reason: str = "agent_requested",
                         wait_timeout_seconds: float = 1.0) -> AsyncTaskState | None:
         """
@@ -593,6 +609,7 @@ class _AsyncTaskRuntime(
             future_to_cancel = self._futures.get(normalized_task_id)
             if future_to_cancel is not None and not future_to_cancel.done():
                 future_to_cancel.cancel()
+            self._signal_cancel_locked(normalized_task_id)
             process_to_kill = self._processes.get(normalized_task_id)
             if str(async_task.get("kind") or "").strip() == "teammate":
                 set_teammate_shutdown(async_task, requested=True)

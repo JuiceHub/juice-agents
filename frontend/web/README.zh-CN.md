@@ -21,7 +21,7 @@ conda activate juice-agents
 | 中央 | 阅读对话、工具结果与审批请求；运行时继续输入，消息按序排队 |
 | 右侧 | 操作当前 Runner 的 Browser，或只读预览工作区文件 |
 
-Team 会话显示任务完成数、成员状态和错误。输入框支持 `/agents`、`/teams`、`/skills`、`/deep-research` 等命令，以及模型与 thinking effort 选择。
+Team 会话显示任务完成数、成员状态和错误。输入框支持 `/agents`、`/teams`、`/skills` 等命令、`$<skill>` / `$workflow:<name> <任务>` 显式调用，以及模型与 thinking effort 选择。
 
 Browser 使用 Playwright 的真实 Chromium 页面。首次使用前执行 `python -m playwright install chromium`；打开独立可见窗口需要桌面会话，纯 SSH 环境可使用内嵌预览。
 

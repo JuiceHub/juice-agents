@@ -4,8 +4,8 @@
 
 import type {
   ActionStep,
-  ActorSessionSnapshot,
-  ActorSessionStep,
+  ActiveAgentSnapshot,
+  ActiveAgentStep,
   ObservationImage,
   RunnerStreamEvent,
   TeamStreamEvent,
@@ -141,39 +141,39 @@ export function presentObservationImageBlocks(images: ObservationImage[] | undef
   }));
 }
 
-export function presentActorSession(actor: ActorSessionSnapshot | null | undefined): MessageBlock[] {
+export function presentActiveAgent(actor: ActiveAgentSnapshot | null | undefined): MessageBlock[] {
   if (!actor) {
     return [{ kind: "system", text: "No actor session selected." }];
   }
 
   const blocks: MessageBlock[] = [presentActorStatus(actor)];
   for (const step of actor.steps || []) {
-    blocks.push(...presentActorSessionStep(step));
+    blocks.push(...presentActiveAgentStep(step));
   }
 
   if (blocks.length === 1) {
     blocks.push({
       kind: "system",
-      text: `No transcript entries for ${actor.actor_name || "actor"} yet.`,
+      text: `No transcript entries for ${actor.agent_name || "actor"} yet.`,
     });
   }
 
   return blocks;
 }
 
-function presentActorStatus(actor: ActorSessionSnapshot): MessageBlock {
+function presentActorStatus(actor: ActiveAgentSnapshot): MessageBlock {
   const details = [
     actor.status || "unknown",
-    actor.actor_kind || actor.actor_role || "actor",
+    actor.agent_kind || actor.agent_role || "actor",
     actor.current_async_task_id || "",
   ].filter(Boolean);
   return {
     kind: "system",
-    text: `${actor.actor_name || "actor"}: ${details.join(" · ")}`,
+    text: `${actor.agent_name || "actor"}: ${details.join(" · ")}`,
   };
 }
 
-function presentActorSessionStep(step: ActorSessionStep): MessageBlock[] {
+function presentActiveAgentStep(step: ActiveAgentStep): MessageBlock[] {
   if (!step || typeof step !== "object") return [];
   const raw = step as Record<string, any>;
   const stepType = String(raw.type || "").trim();
@@ -195,7 +195,7 @@ function presentActorSessionStep(step: ActorSessionStep): MessageBlock[] {
   return [];
 }
 
-function coerceActorActionStep(step: ActorSessionStep): ActionStep {
+function coerceActorActionStep(step: ActiveAgentStep): ActionStep {
   const raw = step as Record<string, any>;
   return {
     step_num: Number(raw.step_num || 0),

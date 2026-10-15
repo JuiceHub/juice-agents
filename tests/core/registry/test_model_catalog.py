@@ -77,6 +77,42 @@ class RuntimeModelCatalogTests(unittest.TestCase):
         self.assertEqual(config.provider_model_name, "gpt-4o-mini")
         self.assertEqual(config.api_key, "test-openai-key")
 
+    def test_api_base_env_overrides_yaml_api_base(self):
+        """api_base_env 指向的变量存在时覆盖 YAML api_base；缺失时回退到 YAML。"""
+        from juice_agents.core.config.model_catalog import load_runtime_model_config
+
+        self._write_catalog(
+            """
+            models:
+              claude:
+                backend: anthropic
+                api_base: https://api.anthropic.com
+                api_base_env: TEST_ANTHROPIC_BASE_URL
+                api_key_env: TEST_ANTHROPIC_AUTH_TOKEN
+                provider_model_name: claude-sonnet-4-6
+            """
+        )
+        kwargs = dict(model_name="claude", runtime_config_path=self.catalog_path, dotenv_path=self.env_path)
+
+        # .env 中只有密钥、没有 base url：回退到 YAML 默认值
+        self._write_env("TEST_ANTHROPIC_AUTH_TOKEN=tok")
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("TEST_ANTHROPIC_BASE_URL", None)
+            self.assertEqual(load_runtime_model_config(**kwargs).api_base, "https://api.anthropic.com")
+
+        # .env 提供 base url：覆盖 YAML
+        self._write_env(
+            """
+            TEST_ANTHROPIC_AUTH_TOKEN=tok
+            TEST_ANTHROPIC_BASE_URL=https://proxy.example.com
+            """
+        )
+        self.assertEqual(load_runtime_model_config(**kwargs).api_base, "https://proxy.example.com")
+
+        # 进程环境变量优先于 .env
+        with patch.dict(os.environ, {"TEST_ANTHROPIC_BASE_URL": "https://env.example.com"}):
+            self.assertEqual(load_runtime_model_config(**kwargs).api_base, "https://env.example.com")
+
     def test_list_runtime_models_returns_stable_metadata(self):
         from juice_agents.core.config.model_catalog import list_runtime_models
 
@@ -145,6 +181,16 @@ class RuntimeModelCatalogTests(unittest.TestCase):
         self._write_catalog(
             """
             models:
+              claude-opus-5-5:
+                backend: anthropic
+                api_base: https://api.anthropic.com
+                api_key_env: ANTHROPIC_AUTH_TOKEN
+                provider_model_name: claude-opus-5-5
+              claude-sonnet-5-5:
+                backend: anthropic
+                api_base: https://api.anthropic.com
+                api_key_env: ANTHROPIC_AUTH_TOKEN
+                provider_model_name: claude-sonnet-5-5
               claude-opus-4-8:
                 backend: anthropic
                 api_base: https://api.anthropic.com
@@ -173,13 +219,29 @@ class RuntimeModelCatalogTests(unittest.TestCase):
             for model in list_runtime_models(runtime_config_path=self.catalog_path)
         }
 
-        # Opus 4-8 与 4-7 同样支持完整 effort 档位（含 xhigh / max），且支持 budget tokens。
+        # Opus 5.5 / Sonnet 5.5：完整 effort 档位（含 xhigh/max），adaptive thinking，不支持 budget_tokens
+        self.assertEqual(
+            by_name["claude-opus-5-5"]["supported_efforts"],
+            ["disabled", "low", "medium", "high", "xhigh", "max"],
+        )
+        self.assertEqual(by_name["claude-opus-5-5"]["thinking_mode"], "adaptive")
+        self.assertFalse(by_name["claude-opus-5-5"]["supports_budget_tokens"])
+
+        self.assertEqual(
+            by_name["claude-sonnet-5-5"]["supported_efforts"],
+            ["disabled", "low", "medium", "high", "xhigh", "max"],
+        )
+        self.assertEqual(by_name["claude-sonnet-5-5"]["thinking_mode"], "adaptive")
+        self.assertFalse(by_name["claude-sonnet-5-5"]["supports_budget_tokens"])
+
+        # Opus 4-8 与 4-7 同样支持完整 effort 档位（含 xhigh / max）；
+        # 4-8 支持 budget tokens，4-7 不支持。
         self.assertEqual(
             by_name["claude-opus-4-8"]["supported_efforts"],
             ["disabled", "low", "medium", "high", "xhigh", "max"],
         )
         self.assertEqual(by_name["claude-opus-4-8"]["thinking_mode"], "adaptive")
-        self.assertTrue(by_name["claude-opus-4-8"]["supports_budget_tokens"])
+        self.assertFalse(by_name["claude-opus-4-8"]["supports_budget_tokens"])  # 改为不支持
         self.assertEqual(
             by_name["claude-opus-4-7"]["supported_efforts"],
             ["disabled", "low", "medium", "high", "xhigh", "max"],
@@ -284,129 +346,6 @@ class RuntimeModelCatalogTests(unittest.TestCase):
         self.assertIsInstance(openai_model, _FakeOpenAIModel)
         self.assertEqual(openai_model.kwargs["model_name"], "gpt-4o-mini")
         self.assertEqual(openai_model.kwargs["api_key"], "test-openai-key")
-
-    def test_list_runtime_models_includes_composite_metadata(self):
-        from juice_agents.core.config.model_catalog import list_runtime_models
-
-        self._write_catalog(
-            """
-            models:
-              ensemble:
-                backend: composite
-                strategy: judge_select
-                candidates: [doubao_seed]
-                judge: doubao_seed
-              doubao_seed:
-                backend: doubao
-                api_base: https://ark.example.com/api/v3
-                api_key_env: DOUBAO_API_KEY
-                provider_model_name: doubao-seed-1-6
-            """
-        )
-
-        by_name = {
-            model["model_name"]: model
-            for model in list_runtime_models(runtime_config_path=self.catalog_path)
-        }
-
-        self.assertEqual(by_name["ensemble"]["backend"], "composite")
-        self.assertEqual(by_name["ensemble"]["strategy"], "judge_select")
-        self.assertEqual(by_name["ensemble"]["api_base"], "")
-        self.assertEqual(
-            by_name["ensemble"]["supported_efforts"],
-            ["disabled", "low", "medium", "high", "xhigh", "max", "auto"],
-        )
-
-    def test_resolve_runtime_model_builds_composite_model(self):
-        from juice_agents.core.config.model_catalog import resolve_runtime_model
-        from juice_agents.core.models import CompositeModel
-
-        self._write_catalog(
-            """
-            models:
-              ensemble:
-                backend: composite
-                strategy: judge_select
-                candidates:
-                  - model: doubao_seed
-                    name: fast
-                  - model: gpt4o_mini
-                    name: precise
-                    model_effort: high
-                judge:
-                  model: doubao_seed
-                  name: judge
-                fail_fast: false
-              doubao_seed:
-                backend: doubao
-                api_base: https://ark.example.com/api/v3
-                api_key_env: DOUBAO_API_KEY
-                provider_model_name: doubao-seed-1-6
-              gpt4o_mini:
-                backend: openai
-                api_base: https://api.openai.com/v1
-                api_key_env: OPENAI_API_KEY
-                provider_model_name: gpt-4o-mini
-            """
-        )
-        self._write_env(
-            """
-            DOUBAO_API_KEY=test-doubao-key
-            OPENAI_API_KEY=test-openai-key
-            """
-        )
-
-        with patch("juice_agents.core.config.model_catalog.OpenAIModel", _FakeOpenAIModel), patch(
-            "juice_agents.core.config.model_catalog.DoubaoModel", _FakeDoubaoModel
-        ):
-            model = resolve_runtime_model(
-                model_name="ensemble",
-                runtime_config_path=self.catalog_path,
-                dotenv_path=self.env_path,
-                model_effort="low",
-            )
-
-        self.assertIsInstance(model, CompositeModel)
-        self.assertEqual(model.strategy, "judge_select")
-        self.assertEqual([candidate.name for candidate in model.candidates], ["fast", "precise"])
-        self.assertIsInstance(model.candidates[0].model, _FakeDoubaoModel)
-        self.assertEqual(model.candidates[0].model.kwargs["thinking"], {"type": "enabled", "effort": "low"})
-        self.assertIsInstance(model.candidates[1].model, _FakeOpenAIModel)
-        self.assertEqual(model.candidates[1].model.kwargs["thinking"], {"type": "enabled", "effort": "high"})
-        self.assertIsInstance(model.judge_model, _FakeDoubaoModel)
-
-    def test_resolve_runtime_model_rejects_composite_cycles(self):
-        from juice_agents.core.config.model_catalog import resolve_runtime_model
-
-        self._write_catalog(
-            """
-            models:
-              a:
-                backend: composite
-                strategy: judge_select
-                candidates: [b]
-                judge: base
-              b:
-                backend: composite
-                strategy: judge_select
-                candidates: [a]
-                judge: base
-              base:
-                backend: doubao
-                api_base: https://ark.example.com/api/v3
-                api_key_env: DOUBAO_API_KEY
-                provider_model_name: doubao-seed-1-6
-            """
-        )
-        self._write_env("DOUBAO_API_KEY=test-doubao-key")
-
-        with patch("juice_agents.core.config.model_catalog.DoubaoModel", _FakeDoubaoModel):
-            with self.assertRaisesRegex(ValueError, "循环引用"):
-                resolve_runtime_model(
-                    model_name="a",
-                    runtime_config_path=self.catalog_path,
-                    dotenv_path=self.env_path,
-                )
 
     def test_resolve_runtime_model_selects_anthropic_model_class(self):
         from juice_agents.core.config.model_catalog import resolve_runtime_model

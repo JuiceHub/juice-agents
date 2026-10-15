@@ -31,15 +31,17 @@ from typing import TYPE_CHECKING, Any, Protocol, TypedDict
 from uuid import uuid4
 
 from juice_agents.core.agent.attachments import RuntimeAttachment, serialize_runtime_attachments_text
-from juice_agents.core.agent.sessions import (
+from juice_agents.core.agent.context import (
     ActionStep,
     AgentError,
-    AgentSession,
+    ContextNode,
+    ContextTree,
+    NodeStatus,
     TaskStep,
-    deserialize_session,
+    deserialize_context_tree,
     is_recoverable_agent_error,
     observations_to_text,
-    serialize_session,
+    serialize_context_tree,
 )
 from juice_agents.core.utils import sanitize_path_component
 
@@ -242,7 +244,7 @@ class AgentExecutionInterrupted(RuntimeError):
 class ManagedAgent:
     """The sole live-runtime record for one acquired Agent.
 
-    ``session`` remains available after ``instance`` is released.  This makes
+    ``context`` remains available after ``instance`` is released.  This makes
     a functional worker's final transcript inspectable without retaining a
     live model/tool object, which is important for deterministic release.
     """
@@ -252,9 +254,17 @@ class ManagedAgent:
     role: str
     lifecycle: AgentLifecycle
     instance: "MultiStepAgent | None"
-    session: AgentSession
+    context: ContextTree
     status: AgentStatus = AgentStatus.READY
     is_root: bool = False
+    # ephemeral agent（workflow 内部调用）只在内存中存在：不写 snapshot、不触发
+    # after_step 回调、不写文件日志，release 后不留任何磁盘痕迹。
+    ephemeral: bool = False
+    # 非空时覆盖 Runner 的审批模式（workflow 内部 agent 固定为 accept）。
+    permission_mode: str = ""
+    # 调用方的取消信号（例如外层 workflow 的 cancel_event），与自身 cancel_event
+    # 一起在 step 边界检查；不需要额外线程转发。
+    external_cancel: threading.Event | None = field(default=None, repr=False)
     metadata: dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
@@ -433,8 +443,8 @@ class AgentManager:
         if self.workspace_dir is not None:
             kwargs.setdefault("juice_root", self.workspace_dir)
         instance = instantiate(_binding_ref(binding), **kwargs)
-        if not hasattr(instance, "session") or not hasattr(instance, "step"):
-            raise TypeError("AgentRegistry.instantiate() 必须返回具备 session 与 step() 的 MultiStepAgent")
+        if not hasattr(instance, "context") or not hasattr(instance, "step"):
+            raise TypeError("AgentRegistry.instantiate() 必须返回具备 context 与 step() 的 MultiStepAgent")
         return instance
 
     def _snapshot_for(self, managed: ManagedAgent) -> AgentSnapshot:
@@ -449,18 +459,18 @@ class AgentManager:
             "metadata": {"resolved_agent_type": _resolved_agent_type(managed.instance), **managed.metadata},
             "created_at": managed.created_at,
             "updated_at": managed.updated_at,
-            "session": serialize_session(managed.session),
+            "session": serialize_context_tree(managed.context),
         }
 
     @staticmethod
-    def _session_from_state(session_state: Mapping[str, Any] | AgentSession | None) -> AgentSession | None:
+    def _session_from_state(session_state: Mapping[str, Any] | ContextTree | None) -> ContextTree | None:
         if session_state is None:
             return None
-        if isinstance(session_state, AgentSession):
+        if isinstance(session_state, ContextTree):
             return session_state.clone()
         if not isinstance(session_state, Mapping):
-            raise TypeError("session_state 必须是 AgentSession 或可序列化 object")
-        return deserialize_session(dict(session_state))
+            raise TypeError("session_state 必须是 ContextTree 或可序列化 object")
+        return deserialize_context_tree(dict(session_state))
 
     def acquire(
         self,
@@ -468,12 +478,15 @@ class AgentManager:
         *,
         role: str | None = None,
         lifecycle: AgentLifecycle | str | None = None,
-        session_state: Mapping[str, Any] | AgentSession | None = None,
+        session_state: Mapping[str, Any] | ContextTree | None = None,
         is_root: bool = False,
         agent_id: str | None = None,
         agent_name: str | None = None,
         metadata: Mapping[str, Any] | None = None,
         model: Any | None = None,
+        ephemeral: bool = False,
+        permission_mode: str = "",
+        external_cancel: threading.Event | None = None,
         **runtime_kwargs: Any,
     ) -> ManagedAgent:
         """Acquire one fresh runtime instance and checkpoint its restored session.
@@ -484,6 +497,8 @@ class AgentManager:
         """
 
         resolved_lifecycle = _normalize_lifecycle(lifecycle, binding=binding)
+        if ephemeral and (is_root or resolved_lifecycle is not AgentLifecycle.FUNCTIONAL):
+            raise ValueError("ephemeral agent 必须是非 root 的 functional agent")
         declaration_name = _binding_name(binding)
         resolved_name = str(agent_name or declaration_name).strip()
         if not resolved_name:
@@ -511,7 +526,7 @@ class AgentManager:
                 )
                 return existing
 
-            persisted = self.snapshot_store.load(resolved_id)
+            persisted = None if ephemeral else self.snapshot_store.load(resolved_id)
             if persisted is not None:
                 if bool(persisted.get("is_root")) != bool(is_root):
                     raise ValueError(f"agent snapshot root 身份不匹配: agent_id={resolved_id}")
@@ -523,7 +538,7 @@ class AgentManager:
             if restored_session is None and persisted is not None:
                 restored_session = self._session_from_state(persisted.get("session") or {})
             if restored_session is not None:
-                instance.session = restored_session
+                instance.context = restored_session
 
             instance.agent_id = resolved_id
             effective_metadata = dict((persisted or {}).get("metadata") or {})
@@ -537,9 +552,12 @@ class AgentManager:
                 role=resolved_role,
                 lifecycle=resolved_lifecycle,
                 instance=instance,
-                session=instance.session,
+                context=instance.context,
                 status=AgentStatus.READY,
                 is_root=is_root,
+                ephemeral=ephemeral,
+                permission_mode=str(permission_mode or "").strip(),
+                external_cancel=external_cancel,
                 metadata=effective_metadata,
                 created_at=float((persisted or {}).get("created_at") or time.time()),
             )
@@ -614,11 +632,11 @@ class AgentManager:
         return self.snapshot_store.load(agent_id)
 
     @staticmethod
-    def deserialize_snapshot(snapshot: Mapping[str, Any]) -> AgentSession:
+    def deserialize_snapshot(snapshot: Mapping[str, Any]) -> ContextTree:
         """Decode a validated snapshot session for read-only recovery tooling."""
 
         normalized = JsonAgentSnapshotStore._validate(snapshot)
-        return deserialize_session(dict(normalized["session"]))
+        return deserialize_context_tree(dict(normalized["session"]))
 
     def persist(self, managed: ManagedAgent | str) -> AgentSnapshot:
         """Checkpoint a session and lifecycle state without retaining Runner state."""
@@ -626,6 +644,8 @@ class AgentManager:
         item = self.get(managed) if isinstance(managed, str) else managed
         with self._lock:
             item.updated_at = time.time()
+            if item.ephemeral:
+                return self._snapshot_for(item)
             snapshot = self.snapshot_store.save(self._snapshot_for(item))
             if self.callbacks.after_persist is not None:
                 self.callbacks.after_persist(snapshot)
@@ -634,7 +654,7 @@ class AgentManager:
                 self.runner_id,
                 item.agent_id,
                 item.status.value,
-                len(item.session.steps),
+                len(item.context.to_linear_steps()),
             )
             return snapshot
 
@@ -667,6 +687,8 @@ class AgentManager:
             raise AgentExecutionInterrupted(
                 self._interrupt_reasons.get(managed.agent_id, "agent_interrupted")
             )
+        if managed.external_cancel is not None and managed.external_cancel.is_set():
+            raise AgentExecutionInterrupted("caller_cancelled")
 
     @staticmethod
     def _format_task_log_content(task: str, attachments: list[RuntimeAttachment]) -> str:
@@ -722,12 +744,32 @@ class AgentManager:
             else []
         )
         step.attachments = attachments
-        instance.session.append_step(step)
-        managed.session = instance.session
+        # 添加步骤到 ContextTree
+        if instance.context.active_leaf_ids:
+            parent_id = instance.context.active_leaf_ids[0]
+        else:
+            parent_id = instance.context.root_id if instance.context.root_id else None
+
+        node_id = f"node_{len(instance.context.nodes)}"
+        node = ContextNode(
+            node_id=node_id,
+            step=step,
+            depth=instance.context.nodes[parent_id].depth + 1 if parent_id else 0,
+            status=NodeStatus.ACTIVE
+        )
+
+        if parent_id:
+            instance.context.add_node(node, parent_id=parent_id)
+        else:
+            instance.context.add_node(node)
+            instance.context.root_id = node_id
+
+        instance.context.active_leaf_ids = [node_id]
+        managed.context = instance.context
         # A session checkpoint is the durability boundary for every action;
         # callbacks may publish events, but cannot make the transcript vanish.
         self.persist(managed)
-        if self.callbacks.after_step is not None:
+        if self.callbacks.after_step is not None and not managed.ephemeral:
             self.callbacks.after_step(managed, step)
         return step
 
@@ -768,15 +810,37 @@ class AgentManager:
                         reset_tools = getattr(instance, "_reset_tool_runtime_state", None)
                         if callable(reset_tools):
                             reset_tools()
-                        instance.session.steps.clear()
-                    instance.session.append_step(
-                        TaskStep(
+                        # 清空 ContextTree 的节点（保留 root）
+                        instance.context.nodes.clear()
+                        instance.context.all_paths.clear()
+                        instance.context.active_leaf_ids.clear()
+                        instance.context.root_id = ""
+
+                    # 只有在树为空时才创建根节点
+                    if not instance.context.nodes:
+                        # 创建根节点 (TaskStep)
+                        task_step = TaskStep(
                             task=normalized_task,
                             task_images=list(task_images or []),
                             attachments=initial_attachments,
                         )
-                    )
-                    item.session = instance.session
+                        root_node = ContextNode(
+                            node_id="root",
+                            step=task_step,
+                            depth=0,
+                            status=NodeStatus.ACTIVE
+                        )
+                        instance.context.add_node(root_node)
+                        instance.context.active_leaf_ids = ["root"]
+                    else:
+                        # 树已有节点，将任务作为新步骤添加
+                        task_step = TaskStep(
+                            task=normalized_task,
+                            task_images=list(task_images or []),
+                            attachments=initial_attachments,
+                        )
+                        instance.context.append_step(task_step)
+                    item.context = instance.context
                     self.persist(item)
                     pretty_log = getattr(instance, "_pretty_log", None)
                     if callable(pretty_log):
@@ -795,7 +859,7 @@ class AgentManager:
                         action_step = self._finish_step(item, self._perform_step(item, step_index), step_index)
                         yield action_step
                         self._raise_if_interrupted(item)
-                        if action_step.round_outcome in {"submitted", "yielded", "failed"}:
+                        if action_step.round_outcome in {"submitted", "failed"}:
                             terminated = True
                             break
 
@@ -809,8 +873,8 @@ class AgentManager:
                                 "submit_output 提交结果；即使结果不完整也必须提交。"
                             )
                         )
-                        instance.session.append_step(fallback)
-                        item.session = instance.session
+                        instance.context.append_step(fallback)
+                        item.context = instance.context
                         self.persist(item)
                         fallback_step = self._finish_step(
                             item,

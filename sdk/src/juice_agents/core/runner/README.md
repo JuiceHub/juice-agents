@@ -2,12 +2,12 @@
 
 > [简体中文](README.zh-CN.md)
 
-`Runner` is the unified entry point for one conversation request. It does not retain live Agent, Tool, Graph, or background-task instances; Managers own those mutable objects. Registry resolves and freshly constructs static declarations.
+`Runner` is the unified entry point for one conversation request. It does not retain live Agent, Tool, Workflow, or background-task instances; Managers own those mutable objects. Registry resolves and freshly constructs static declarations.
 
 > [Chinese](README.zh-CN.md)
 
 ```text
-Agent / Tool / Graph declarations
+Agent / Tool / Workflow declarations
               │ resolve · validate · instantiate
               ▼
            Registry
@@ -15,7 +15,7 @@ Agent / Tool / Graph declarations
               ▼
 Runner ── owns ──► AgentManager      session · snapshot · stream · cancel · release
   │               ToolManager        runtime binding · permissions · audit
-  │               GraphRunManager    graph run · checkpoint · recovery
+  │               WorkflowRunManager    workflow call · checkpoint · recovery
   └──────────────► AsyncTaskManager  task state · workers · notification · recovery
 ```
 
@@ -94,7 +94,7 @@ Runner state is rooted at `.juice/runners/<runner_id>/`. The manifest stores
 the serialized `RunnerConfig`, selected Team and mode-local disabled Agents;
 Agent runtime snapshots live under `agents/`. The formal plan artifact is
 always `plans/root.md`.
-Managers own their corresponding task, graph and tool runtime records.
+Managers own their corresponding task, workflow and tool runtime records.
 
 ## Module map
 
@@ -105,7 +105,7 @@ Managers own their corresponding task, graph and tool runtime records.
 | `execution/context.py` | narrow Agent-to-Runner capability bridge |
 | `persistence/store.py` | Runner manifest and directory layout |
 | `core/agent/manager.py` | managed Agent lifecycle and snapshots |
-| `core/managers/` | Tool, GraphRun and AsyncTask runtime ownership |
+| `core/managers/` | Tool, Workflow and AsyncTask runtime ownership |
 
 When changing this boundary, add architectural tests that prove Registry has no
 live state, Manager owns lifecycle, and Runner does not directly instantiate or
@@ -113,8 +113,8 @@ execute domain objects.
 
 ## Development conventions
 
-- `RunnerConfig` is serializable data. Built-in and custom modes share `stream()`, `run()`, and `stop()`; do not register a dynamic factory, callback, or separate loop. Runner may keep request locks, cancellation state, and listeners, but never live Agent, Tool, Graph, or Task objects.
-- Validate a mode target before applying it, and change modes only when root, background tasks, and Graphs are idle. Preserve the Runner ID and snapshot; reject a busy change and any unfinished Team work. Reject old manifest schemas explicitly instead of migrating them.
+- `RunnerConfig` is serializable data. Built-in and custom modes share `stream()`, `run()`, and `stop()`; do not register a dynamic factory, callback, or separate loop. Runner may keep request locks, cancellation state, and listeners, but never live Agent, Tool, Workflow, or Task objects.
+- Validate a mode target before applying it, and change modes only when root, background tasks, and Workflows are idle. Preserve the Runner ID and snapshot; reject a busy change and any unfinished Team work. Reject old manifest schemas explicitly instead of migrating them.
 - Persist Team task state before emitting events. Schedule member turns through the shared `AsyncTaskManager`, checkpoint sessions through `AgentManager`, and acknowledge inbox IDs only after the receiving step is saved. The request stream waits for active member calls and emits `team_update` before `round_end`.
-- `AgentManager.acquire()` loads a snapshot, constructs a fresh Registry object, restores its session, binds context, and checkpoints. `stop()` cancels cooperatively; `close()` releases resources. Terminal and recovery logs include Runner, Agent/task/Graph IDs and the reason. Persistence contains data only, never live Python objects.
+- `AgentManager.acquire()` loads a snapshot, constructs a fresh Registry object, restores its session, binds context, and checkpoints. `stop()` cancels cooperatively; `close()` releases resources. Terminal and recovery logs include Runner, Agent/task/Workflow IDs and the reason. Persistence contains data only, never live Python objects.
 - Put boundary, lifecycle, and layout tests in `tests/core/runner/`, covering the shared execution chain, concurrency, cancellation, recovery, and old-schema rejection across built-in modes.

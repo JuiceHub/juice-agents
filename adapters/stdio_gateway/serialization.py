@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from juice_agents.core.agent.agent_type import ObservationImage
-from juice_agents.core.agent.sessions.steps import ActionStep
+from juice_agents.core.agent.context.steps import ActionStep
 
 
 def serialize_action_step(step: ActionStep) -> dict[str, Any]:
@@ -43,7 +43,7 @@ def serialize_runner_stream_event(event: dict[str, Any]) -> dict[str, Any]:
     if event.get("kind") == "team_update" and team_event is None:
         team_event = {
             "team_name": event.get("team_name"),
-            "actor": event.get("agent_name") or event.get("actor_name") or "team",
+            "actor": event.get("agent_name") or "team",
             "update": event.get("update") or {},
             "snapshot": event.get("snapshot") or {},
         }
@@ -52,8 +52,6 @@ def serialize_runner_stream_event(event: dict[str, Any]) -> dict[str, Any]:
         "permission_mode": str(event.get("permission_mode") or ""),
         "agent_mode": str(event.get("agent_mode") or event.get("mode_id") or ""),
         "runner_id": str(event.get("runner_id") or ""),
-        "actor_name": event.get("actor_name") or event.get("agent_name"),
-        "actor_role": event.get("actor_role") or event.get("agent_role"),
         "agent_name": event.get("agent_name"),
         "agent_id": event.get("agent_id"),
         "agent_role": event.get("agent_role"),

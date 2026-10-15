@@ -40,6 +40,17 @@ REACT_PROTOCOL_SECTION_EN = PromptSection(
     template="""
 # ReAct Protocol
 - Follow the ReAct loop: `<thought>` explains the current intent, `<actions>` calls tools, observations return facts, then repeat until the final `submit_output`.
+
+## Output Format Schema
+Every step must produce EXACTLY this format:
+```
+<thought>Your reasoning here</thought>
+<actions>[{"name": "tool_name", "args": {...}}]</actions>
+```
+
+**Critical**: `</actions>` MUST be the last text you output in each step. Do not write anything after `</actions>` — no extra tags, no text, no duplicate closing tags.
+
+## Format Rules
 - Every step must output exactly one `<thought></thought>` block followed by one `<actions></actions>` block.
 - `<thought>` is visible to the user. Keep it high-level: current goal, evidence considered, and next intent. Do not include tool names, JSON actions, arguments, or code execution details there.
 - Only a JSON array is valid inside `<actions>`. The first non-whitespace character inside `<actions>` must be `[`.
@@ -47,13 +58,37 @@ REACT_PROTOCOL_SECTION_EN = PromptSection(
 - Each action item must contain `{"name": "tool_name", "args": {...}}` and may add sibling `max_observation_chars` to lower that tool's output projection limit. Never use it to raise a tool limit.
 - Output at most {{ max_tool_calls_per_step }} actions in one step. The framework rejects the whole list before execution when this limit is exceeded.
 - `args` must always be a valid JSON object containing only necessary parameters. For tools without parameters, use `{"name": "...", "args": {}}`.
+
+## Correct Examples
+```
+<thought>I need to read the config file to understand the settings.</thought>
+<actions>[{"name": "read", "args": {"path": "/path/to/config.yaml"}}]</actions>
+```
+
+```
+<thought>Found the issue. Submitting the analysis to the user.</thought>
+<actions>[{"name": "submit_output", "args": {"output": "Analysis complete: the bug is in line 42."}}]</actions>
+```
+
+## Common Mistakes to Avoid
+WRONG: `<actions>[...]</actions></actions>` (duplicate closing tag)
+WRONG: `<actions>[...]</actions>extra text` (text after closing tag)
+WRONG: `<actions>{"name": "tool"}</actions>` (not a JSON array)
+CORRECT: `<actions>[{"name": "tool", "args": {}}]</actions>` (ends with </actions>)
+
+## Async Tasks and Notifications
 - If you see `<attachments>`, runtime injected external information such as background async task notifications or inbox messages. Treat attachments like observations and include them in later reasoning.
 - Background async tasks are truly asynchronous: they return a receipt immediately and do not block. Task completion is pushed via `<attachments>` as `async_task_notification` in a later step.
 - A background async task start receipt is not the result. `async_task_notification.summary` is runtime status; `async_task_notification.result` is the actual subtask output.
-- Do not read task files or poll after launch. End the current round with empty actions and wait for the completion notification. To cancel a task, use `async_task_stop(async_task_id)`.
+- Do not read task files or poll after launch. To wait for the completion notification, call `submit_output` to end the current round and state what is running; the notification arrives in a later round. To cancel a task, use `async_task_stop(async_task_id)`.
+- **Important**: Once you receive an `async_task_notification` in `<attachments>` and present the result to the user, you should call `submit_output` to complete the task. Do not repeat the same output in subsequent steps without new information or user requests.
+
+## Round Control
+- Only `submit_output` ends a round. Empty actions `[]` run nothing and the loop continues to the next step. To ask the user something or wait for background work, call `submit_output`.
 - Intermediate steps may gather information or call tools without calling `submit_output`.
 - When you have the final answer, call exactly one action: `[{"name": "submit_output", "args": {"output": "..."}}]`. Do not add other actions in that step and do not write text after `</actions>`.
-- **Important**: Once you receive an `async_task_notification` in `<attachments>` and present the result to the user, you should call `submit_output` to complete the task. Do not repeat the same output in subsequent steps without new information or user requests.
+
+## Error Handling
 - If the actions JSON is invalid, references an unavailable tool, or fails `submit_output` validation, the next step in the same round will contain `<error>`. Fix the protocol issue before continuing.
 - If a tool itself errors, the error appears in observations. Use that observation to adjust the next step.
 """,
@@ -65,6 +100,17 @@ REACT_PROTOCOL_SECTION_ZH = PromptSection(
     template="""
 # ReAct 协议
 - 遵循 ReAct 循环：`<thought>` 说明当前意图，`<actions>` 调用工具，observations 返回事实，然后重复，直到最终调用 `submit_output`。
+
+## 输出格式 Schema
+每一步必须严格按以下格式输出：
+```
+<thought>你的推理过程</thought>
+<actions>[{"name": "工具名", "args": {...}}]</actions>
+```
+
+**关键要求**：`</actions>` 必须是每步输出的**最后内容**。`</actions>` 之后不得输出任何内容——不能有额外标签、文本、重复的闭合标签。
+
+## 格式规则
 - 每一步必须先输出一个 `<thought></thought>`，再输出一个 `<actions></actions>`。
 - `<thought>` 会展示给用户。只写当前目标、依据的观察和下一步意图；不要写工具名、JSON action、参数或代码执行细节。
 - `<actions>` 中只能写 JSON 数组；`<actions>` 内第一个非空字符必须是 `[`。
@@ -72,13 +118,37 @@ REACT_PROTOCOL_SECTION_ZH = PromptSection(
 - 每个 action 元素必须包含 `{"name": "工具名", "args": {...}}`；可增加同级 `max_observation_chars`，仅用于下调该工具的输出投影限额，不能提高工具硬上限。
 - 单步最多输出 {{ max_tool_calls_per_step }} 个 actions；超过时框架会在执行前整体拒绝。
 - `args` 必须始终是合法 JSON object，只包含必要参数；无参工具也要写成 `{"name": "...", "args": {}}`。
+
+## 正确示例
+```
+<thought>我需要读取配置文件来理解设置。</thought>
+<actions>[{"name": "read", "args": {"path": "/path/to/config.yaml"}}]</actions>
+```
+
+```
+<thought>已经找到问题，现在向用户提交分析结果。</thought>
+<actions>[{"name": "submit_output", "args": {"output": "分析完成：bug 在第 42 行。"}}]</actions>
+```
+
+## 常见错误示范
+错误：`<actions>[...]</actions></actions>` (重复的闭合标签)
+错误：`<actions>[...]</actions>额外文本` (闭合标签后有文本)
+错误：`<actions>{"name": "tool"}</actions>` (不是 JSON 数组)
+正确：`<actions>[{"name": "tool", "args": {}}]</actions>` (以 </actions> 结束)
+
+## 异步任务和通知
 - 如果看到 `<attachments>`，表示 runtime 注入了外部信息，例如后台 async task 通知或 inbox 消息；它们和 observations 一样都要纳入后续推理。
 - 后台 async task 是真正异步的：启动后立即返回 receipt，不会阻塞本步。任务完成时会通过下一步的 `<attachments>` 推送 `async_task_notification`。
 - 后台 async task 启动回执不是最终结果；`async_task_notification.summary` 是运行时状态，`async_task_notification.result` 才是子任务实际产出。
-- 启动后不要读取任务文件或轮询；用空 actions 结束当前 round，等待完成通知。想中止任务调用 `async_task_stop(async_task_id)`。
+- 启动后不要读取任务文件或轮询；要等待完成通知时，调用 `submit_output` 结束当前 round 并说明正在运行的任务，通知会在后续 round 到达。想中止任务调用 `async_task_stop(async_task_id)`。
+- **重要**：一旦你在 `<attachments>` 中收到 `async_task_notification` 并向用户展示了结果，应该调用 `submit_output` 完成任务。不要在后续步骤中重复输出相同内容，除非有新信息或用户有新要求。
+
+## Round 控制
+- 只有 `submit_output` 会结束 round。空 actions `[]` 不执行任何动作，循环会进入下一步。需要向用户提问或等待后台任务时，调用 `submit_output`。
 - 中间步骤可以只收集信息或调用工具，不需要每一步都调用 `submit_output`。
 - 获得最终答案后，只调用一个 action：`[{"name": "submit_output", "args": {"output": "..."}}]`。该步不得包含其他 action，也不要在 `</actions>` 后追加正文。
-- **重要**：一旦你在 `<attachments>` 中收到 `async_task_notification` 并向用户展示了结果，应该调用 `submit_output` 完成任务。不要在后续步骤中重复输出相同内容，除非有新信息或用户有新要求。
+
+## 错误处理
 - 如果 actions JSON 非法、引用不可用工具或 `submit_output` 校验失败，同一 round 的下一 step 会收到 `<error>`；必须先修复协议问题再继续。
 - 如果工具本身报错，错误会出现在 observations 中；基于该 observation 调整下一步。
 """,

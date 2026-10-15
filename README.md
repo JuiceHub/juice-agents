@@ -2,29 +2,33 @@
 
 > [简体中文](README.zh-CN.md)
 
-`juice-agents` is a lightweight Python agent framework. Build ReAct and CodeAct agents with one runtime, call tools, orchestrate graphs, and resume sessions and tasks after a process restart.
+A lightweight Python agent framework for building ReAct and CodeAct agents with **persistent sessions**, **workflow orchestration**, and **multi-agent collaboration**.
 
-The project is currently a `0.1.0` development release. Persisted state uses the current schema only; back up `.juice/` before upgrading.
+**Current version:** `0.1.0` (development release)
 
-## What it provides
+## Core Features
 
-| Capability | Use |
+| Feature | Description |
 | --- | --- |
-| Agents and tools | Shell, Python, file, web, browser, image, MCP, and other tools |
-| Graphs | Branching, parallel work, loops, and checkpoints |
-| Multiple agents | Built-in `agent`, `plan`, `group`, and `team` configurations |
-| Persistence | Resumable sessions, graphs, background tasks, and Team boards |
-| Entry points | Python SDK, terminal CLI, and local Web workbench |
+| 🔄 **Session Resume** | Resume agents, workflows, and tasks after process restart |
+| 🎯 **Multiple Agent Modes** | `agent`, `plan`, `group`, `team` — one runtime, four collaboration patterns |
+| 🧠 **Exploration Strategies** | Greedy, Best-of-N, Beam Search, Tree-of-Thoughts for multi-path reasoning |
+| 🌐 **Workflow Orchestration** | Branch, parallelize, loop, and checkpoint complex workflows |
+| 🛠️ **Rich Toolset** | Shell, Python, file, web, browser, image, MCP, and custom tools |
+| 💾 **Persistent State** | Sessions, workflows, background tasks, and team boards survive restarts |
+| 🚀 **Multiple Interfaces** | Python SDK, terminal CLI, and local web workbench |
 
 ```text
-User request → Runner → Agent / Graph / Team → Tools
-                    │                         │
-                    └── sessions, tasks, approvals, and audit ──┘
+User request → Runner → Agent / Workflow / Team → Tools
+                    │                              │
+                    └──── persistence, approval, audit ────┘
 ```
 
-## Install from source
+## Quick Start
 
-Conda is required. Run these commands from the repository root; the environment file installs Python and Node.js.
+### Installation
+
+Requires Conda. Run from repository root:
 
 ```bash
 conda env create -f environment.yml
@@ -34,17 +38,18 @@ python -m pip install -r adapters/requirements.txt
 npm ci --prefix frontend
 ```
 
-Before using an online model, copy the templates and add the credentials for your provider:
+Configure API credentials for online models:
 
 ```bash
 mkdir -p .juice
 cp sdk/src/juice_agents/_assets/config.example.yaml .juice/config.yaml
 cp .env.example .env
+# Edit .env with your API keys
 ```
 
-Do not commit `.env` or `.juice/`. Browser tools also require `python -m playwright install chromium`.
+Browser tools require: `python -m playwright install chromium`
 
-## First SDK program
+### First Program
 
 ```python
 from juice_agents import Juice
@@ -52,52 +57,80 @@ from juice_agents import Juice
 juice = Juice(workspace=".")
 runner = juice.runners.create(runner_config="agent", permission_mode="default")
 
+# Stream execution events
 for event in runner.stream("Analyze this project's module boundaries"):
     print(event)
 
-# runner_id can restore the same session in a later process.
+# Resume the same session later (even after process restart)
 runner = juice.runners.resume(runner_id=runner.runner_id)
 print(runner.run("Turn the recommendations into an implementation order"))
 ```
 
-All four built-in configurations share the Runner execution path:
+### Agent Modes
 
-| Configuration | Best for |
+| Mode | Best For |
 | --- | --- |
-| `agent` | One Agent executing directly, with optional delegation |
-| `plan` | Investigating and planning before approval and execution |
-| `group` | A root coordinating a group of specialist Agents |
-| `team` | A persistent task board, member claims, and messages |
+| `agent` | Single agent execution with optional delegation |
+| `plan` | Investigate and plan before approval and execution |
+| `group` | Root agent coordinating specialist agents |
+| `team` | Persistent task board with member claims and messages |
 
-A Team is created or selected by root, then populated with members. Existing member definitions can be reused on a new board. See the [Runner](sdk/src/juice_agents/core/runner/README.md) and [Team](sdk/src/juice_agents/core/team/README.md) documentation for configuration and runtime rules.
-
-## CLI and Web
+### CLI and Web
 
 ```bash
-./juice       # terminal interface
-./juice-web   # local Web workbench
+./juice       # Terminal interface
+./juice-web   # Local web workbench (localhost only)
 ```
 
-The Web gateway is local-only and has no remote authentication; it rejects non-loopback bind addresses. The Python SDK can be built independently. CLI, Web, and adapters currently run from the repository source and are not published as separate packages.
+### Exploration Strategies
 
-## Development conventions
+Control how agents explore solution spaces with `/strategy` in CLI or SDK:
+
+```bash
+# CLI: Switch strategies dynamically
+/strategy reset                           # Default greedy (single path)
+/strategy breadth=5 depth=1               # Best-of-N: generate 5, select best
+/strategy breadth=3 depth=5 beam_width=3  # Beam Search: keep 3 parallel paths
+/strategy breadth=3 depth=5 beam_width=1  # Single-path exploration
+```
+
+```python
+# SDK: Configure exploration strategy
+from juice_agents.core.agent.context.strategies import TreeOfThoughtsStrategy
+
+strategy = TreeOfThoughtsStrategy(
+    breadth=3,        # Generate 3 candidates per step
+    depth_limit=5,    # Explore up to 5 layers deep
+    keep_top_k=2      # Keep top-2 paths at each step
+)
+agent.set_exploration_strategy(strategy)
+```
+
+| Strategy | Configuration | Use Case |
+| --- | --- | --- |
+| **Greedy** | `breadth=1, depth=1` | Fast, deterministic decisions |
+| **Best-of-N** | `breadth=N, depth=1, beam_width=1` | One-shot candidate generation |
+| **Beam Search** | `breadth=N, depth=D, beam_width=N` | Parallel path exploration |
+| **ToT-style** | `breadth=N, depth=D, beam_width=1` | Deep single-path with backtracking |
+
+See [examples/agent_tot](examples/agent_tot) for complete examples.
+
+## Architecture
 
 ```text
-Registry (static declarations) → Manager (runtime objects and state) ← Runner (request scheduling)
+Registry (static config) → Manager (runtime state) ← Runner (execution)
 ```
 
-| Boundary | Convention |
-| --- | --- |
-| Registry | Resolve, validate, and instantiate objects; never keep active sessions or execution state |
-| Manager | Own Agent, tool, graph, and background-task lifecycles, persistence, and cancellation |
-| Runner | Compose Managers and schedule requests; every mode uses the same execution path |
-| Adapter | Map stdio / HTTP / WebSocket protocols; the SDK core must not import `adapters/` |
+- **Registry**: Resolve, validate, and instantiate objects
+- **Manager**: Handle lifecycles, persistence, and cancellation
+- **Runner**: Compose managers and schedule requests
+- **Adapter**: Map stdio/HTTP/WebSocket protocols
 
-Agents call tools through the Runner context so permissions, cancellation, and audit apply to one request. `RunnerConfig` is the execution contract; a custom configuration cannot install another execution loop. Team tasks, messages, and state are persisted by Managers, and only root can create tasks or change task eligibility. Plan approval is initiated by the current Runner root; old Runner manifests are not migrated automatically.
+All agent modes share the same execution path through Runner. State persists to `.juice/` in the workspace.
 
-Runtime state is written to `.juice/` in the caller workspace. New writes must be atomic, and cancellation, recovery, and failures must produce logs that can be associated with the Runner ID. Reuse existing interfaces, add behavior tests under `tests/`, and update affected module READMEs.
+## Development
 
-## Testing and contributing
+Run tests:
 
 ```bash
 conda activate juice-agents
@@ -105,14 +138,14 @@ python -m pytest tests -q
 cd frontend && npm test --workspaces --if-present
 ```
 
-Changes should include relevant tests, documentation updates, and verification results. Use GitHub Issues for general questions and feature requests. Report security issues through the repository's private vulnerability channel instead of a public issue.
+Contributions should include tests, documentation updates, and verification results. See [AGENTS.md](AGENTS.md) for development guidelines.
 
-The project is released under the [Apache License 2.0](LICENSE). Confirm that contributions can be distributed under that license; third-party dependencies retain their own licenses.
-
-Before a release, run Python and frontend tests, type checks, and builds in a clean environment. Inspect SDK wheel files and metadata. Build public artifacts from a reviewed source snapshot without private Git history, then enable CI, secret scanning, dependency alerts, and private vulnerability reporting. SDK wheels do not contain CLI or Web code.
-
-## Module documentation
+## Module Documentation
 
 - [SDK](sdk/README.md) · [Adapters](adapters/README.md) · [Examples](examples/README.md)
-- [Core](sdk/src/juice_agents/core/README.md) · [Graph](sdk/src/juice_agents/core/graph/README.md)
-- [CLI](frontend/cli/README.md) · [Web](frontend/web/README.md) · [Frontend shared](frontend/shared/README.md)
+- [Core](sdk/src/juice_agents/core/README.md) · [Workflow](sdk/src/juice_agents/core/workflow/README.md)
+- [CLI](frontend/cli/README.md) · [Web](frontend/web/README.md) · [Frontend Shared](frontend/shared/README.md)
+
+## License
+
+[Apache License 2.0](LICENSE)

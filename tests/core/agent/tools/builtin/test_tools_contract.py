@@ -8,7 +8,7 @@ from juice_agents.core.agent.tools.builtin.web.browser.inspection_tools import B
 from juice_agents.core.agent.tools.builtin.mcp.mcp_tools import MCPRemoteTool
 from juice_agents.core.agent.tools.builtin.web.web_search_tools import WebSearchTool
 from juice_agents.core.agent.tools.builtin.user_interaction.ask_tools import AskTool
-from juice_agents.core.agent.tools.builtin.graphs.graphs_tools import GraphTool
+from juice_agents.core.agent.tools.builtin.workflows.workflows_tools import WorkflowRunTool
 from juice_agents.core.agent.tools.builtin.agents.subagents_tools import AgentTool
 from juice_agents.core.agent.tools.builtin.filesystem.files_tools import GlobTool, ReadTool
 
@@ -62,7 +62,7 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(BrowserGetTextTool.max_observation_chars, 12_000)
         self.assertEqual(MCPRemoteTool.max_observation_chars, 12_000)
         self.assertEqual(AgentTool.max_observation_chars, 16_000)
-        self.assertEqual(GraphTool.max_observation_chars, 16_000)
+        self.assertEqual(WorkflowRunTool.max_observation_chars, 16_000)
         self.assertEqual(AskTool.max_observation_chars, 32_000)
 
     def test_invocation_observation_limit_is_scoped_and_restored(self):

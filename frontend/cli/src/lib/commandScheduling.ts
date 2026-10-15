@@ -11,7 +11,7 @@ export type CommandExecutionPolicy = "immediate" | "fifo";
 // 只包含不刷新 root 有效配置的轻量指令。`/mode` 会在空闲边界刷新 root，
 // 因此不在此列；`/permissions` 只改审批策略，可以在 step 边界插队。
 const IMMEDIATE_COMMAND_TOKENS = new Set([
-  "/actors",
+  "/active",
   "/clear",
   "/exit",
   "/help",

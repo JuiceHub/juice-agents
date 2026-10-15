@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Literal
 from weakref import WeakValueDictionary
 
-from juice_agents.core.models import AnthropicModel, CompositeModel, DoubaoModel, OpenAIModel
+from juice_agents.core.models import AnthropicModel, DoubaoModel, OpenAIModel
 from juice_agents.core.utils import load_env_file
 
 from .runtime_config import (
@@ -39,7 +39,7 @@ _MODEL_INSTANCE_POOL: WeakValueDictionary = WeakValueDictionary()
 _pool_lock = __import__("threading").Lock()
 
 DEFAULT_RUNTIME_MODEL_NAME = "doubao_lite"
-RuntimeBackend = Literal["openai", "doubao", "anthropic", "composite"]
+RuntimeBackend = Literal["openai", "doubao", "anthropic"]
 RuntimeModelEffort = Literal["disabled", "low", "medium", "high", "xhigh", "max", "auto"]
 RuntimeThinkingMode = Literal["adaptive", "manual", "none"]
 RUNTIME_MODEL_EFFORTS_ORDER: tuple[str, ...] = (
@@ -95,17 +95,36 @@ def _require_model_entry_fields(model_name: str, raw: dict[str, Any], required: 
 
 def _normalize_backend(model_name: str, raw: dict[str, Any]) -> RuntimeBackend:
     backend = str(raw.get("backend") or "").strip().lower()
-    if backend not in {"openai", "doubao", "anthropic", "composite"}:
+    if backend not in {"openai", "doubao", "anthropic"}:
         raise ValueError(f"模型 {model_name} 的 backend 不合法: {backend}")
     return backend  # type: ignore[return-value]
 
 
-def _resolve_api_key(*, api_key_env: str, dotenv_path: str | Path | None) -> str:
+def _read_env_value(name: str, *, dotenv_path: str | Path | None) -> str:
+    """读取变量值：进程环境变量优先，其次 .env 文件；未配置返回空串。"""
     env_values = load_env_file(dotenv_path or DEFAULT_DOTENV_PATH)
-    value = str(os.environ.get(api_key_env) or env_values.get(api_key_env) or "").strip()
+    return str(os.environ.get(name) or env_values.get(name) or "").strip()
+
+
+def _resolve_api_key(*, api_key_env: str, dotenv_path: str | Path | None) -> str:
+    value = _read_env_value(api_key_env, dotenv_path=dotenv_path)
     if not value:
         raise ValueError(f"模型密钥环境变量未配置: {api_key_env}")
     return value
+
+
+def _resolve_api_base(*, api_base: str, api_base_env: str, dotenv_path: str | Path | None) -> str:
+    """
+    解析 API base URL，优先级：api_base_env 指向的变量 > YAML 中的 api_base。
+
+    便于在 .env 中切换官方地址与代理/中转地址，而无需修改模型目录 YAML。
+    """
+    if api_base_env:
+        env_value = _read_env_value(api_base_env, dotenv_path=dotenv_path)
+        if env_value:
+            logger.info("api_base 由环境变量 %s 覆盖: %s", api_base_env, env_value)
+            return env_value
+    return api_base
 
 
 def normalize_runtime_model_effort(model_effort: str | None) -> RuntimeModelEffort:
@@ -138,7 +157,8 @@ def _normalize_effort_list(raw: Any, *, model_name: str) -> list[RuntimeModelEff
 
 def _infer_anthropic_supported_efforts(provider_model_name: str) -> tuple[str, ...]:
     model = str(provider_model_name or "").strip().lower()
-    if "claude-opus-4-8" in model or "claude-opus-4-7" in model:
+    # Opus 5.5 / Sonnet 5.5 / Opus 5 / 4.8/4.7 支持完整 effort 档位（含 xhigh / max）
+    if any(x in model for x in ("claude-opus-5-5", "claude-sonnet-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7")):
         return CLAUDE_OPUS_EFFORTS
     if "claude-sonnet-4-6" in model or "claude-opus-4-6" in model:
         return CLAUDE_SONNET_46_EFFORTS
@@ -151,9 +171,7 @@ def _infer_anthropic_supported_efforts(provider_model_name: str) -> tuple[str, .
 
 def infer_supported_efforts(*, backend: str, provider_model_name: str) -> list[RuntimeModelEffort]:
     normalized_backend = str(backend or "").strip().lower()
-    if normalized_backend == "composite":
-        values = RUNTIME_MODEL_EFFORTS_ORDER
-    elif normalized_backend == "anthropic":
+    if normalized_backend == "anthropic":
         values = _infer_anthropic_supported_efforts(provider_model_name)
     else:
         values = DEFAULT_PROVIDER_EFFORTS.get(normalized_backend, ("disabled",))
@@ -198,7 +216,9 @@ def infer_supports_budget_tokens(*, backend: str, provider_model_name: str) -> b
     if str(backend or "").strip().lower() != "anthropic":
         return False
     model = str(provider_model_name or "").strip().lower()
-    return "claude-opus-4-7" not in model
+    # Opus 5.5 / Sonnet 5.5 / Opus 5 / Opus 4.8 / Opus 4.7 不支持 budget_tokens（仅通过 effort 控制）
+    excluded = ("claude-opus-5-5", "claude-sonnet-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7")
+    return not any(x in model for x in excluded)
 
 
 def resolve_supports_budget_tokens(raw: dict[str, Any]) -> bool:
@@ -278,8 +298,6 @@ def load_runtime_model_config(
 
     _require_model_entry_fields(normalized_model_name, raw_model, ["backend"])
     backend = _normalize_backend(normalized_model_name, raw_model)
-    if backend == "composite":
-        return RuntimeModelConfig(model_name=normalized_model_name, backend=backend)
 
     _require_model_entry_fields(
         normalized_model_name,
@@ -289,7 +307,12 @@ def load_runtime_model_config(
 
     api_key_env = str(raw_model.get("api_key_env") or "").strip()
     provider_model_name = str(raw_model.get("provider_model_name") or "").strip()
-    api_base = str(raw_model.get("api_base") or "").strip()
+    # api_base_env 可选：配置后其指向的变量（如 ANTHROPIC_BASE_URL）优先于 YAML 的 api_base
+    api_base = _resolve_api_base(
+        api_base=str(raw_model.get("api_base") or "").strip(),
+        api_base_env=str(raw_model.get("api_base_env") or "").strip(),
+        dotenv_path=dotenv_path,
+    )
     api_key = _resolve_api_key(api_key_env=api_key_env, dotenv_path=dotenv_path)
 
     return RuntimeModelConfig(
@@ -313,12 +336,11 @@ def list_runtime_models(
         raw = dict(models.get(model_name) or {})
         _require_model_entry_fields(model_name, raw, ["backend"])
         backend = _normalize_backend(model_name, raw)
-        if backend != "composite":
-            _require_model_entry_fields(
-                model_name,
-                raw,
-                ["api_base", "api_key_env", "provider_model_name"],
-            )
+        _require_model_entry_fields(
+            model_name,
+            raw,
+            ["api_base", "api_key_env", "provider_model_name"],
+        )
         item = {
             "model_name": model_name,
             "backend": backend,
@@ -329,181 +351,8 @@ def list_runtime_models(
             "thinking_mode": resolve_thinking_mode(raw),
             "supports_budget_tokens": resolve_supports_budget_tokens(raw),
         }
-        if backend == "composite":
-            item["strategy"] = str(raw.get("strategy") or "").strip().lower()
         items.append(item)
     return items
-
-
-def _normalize_model_ref(raw: Any, *, field_name: str) -> dict[str, str]:
-    """把 composite 子模型引用收敛为统一结构。"""
-
-    if isinstance(raw, str):
-        model_name = raw.strip()
-        if not model_name:
-            raise ValueError(f"{field_name} 不能为空")
-        return {"model": model_name, "name": model_name, "model_effort": ""}
-    if not isinstance(raw, dict):
-        raise ValueError(f"{field_name} 必须为字符串或 object")
-    model_name = str(raw.get("model") or "").strip()
-    if not model_name:
-        raise ValueError(f"{field_name}.model 不能为空")
-    return {
-        "model": model_name,
-        "name": str(raw.get("name") or model_name).strip(),
-        "model_effort": str(raw.get("model_effort") or "").strip(),
-    }
-
-
-def _resolve_child_model(
-    *,
-    raw_ref: Any,
-    field_name: str,
-    inherited_effort: str | None,
-    runtime_config_path: str | Path | None,
-    workspace_dir: str | Path | None,
-    dotenv_path: str | Path | None,
-    resolution_stack: tuple[str, ...],
-) -> dict[str, Any]:
-    ref = _normalize_model_ref(raw_ref, field_name=field_name)
-    child_effort = ref["model_effort"] or inherited_effort
-    model = resolve_runtime_model(
-        model_name=ref["model"],
-        runtime_config_path=runtime_config_path,
-        workspace_dir=workspace_dir,
-        dotenv_path=dotenv_path,
-        model_effort=child_effort,
-        _resolution_stack=resolution_stack,
-    )
-    return {"name": ref["name"], "model": model}
-
-
-def _resolve_child_model_object(
-    *,
-    raw_ref: Any,
-    field_name: str,
-    inherited_effort: str | None,
-    runtime_config_path: str | Path | None,
-    workspace_dir: str | Path | None,
-    dotenv_path: str | Path | None,
-    resolution_stack: tuple[str, ...],
-) -> Any:
-    return _resolve_child_model(
-        raw_ref=raw_ref,
-        field_name=field_name,
-        inherited_effort=inherited_effort,
-        runtime_config_path=runtime_config_path,
-        workspace_dir=workspace_dir,
-        dotenv_path=dotenv_path,
-        resolution_stack=resolution_stack,
-    )["model"]
-
-
-def _resolve_composite_model(
-    *,
-    model_name: str,
-    raw: dict[str, Any],
-    runtime_config_path: str | Path | None,
-    workspace_dir: str | Path | None,
-    dotenv_path: str | Path | None,
-    model_effort: str | None,
-    resolution_stack: tuple[str, ...],
-) -> CompositeModel:
-    strategy = str(raw.get("strategy") or "").strip().lower()
-    if not strategy:
-        raise ValueError(f"Composite 模型 {model_name} 缺少 strategy")
-    fail_fast = bool(raw.get("fail_fast", False))
-    max_refine_rounds = int(raw.get("max_refine_rounds", 2))
-    child_stack = (*resolution_stack, model_name)
-
-    if strategy in {"judge_select", "synthesize"}:
-        raw_candidates = raw.get("candidates")
-        if not isinstance(raw_candidates, list) or not raw_candidates:
-            raise ValueError(f"Composite 模型 {model_name} 必须配置非空 candidates")
-        candidates = [
-            _resolve_child_model(
-                raw_ref=item,
-                field_name=f"{model_name}.candidates[{idx}]",
-                inherited_effort=model_effort,
-                runtime_config_path=runtime_config_path,
-                workspace_dir=workspace_dir,
-                dotenv_path=dotenv_path,
-                resolution_stack=child_stack,
-            )
-            for idx, item in enumerate(raw_candidates)
-        ]
-        if strategy == "judge_select":
-            judge_model = _resolve_child_model_object(
-                raw_ref=raw.get("judge"),
-                field_name=f"{model_name}.judge",
-                inherited_effort=model_effort,
-                runtime_config_path=runtime_config_path,
-                workspace_dir=workspace_dir,
-                dotenv_path=dotenv_path,
-                resolution_stack=child_stack,
-            )
-            return CompositeModel(
-                model_name=model_name,
-                strategy=strategy,
-                candidates=candidates,
-                judge_model=judge_model,
-                fail_fast=fail_fast,
-                max_refine_rounds=max_refine_rounds,
-            )
-        synthesis_ref = raw.get("synthesis") or raw.get("synthesizer") or raw.get("final_model")
-        synthesis_model = _resolve_child_model_object(
-            raw_ref=synthesis_ref,
-            field_name=f"{model_name}.synthesis",
-            inherited_effort=model_effort,
-            runtime_config_path=runtime_config_path,
-            workspace_dir=workspace_dir,
-            dotenv_path=dotenv_path,
-            resolution_stack=child_stack,
-        )
-        return CompositeModel(
-            model_name=model_name,
-            strategy=strategy,
-            candidates=candidates,
-            synthesis_model=synthesis_model,
-            fail_fast=fail_fast,
-            max_refine_rounds=max_refine_rounds,
-        )
-
-    if strategy == "iterative_refine":
-        raw_reviewers = raw.get("reviewers")
-        if not isinstance(raw_reviewers, list) or not raw_reviewers:
-            raise ValueError(f"Composite 模型 {model_name} 必须配置非空 reviewers")
-        generator_model = _resolve_child_model_object(
-            raw_ref=raw.get("generator"),
-            field_name=f"{model_name}.generator",
-            inherited_effort=model_effort,
-            runtime_config_path=runtime_config_path,
-            workspace_dir=workspace_dir,
-            dotenv_path=dotenv_path,
-            resolution_stack=child_stack,
-        )
-        reviewers = [
-            _resolve_child_model(
-                raw_ref=item,
-                field_name=f"{model_name}.reviewers[{idx}]",
-                inherited_effort=model_effort,
-                runtime_config_path=runtime_config_path,
-                workspace_dir=workspace_dir,
-                dotenv_path=dotenv_path,
-                resolution_stack=child_stack,
-            )
-            for idx, item in enumerate(raw_reviewers)
-        ]
-        return CompositeModel(
-            model_name=model_name,
-            strategy=strategy,
-            generator_model=generator_model,
-            reviewer_models=reviewers,
-            fail_fast=fail_fast,
-            max_refine_rounds=max_refine_rounds,
-        )
-
-    raise ValueError(f"Composite 模型 {model_name} 的 strategy 不合法: {strategy}")
 
 
 def resolve_runtime_model(
@@ -538,10 +387,10 @@ def resolve_runtime_model(
                 logger.debug(f"模型实例缓存命中: {normalized_model_name}")
                 return _MODEL_INSTANCE_POOL[cache_key]
 
-    # 循环引用检测
+    # 循环引用检测（移除 composite 后不再需要，但保留以备未来使用）
     if normalized_model_name in _resolution_stack:
         chain = " -> ".join((*_resolution_stack, normalized_model_name))
-        raise ValueError(f"Composite 模型存在循环引用: {chain}")
+        raise ValueError(f"模型存在循环引用: {chain}")
 
     config = load_runtime_model_config(
         model_name=normalized_model_name,
@@ -556,46 +405,33 @@ def resolve_runtime_model(
         workspace_dir=workspace_dir,
     )
 
-    if config.backend == "composite":
-        _, models = _load_catalog_payload(runtime_config_path, workspace_dir=workspace_dir)
-        raw_model = dict(models.get(config.model_name) or {})
-        model = _resolve_composite_model(
-            model_name=config.model_name,
-            raw=raw_model,
-            runtime_config_path=runtime_config_path,
-            workspace_dir=workspace_dir,
-            dotenv_path=dotenv_path,
-            model_effort=normalized_effort,
-            resolution_stack=_resolution_stack,
+    logger.info(
+        "解析运行时模型: model_name=%s backend=%s provider_model_name=%s",
+        config.model_name,
+        config.backend,
+        config.provider_model_name,
+    )
+    # Anthropic 使用 output_config.effort + adaptive thinking（官方推荐）
+    if config.backend == "anthropic":
+        model = AnthropicModel(
+            api_base=config.api_base,
+            api_key=config.api_key,
+            model_name=config.provider_model_name,
+            thinking=build_anthropic_thinking_config(normalized_effort),
+            effort_config=build_anthropic_effort_config(normalized_effort),
         )
     else:
-        logger.info(
-            "解析运行时模型: model_name=%s backend=%s provider_model_name=%s",
-            config.model_name,
-            config.backend,
-            config.provider_model_name,
-        )
-        # Anthropic 使用 output_config.effort + adaptive thinking（官方推荐）
-        if config.backend == "anthropic":
-            model = AnthropicModel(
-                api_base=config.api_base,
-                api_key=config.api_key,
-                model_name=config.provider_model_name,
-                thinking=build_anthropic_thinking_config(normalized_effort),
-                effort_config=build_anthropic_effort_config(normalized_effort),
-            )
+        # Doubao/OpenAI 继续使用 thinking.effort 方式
+        kwargs = {
+            "api_base": config.api_base,
+            "api_key": config.api_key,
+            "model_name": config.provider_model_name,
+            "thinking": build_thinking_override(normalized_effort),
+        }
+        if config.backend == "doubao":
+            model = DoubaoModel(**kwargs)
         else:
-            # Doubao/OpenAI 继续使用 thinking.effort 方式
-            kwargs = {
-                "api_base": config.api_base,
-                "api_key": config.api_key,
-                "model_name": config.provider_model_name,
-                "thinking": build_thinking_override(normalized_effort),
-            }
-            if config.backend == "doubao":
-                model = DoubaoModel(**kwargs)
-            else:
-                model = OpenAIModel(**kwargs)
+            model = OpenAIModel(**kwargs)
 
     # 加入缓存
     if _enable_cache:

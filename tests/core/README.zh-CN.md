@@ -10,7 +10,7 @@
 | `agent/` | Agent 会话、模型协议与内置工具 |
 | `registry/` | 声明解析、校验与运行时边界 |
 | `runner/` | 请求、恢复、后台任务与多 Agent 调度 |
-| `graph/` | StateGraph 流程和 checkpoint |
+| `workflow/` | Workflow 脚本和执行 |
 | `team/` | Team 任务与成员协作 |
 
 从仓库根目录运行：

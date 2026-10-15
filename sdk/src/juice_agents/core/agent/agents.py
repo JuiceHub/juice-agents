@@ -46,29 +46,26 @@ from .prompts import (
 )
 from .prompts.sections import normalize_prompt_language
 from juice_agents.core.registry.skills import SkillRegistry
-from .sessions import (
+from .context import (
     ActionStep,
     ActionValidationError,
     AgentError,
-    AgentSession,
-    CompactCompressStrategy,
-    CompressStrategy,
-    CompressibleAgentSession,
+    ContextTree,
     ContextWindowExceededError,
     ModelOutputProtocolError,
-    RemainCompressStrategy,
     SubmitOutputValidationError,
     TaskStep,
     ToolResolutionError,
     is_recoverable_agent_error,
     observations_to_text,
 )
-from .sessions.content import (
+from .context.compression import CompactCompressStrategy, CompressStrategy, RemainCompressStrategy
+from .context.content import (
     CODEACT_OBSERVATION_PROJECTION_CHARS,
     DEFAULT_OBSERVATION_PROJECTION_CHARS,
 )
 from .tools.builtin.output.completion_tools import SubmitOutputTool
-from .tools.builtin.graphs.constants import GRAPH_TOOL_NAMES
+from .tools.builtin.workflows.constants import WORKFLOW_TOOL_NAMES
 from .tools.builtin.plugins.plugins_tools import PluginViewTool, PluginsListTool
 from .tools.builtin.skills.skills_tools import SkillViewTool, SkillsListTool
 from .tools.builtin.evolution.skill_manage import SkillManageTool
@@ -103,6 +100,10 @@ LOG_TYPE_CONFIG = {
 }
 
 _NO_SUBMIT_OUTPUT = object()
+
+# 空 actions 步的普通 observation：如实告知没有执行动作。它也保证下一次请求
+# 以 user 消息结尾（Claude 等模型不接受以 assistant 消息结尾的 prefill）。
+_EMPTY_ACTIONS_OBSERVATION = "本步未执行任何动作。"
 
 
 def _runner_tool_policy(agent: Any) -> Any | None:
@@ -228,7 +229,7 @@ def _merge_tools_with_submit_output(
     plugin_tool_params: dict[str, Any] | None = None,
     include_skill_tools: bool = True,
     include_plugin_tools: bool = True,
-    include_graph_tools: bool = True,
+    include_workflow_tools: bool = True,
     include_self_evolution: bool = True,
 ) -> dict[str, Tool]:
     """
@@ -240,7 +241,7 @@ def _merge_tools_with_submit_output(
     tools_dict = {
         tool.name: tool
         for tool in tools
-        if include_graph_tools or str(getattr(tool, "name", "")) not in GRAPH_TOOL_NAMES
+        if include_workflow_tools or str(getattr(tool, "name", "")) not in WORKFLOW_TOOL_NAMES
     }
     if "submit_output" not in tools_dict:
         output_tool = SubmitOutputTool()
@@ -660,10 +661,11 @@ class MultiStepAgent(ABC):
         # 与分段后实际发送给模型的内容保持一致。
         self.system_prompt = self._compose_full_system_prompt()
         self.max_steps = max_steps
-        self.session_compression = self._normalize_session_compression(session_compression)
+        self.context_compression = self._normalize_session_compression(session_compression)
         self.compression_model = compression_model or model
         self._pending_request_bytes = 0
-        self.session = AgentSession(
+        self.context = ContextTree(
+            tree_id=self.agent_id,  # 使用 agent_id 作为 tree_id
             system_prompt=self.system_prompt,
             system_prompt_static=self.system_prompt_static,
             system_prompt_dynamic=self.system_prompt_dynamic,
@@ -672,7 +674,7 @@ class MultiStepAgent(ABC):
         # pure step objects until AgentManager binds a RunnerContext; that
         # context forwards every action to the Runner-owned ToolManager.
         self._current_execution_records: list[ToolExecutionResult] = []
-        self.session_compression_strategy: CompressStrategy | None = None
+        self.context_compression_strategy: CompressStrategy | None = None
         self.attachments_hook = attachments_hook
         logger.info(
             "智能体 %s 初始化完成，agent_id=%s，工具：%s，托管智能体：%s",
@@ -1039,7 +1041,7 @@ class MultiStepAgent(ABC):
         """统一写入模型原始输出，并同步到美观日志。"""
         normalized_content = "" if content is None else str(content)
         step.model_output = normalized_content
-        include_reasoning = bool(self.session.include_reasoning_in_context)
+        include_reasoning = bool(self.context.include_reasoning_in_context)
         if step.reasoning_content and not include_reasoning:
             # 默认 reasoning 不会进入后续上下文，日志也保持为独立诊断块，
             # 避免把 `<think>` 误读成模型正文协议的一部分。
@@ -1135,11 +1137,12 @@ class MultiStepAgent(ABC):
         """
         self.system_prompt_static, self.system_prompt_dynamic = self.init_system_prompt_segments()
         self.system_prompt = self._compose_full_system_prompt()
-        session = getattr(self, "session", None)
-        if session is not None:
-            session.system_prompt = self.system_prompt
-            session.system_prompt_static = self.system_prompt_static
-            session.system_prompt_dynamic = self.system_prompt_dynamic
+        # 同步到 context tree，确保模型收到更新后的提示词
+        context = getattr(self, "context", None)
+        if context is not None:
+            context.system_prompt = self.system_prompt
+            context.system_prompt_static = self.system_prompt_static
+            context.system_prompt_dynamic = self.system_prompt_dynamic
 
     def set_attachments_hook(
         self,
@@ -1150,7 +1153,7 @@ class MultiStepAgent(ABC):
     def set_session_compression_strategy(self, strategy: CompressStrategy | None) -> None:
         """设置显式的旧式单策略覆盖；None 恢复默认 remain + compact 管线。"""
 
-        self.session_compression_strategy = strategy
+        self.context_compression_strategy = strategy
 
     @staticmethod
     def _normalize_session_compression(value: dict[str, Any] | None) -> dict[str, Any]:
@@ -1204,7 +1207,9 @@ class MultiStepAgent(ABC):
     def _token_per_byte_ratio(self) -> float:
         """用最近一轮 usage 校准；没有可靠 usage 时退回 bytes / 3。"""
 
-        for step in reversed(self.session.steps):
+        # 使用 to_linear_steps() 获取步骤列表
+        steps = self.context.to_linear_steps()
+        for step in reversed(steps):
             if not isinstance(step, ActionStep):
                 continue
             request_bytes = int(step.request_bytes or 0)
@@ -1237,19 +1242,19 @@ class MultiStepAgent(ABC):
             step.usage = None
 
     def build_messages(self) -> list[dict[str, Any]]:
-        # 显式单策略只用于已有集成的受控覆盖；remain 仍由 wrapper 保证不回写。
-        if self.session_compression_strategy is not None:
-            compressible = CompressibleAgentSession(self.session, self.session_compression_strategy)
-            messages = compressible.to_messages()
-            self.session = compressible.session
+        # 压缩策略处理
+        if self.context_compression_strategy is not None:
+            if self.context_compression_strategy.should_compress(self.context):
+                self.context = self.context_compression_strategy.compress(self.context)
+            messages = self.context.to_messages()
             self._pending_request_bytes = self._messages_utf8_bytes(messages)
             return messages
 
         # Compact 的触发和摘要输入都基于 canonical 的逐工具限额投影，且发生在
         # remain 之前，确保摘要模型仍能看到较老 observation 的真实投影。
-        canonical_messages = self.session.to_messages()
+        canonical_messages = self.context.to_messages()
         canonical_tokens = self._estimate_message_tokens(canonical_messages)
-        compact_config = self.session_compression["compact"]
+        compact_config = self.context_compression["compact"]
         trigger_tokens = int(
             self.context_window_tokens * float(compact_config["trigger_ratio"])
         )
@@ -1260,7 +1265,7 @@ class MultiStepAgent(ABC):
                 preserve_recent_actions=int(compact_config["preserve_recent_actions"]),
             )
             try:
-                self.session = strategy.compress(self.session)
+                self.context = strategy.compress(self.context)
                 logger.info(
                     "会话 compact 成功: agent=%s estimated_tokens=%s trigger_tokens=%s",
                     self.name,
@@ -1274,10 +1279,10 @@ class MultiStepAgent(ABC):
                     self.name,
                 )
 
-        remain_config = self.session_compression["remain"]
+        remain_config = self.context_compression["remain"]
         projected_session = RemainCompressStrategy(
             k=int(remain_config["keep_recent_actions"])
-        ).compress(self.session)
+        ).compress(self.context)
         messages = projected_session.to_messages()
         estimated_tokens = self._estimate_message_tokens(messages)
         if estimated_tokens > self.context_window_tokens:
@@ -1460,15 +1465,15 @@ class ReActAgent(MultiStepAgent):
         tool_executor_max_workers: int = 8,
         prompt_language: str = "en",
         enable_skill_tools: bool = True,
-        enable_graph_tools: bool = True,
+        enable_workflow_tools: bool = True,
         enable_self_evolution: bool = True,
     ):
         if isinstance(tool_executor_max_workers, bool) or not isinstance(tool_executor_max_workers, int) or tool_executor_max_workers <= 0:
             raise ValueError("tool_executor_max_workers 必须为正整数")
         self.tool_executor_max_workers = tool_executor_max_workers
         # PermissionEngine also consults this marker to reject any out-of-band
-        # GraphTool object that was not part of the declared capability set.
-        self.graph_tools_enabled = bool(enable_graph_tools)
+        # WorkflowRunTool object that was not part of the declared capability set.
+        self.workflow_tools_enabled = bool(enable_workflow_tools)
         prompt_language = normalize_prompt_language(prompt_language)
         system_prompt = system_prompt or get_react_system_prompt(prompt_language)
         tools_dict = _merge_tools_with_submit_output(
@@ -1490,7 +1495,7 @@ class ReActAgent(MultiStepAgent):
             },
             include_skill_tools=enable_skill_tools,
             include_plugin_tools=enable_skill_tools,
-            include_graph_tools=enable_graph_tools,
+            include_workflow_tools=enable_workflow_tools,
             include_self_evolution=enable_self_evolution,
         )
         super().__init__(
@@ -1920,6 +1925,9 @@ class ReActAgent(MultiStepAgent):
         observations, observation_images, execution_records, terminal_output = self.process_actions(
             action_specs
         )
+        if not action_specs:
+            # 空 actions 与普通步一致：给出 observation 后进入下一步，由 max_steps 兜底。
+            observations = [_EMPTY_ACTIONS_OBSERVATION]
         step.tool_calls = self._tool_call_records_for_display(execution_records)
         observation_limits = [
             int(record.get("max_observation_chars") or DEFAULT_OBSERVATION_PROJECTION_CHARS)
@@ -1935,8 +1943,8 @@ class ReActAgent(MultiStepAgent):
         )
 
         if terminal_output is _NO_SUBMIT_OUTPUT:
-            # 空 actions 是显式 yield：当前 round 到此结束，不再无意义地调用模型。
-            step.round_outcome = "yielded" if not action_specs else "continue"
+            # 只有 submit_output 结束本轮；其余（含空 actions）都进入下一步。
+            step.round_outcome = "continue"
         else:
             step.round_outcome = "submitted"
             step.output = terminal_output
@@ -1985,14 +1993,14 @@ class CodeActAgent(MultiStepAgent):
         tool_executor_max_workers: int = 8,
         prompt_language: str = "en",
         enable_skill_tools: bool = True,
-        enable_graph_tools: bool = True,
+        enable_workflow_tools: bool = True,
         enable_self_evolution: bool = True,
     ):
         prompt_language = normalize_prompt_language(prompt_language)
         if isinstance(tool_executor_max_workers, bool) or not isinstance(tool_executor_max_workers, int) or tool_executor_max_workers <= 0:
             raise ValueError("tool_executor_max_workers 必须为正整数")
         self.tool_executor_max_workers = tool_executor_max_workers
-        self.graph_tools_enabled = bool(enable_graph_tools)
+        self.workflow_tools_enabled = bool(enable_workflow_tools)
         tools_dict = _merge_tools_with_submit_output(
             tools,
             skill_tool_params={
@@ -2012,7 +2020,7 @@ class CodeActAgent(MultiStepAgent):
             },
             include_skill_tools=enable_skill_tools,
             include_plugin_tools=enable_skill_tools,
-            include_graph_tools=enable_graph_tools,
+            include_workflow_tools=enable_workflow_tools,
             include_self_evolution=enable_self_evolution,
         )
         system_prompt = system_prompt or get_codeact_system_prompt(prompt_language)

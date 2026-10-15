@@ -43,7 +43,7 @@ test("ordinary messages, reconfiguration, and execution commands stay FIFO", () 
     "/model doubao_seed",
     "/config",
     "/agent-type codeact",
-    "/graph run demo {}",
+    "$workflow:deep_research compare APIs",
   ]) {
     assert.equal(getCommandExecutionPolicy(input), "fifo", input);
     assert.equal(

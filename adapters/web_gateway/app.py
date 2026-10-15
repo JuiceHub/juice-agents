@@ -632,12 +632,12 @@ class WebSocketRuntimeConnection:
                 enabled=payload.get("enabled") if "enabled" in payload else None,
                 disabled=[str(item) for item in disabled],
             )
-        if command_type == "graphs_config_status":
-            return runtime.graphs_config_status()
+        if command_type == "workflows_config_status":
+            return runtime.workflows_config_status()
         if command_type == "self_evolution_config_status":
             return runtime.self_evolution_config_status()
-        if command_type == "set_graphs_config":
-            return runtime.set_graphs_config(enabled=bool(payload.get("enabled")))
+        if command_type == "set_workflows_config":
+            return runtime.set_workflows_config(enabled=bool(payload.get("enabled")))
         if command_type == "set_self_evolution_config":
             return runtime.set_self_evolution_config(enabled=bool(payload.get("enabled")))
         if command_type == "plugins_config_status":

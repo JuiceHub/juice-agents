@@ -8,7 +8,7 @@ from typing import Any
 _ATTR_TO_MODULE = {
     "AgentRegistry": ".agents.registry",
     "ToolRegistry": ".tools.registry",
-    "GraphRegistry": ".graphs.registry",
+    "WorkflowRegistry": ".workflows.registry",
     "SkillRegistry": ".skills.registry",
     "PluginRegistry": ".plugins.registry",
     "TeamRegistry": ".teams.registry",

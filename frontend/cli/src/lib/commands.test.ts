@@ -38,9 +38,9 @@ function createClient() {
         supported_efforts: ["disabled", "low", "medium", "high", "auto"],
       },
       {
-        model_name: "claude-sonnet-4-6",
+        model_name: "claude-sonnet-5-5",
         backend: "anthropic",
-        provider_model_name: "claude-sonnet-4-6",
+        provider_model_name: "claude-sonnet-5-5",
         supported_efforts: ["disabled", "low", "medium", "high", "max"],
       },
     ],
@@ -174,12 +174,7 @@ function createClient() {
       ],
       count: 1,
     }),
-    listGraphs: async () => ({ graphs: [{ name: "deep_research", source: "builtin" }], count: 1 }),
-    viewGraph: async ({ name }: { name: string }) => ({ metadata: { name }, content: "GRAPH_METADATA = {}" }),
-    runGraph: async ({ name, payload }: { name: string; payload: Record<string, any> }) => ({ manifest: { graph_name: name, status: "completed" }, result: payload }),
-    listGraphRuns: async () => ({ runs: [{ graph_run_id: "graph-1", status: "completed" }], count: 1 }),
-    controlGraphRun: async ({ graph_run_id, action }: { graph_run_id: string; action: string }) => ({ manifest: { graph_run_id, requested_status: action } }),
-    graphsConfigStatus: async () => ({ success: true, enabled: true }),
+    workflowsConfigStatus: async () => ({ success: true, enabled: true }),
     permissionStatus: async () => ({ permission_mode: "default", workspace_rules: [], session_rules: [] }),
     viewSkill: async ({ name, file_path }: { name: string; file_path?: string }) => ({
       success: true,
@@ -558,7 +553,7 @@ test("/model rejects invalid effort values", async () => {
 test("/model rejects effort values unsupported by the target model", async () => {
   const client = createClient();
 
-  const result = await executeCommand("/model claude-sonnet-4-6 xhigh", client, "/tmp/workspace");
+  const result = await executeCommand("/model claude-sonnet-5-5 xhigh", client, "/tmp/workspace");
 
   assert.equal(result.blocks.length, 1);
   assert.equal(client.calls.length, 0);
@@ -1096,42 +1091,8 @@ test("unknown slash command remains an error", async () => {
   assert.match(result.blocks[0]?.text || "", /Unknown command/);
 });
 
-test("/graph and /permissions call graph RPC helpers", async () => {
+test("/permissions calls permission RPC helpers", async () => {
   const client = createClient();
-  const listed = await executeCommand("/graph list", client, "/tmp/workspace");
-  const run = await executeCommand('/graph run custom_graph {"value":"test"}', client, "/tmp/workspace");
   const permissions = await executeCommand("/permissions status", client, "/tmp/workspace");
-  assert.match(listed.blocks[0]?.text || "", /deep_research/);
-  assert.match(run.blocks[0]?.text || "", /completed/);
   assert.match(permissions.blocks[0]?.text || "", /default/);
-});
-
-test("/deep-research forwards a plain question to the root agent", async () => {
-  const client = createClient();
-
-  const result = await executeCommand("/deep-research --workspace compare graph APIs", client, "/tmp/workspace");
-
-  assert.deepEqual(result.blocks, []);
-  assert.equal(result.forwardMessage, "/deep-research --workspace compare graph APIs");
-  assert.equal(client.calls.some((call: any[]) => call[0] === "runGraph"), false);
-});
-
-test("/deep-research validates and forwards an advanced JSON payload", async () => {
-  const client = createClient();
-
-  const result = await executeCommand('/deep-research {"question":"compare graph APIs","source_mode":"web_workspace"}', client, "/tmp/workspace");
-
-  assert.deepEqual(result.blocks, []);
-  assert.equal(result.forwardMessage, '/deep-research {"question":"compare graph APIs","source_mode":"web_workspace"}');
-  assert.equal(client.calls.some((call: any[]) => call[0] === "runGraph"), false);
-});
-
-test("/deep-research suggests explicit graph invocation when automatic Graph tools are disabled", async () => {
-  const client = createClient();
-  client.graphsConfigStatus = async () => ({ success: true, enabled: false });
-
-  const result = await executeCommand("/deep-research compare graph APIs", client, "/tmp/workspace");
-
-  assert.equal(result.forwardMessage, undefined);
-  assert.match(result.blocks[0]?.text || "", /\$graph:deep_research compare graph APIs/);
 });

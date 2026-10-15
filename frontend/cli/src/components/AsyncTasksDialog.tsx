@@ -18,7 +18,7 @@ import { pickWindowAroundSelected } from "../lib/overlayWindowing.js";
 const KIND_DISPLAY: Record<string, string> = {
   local_bash: "bash",
   local_agent: "agent",
-  local_graph: "graph",
+  local_workflow: "workflow",
   teammate: "team",
   memory_dream: "dream",
 };
@@ -100,7 +100,7 @@ export function buildAsyncTaskRow(task: AsyncTaskState, now: number): AsyncTaskR
     id: shortId(task.async_task_id),
     status: (task.status || "").trim() || "unknown",
     duration: computeTaskDuration(task, now),
-    owner: truncate((task.owner_actor_name || "").trim() || "-", 12),
+    owner: truncate((task.owner_agent_name || "").trim() || "-", 12),
     description: truncate((task.description || "").trim(), 60),
   };
 }

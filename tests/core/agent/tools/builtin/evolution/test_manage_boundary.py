@@ -12,17 +12,17 @@ from __future__ import annotations
 from pathlib import Path
 import unittest
 
-from juice_agents.core.agent.tools import AGENT_TOOLS, GRAPH_TOOLS, SKILL_TOOLS, TOOL_TOOLS
+from juice_agents.core.agent.tools import AGENT_TOOLS, WORKFLOW_TOOLS, SKILL_TOOLS, TOOL_TOOLS
 from juice_agents.core.agent.tools.builtin import evolution as _evolution_pkg
 from juice_agents.core.agent.tools.builtin.evolution.agent_manage import AgentManageTool
 from juice_agents.core.agent.tools.builtin.evolution.constants import SELF_EVOLUTION_TOOL_NAMES
-from juice_agents.core.agent.tools.builtin.evolution.graph_manage import GraphManageTool
+from juice_agents.core.agent.tools.builtin.evolution.workflow_manage import WorkflowManageTool
 from juice_agents.core.agent.tools.builtin.evolution.skill_manage import SkillManageTool
 from juice_agents.core.agent.tools.builtin.evolution.tool_manage import ToolManageTool
 
-# 从包自身推导目录，避免依赖 cwd（conftest 会在 session 级切换它）。
+# 从包自身推导目录,避免依赖 cwd（conftest 会在 session 级切换它）。
 _EVOLUTION_DIR = Path(_evolution_pkg.__file__).parent
-_MANAGE_TOOLS = (AgentManageTool, ToolManageTool, SkillManageTool, GraphManageTool)
+_MANAGE_TOOLS = (AgentManageTool, ToolManageTool, SkillManageTool, WorkflowManageTool)
 
 
 class ManageBoundaryTests(unittest.TestCase):
@@ -52,17 +52,17 @@ class ManageBoundaryTests(unittest.TestCase):
     def test_list_and_view_stay_outside_the_evolution_scope(self) -> None:
         """只读工具受领域能力开关约束，不受 self_evolution 约束。"""
 
-        for bundle in (AGENT_TOOLS, TOOL_TOOLS, SKILL_TOOLS, GRAPH_TOOLS):
+        for bundle in (AGENT_TOOLS, TOOL_TOOLS, SKILL_TOOLS, WORKFLOW_TOOLS):
             for tool in bundle:
                 if tool.name.endswith("_manage"):
                     continue
                 with self.subTest(tool=tool.name):
                     self.assertNotIn(tool.name, SELF_EVOLUTION_TOOL_NAMES)
 
-    def test_graph_manage_rejects_delete_like_the_other_three_domains(self) -> None:
+    def test_workflow_manage_rejects_delete_like_the_other_three_domains(self) -> None:
         """manage 只写不删；物理删除一律走通用文件/Shell 工具。"""
 
-        self.assertEqual(GraphManageTool.inputs["action"]["description"], "create/edit")
+        self.assertEqual(WorkflowManageTool.inputs["action"]["description"], "create/edit")
 
 
 if __name__ == "__main__":

@@ -26,44 +26,37 @@ models:
     thinking_mode: none
     supports_budget_tokens: false
 
-  claude-opus-4-7:
+  # 5.5 系列不能关闭 thinking：effort=disabled 时框架不发送 thinking/output_config，
+  # 由模型按默认 adaptive 运行（Opus 5.5 默认 effort=medium，Sonnet 5.5 默认 high）。
+  claude-opus-5-5:
     backend: anthropic
     api_base: https://api.anthropic.com
+    api_base_env: ANTHROPIC_BASE_URL
     api_key_env: ANTHROPIC_AUTH_TOKEN
-    provider_model_name: claude-opus-4-7
+    provider_model_name: claude-opus-5-5
     supported_efforts: [disabled, low, medium, high, xhigh, max]
     thinking_mode: adaptive
     supports_budget_tokens: false
 
-  claude-sonnet-4-6:
+  claude-sonnet-5-5:
     backend: anthropic
     api_base: https://api.anthropic.com
+    api_base_env: ANTHROPIC_BASE_URL
     api_key_env: ANTHROPIC_AUTH_TOKEN
-    provider_model_name: claude-sonnet-4-6
-    supported_efforts: [disabled, low, medium, high, max]
+    provider_model_name: claude-sonnet-5-5
+    supported_efforts: [disabled, low, medium, high, xhigh, max]
     thinking_mode: adaptive
-    supports_budget_tokens: true
+    supports_budget_tokens: false
 
   claude-haiku-4-5-20251001:
     backend: anthropic
     api_base: https://api.anthropic.com
+    api_base_env: ANTHROPIC_BASE_URL
     api_key_env: ANTHROPIC_AUTH_TOKEN
     provider_model_name: claude-haiku-4-5-20251001
     supported_efforts: [disabled]
     thinking_mode: manual
     supports_budget_tokens: true
-
-  composite_best:
-    backend: composite
-    strategy: judge_select
-    candidates:
-      - model: doubao_lite
-      - model: gpt4o_mini
-        model_effort: medium
-    judge:
-      model: doubao_pro
-      model_effort: high
-    fail_fast: false
 
 tools:
   tavily:
@@ -128,8 +121,8 @@ plugins:
 permissions:
   rules: []
 
-graphs:
-  enabled: true
+workflows:
+  enabled: false
   deep_research:
     max_concurrent_research_units: 5
     max_research_rounds: 3

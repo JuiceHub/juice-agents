@@ -17,34 +17,38 @@ from juice_agents.core.config.context import ConfigurationContext
 from juice_agents.core.registry.plugins import PluginRegistry
 from juice_agents.core.registry.skills import SkillRegistry
 
-from ..graphs.graphs_tools import GraphTool
+from ..workflows.workflows_tools import WorkflowRunTool
 
 logger = logging.getLogger(__name__)
 _LEADING_CAPABILITY = re.compile(r"^\s*\$(?P<name>[^\s]+)(?:\s+(?P<task>[\s\S]*))?$")
 _MISSING = object()
 
 
-def feature_enabled(context: ConfigurationContext, section: str) -> bool:
-    """Read an opt-out boolean; absent or malformed settings remain enabled."""
+def feature_enabled(context: ConfigurationContext, section: str, *, default: bool = True) -> bool:
+    """Read a ``<section>.enabled`` boolean; absent or malformed settings use ``default``."""
 
     try:
         raw = context.read_merged_config().get(section, {})
     except Exception:
-        return True
+        return default
     if not isinstance(raw, dict):
-        return True
-    enabled = raw.get("enabled", True)
-    return enabled if isinstance(enabled, bool) else True
+        return default
+    enabled = raw.get("enabled", default)
+    return enabled if isinstance(enabled, bool) else default
 
 
-def graphs_enabled(context: ConfigurationContext) -> bool:
-    """Whether Graph tools are automatically available to an Agent."""
+def workflows_enabled(context: ConfigurationContext) -> bool:
+    """Whether Workflow tools are automatically available to an Agent.
 
-    return feature_enabled(context, "graphs")
+    与其他自动能力不同，workflow 默认关闭：它会派生多个 Agent、成本较高，
+    对齐 Claude Code「用户显式要求才运行」。显式入口 ``$workflow:<name>`` 不受此开关影响。
+    """
+
+    return feature_enabled(context, "workflows", default=False)
 
 
 def self_evolution_enabled(context: ConfigurationContext) -> bool:
-    """Whether Agent/Tool/Skill/Graph mutation tools may run at all."""
+    """Whether Agent/Tool/Skill/Workflow mutation tools may run at all."""
 
     return feature_enabled(context, "self_evolution")
 
@@ -53,77 +57,77 @@ class ManualCapabilityError(ValueError):
     """A user-requested leading `$` capability cannot be resolved."""
 
 
-class ScopedGraphTool(GraphTool):
-    """A graph tool that accepts exactly the graph selected by `$graph:<name>`."""
+class ScopedWorkflowRunTool(WorkflowRunTool):
+    """A workflow_run tool that accepts exactly the workflow selected by `$workflow:<name>`."""
 
-    def __init__(self, graph_name: str) -> None:
+    def __init__(self, workflow_name: str) -> None:
         super().__init__()
-        self.graph_name = str(graph_name or "").strip()
+        self.workflow_name = str(workflow_name or "").strip()
 
     def forward(
         self,
         name: str,
-        payload: dict[str, Any],
+        args: dict[str, Any],
         config: dict[str, Any] | None = None,
         background: bool = False,
     ) -> dict[str, Any]:
-        if str(name or "").strip() != self.graph_name:
+        if str(name or "").strip() != self.workflow_name:
             return self._failed(
-                graph_name=str(name or "").strip(),
-                error=f"当前显式 Graph 调用仅授权 {self.graph_name!r}",
+                name=str(name or "").strip(),
+                error=f"当前显式 Workflow 调用仅授权 {self.workflow_name!r}",
             )
-        return super().forward(name=name, payload=payload, config=config, background=background)
+        return super().forward(name=name, args=args, config=config, background=background)
 
 
 @dataclass(frozen=True, slots=True)
 class ManualCapability:
-    """The remaining task, one attachment, and optional transient graph scope."""
+    """The remaining task, one attachment, and optional transient workflow scope."""
 
     task: str
     attachment: RuntimeAttachment
-    graph_name: str | None = None
+    workflow_name: str | None = None
 
     def install(self, agent: Any) -> tuple[Any, Any]:
-        """Install a scoped graph callable and return exact state for cleanup."""
+        """Install a scoped workflow callable and return exact state for cleanup."""
 
-        if self.graph_name is None:
+        if self.workflow_name is None:
             return _MISSING, _MISSING
         tools = getattr(agent, "tools", None)
         if not isinstance(tools, dict):
-            raise ManualCapabilityError("当前 root agent 不支持临时 Graph 能力")
-        previous_tool = tools.get("graph_tool", _MISSING)
-        previous_authorization = getattr(agent, "_manual_graph_authorization", _MISSING)
-        # GraphTool resolves its GraphRunManager from the owning agent's runner
+            raise ManualCapabilityError("当前 root agent 不支持临时 Workflow 能力")
+        previous_tool = tools.get("workflow_run", _MISSING)
+        previous_authorization = getattr(agent, "_manual_workflow_authorization", _MISSING)
+        # WorkflowRunTool resolves its WorkflowRunManager from the owning agent's runner
         # context.  A transient instance therefore needs the same binding as a
         # normal registry-created tool before it becomes callable.
-        scoped_tool = ScopedGraphTool(self.graph_name)
+        scoped_tool = ScopedWorkflowRunTool(self.workflow_name)
         scoped_tool.bind_owner_agent(agent)
-        tools["graph_tool"] = scoped_tool
-        agent._manual_graph_authorization = self.graph_name
+        tools["workflow_run"] = scoped_tool
+        agent._manual_workflow_authorization = self.workflow_name
         _refresh_agent_capabilities(agent)
-        logger.info("显式 Graph 能力已注入: agent=%s graph=%s", getattr(agent, "name", ""), self.graph_name)
+        logger.info("显式 Workflow 能力已注入: agent=%s workflow=%s", getattr(agent, "name", ""), self.workflow_name)
         return previous_tool, previous_authorization
 
     def uninstall(self, agent: Any, previous_tool: Any, previous_authorization: Any) -> None:
         """Restore the pre-stream callable surface even when stream execution fails."""
 
-        if self.graph_name is None:
+        if self.workflow_name is None:
             return
         tools = getattr(agent, "tools", None)
         if isinstance(tools, dict):
             if previous_tool is _MISSING:
-                tools.pop("graph_tool", None)
+                tools.pop("workflow_run", None)
             else:
-                tools["graph_tool"] = previous_tool
+                tools["workflow_run"] = previous_tool
         if previous_authorization is _MISSING:
             try:
-                delattr(agent, "_manual_graph_authorization")
+                delattr(agent, "_manual_workflow_authorization")
             except AttributeError:
                 pass
         else:
-            agent._manual_graph_authorization = previous_authorization
+            agent._manual_workflow_authorization = previous_authorization
         _refresh_agent_capabilities(agent)
-        logger.info("显式 Graph 能力已回收: agent=%s", getattr(agent, "name", ""))
+        logger.info("显式 Workflow 能力已回收: agent=%s", getattr(agent, "name", ""))
 
 
 def _refresh_agent_capabilities(agent: Any) -> None:
@@ -190,26 +194,26 @@ def _resolve_plugin(context: ConfigurationContext, name: str, *, task: str) -> M
     )
 
 
-def _resolve_graph(context: ConfigurationContext, name: str, *, task: str) -> ManualCapability:
-    from juice_agents.core.registry.graphs import GraphRegistry
+def _resolve_workflow(context: ConfigurationContext, name: str, *, task: str) -> ManualCapability:
+    from juice_agents.core.registry.workflows import WorkflowRegistry
 
-    metadata = GraphRegistry(config_context=context).get_metadata(name)
+    metadata = WorkflowRegistry(config_context=context).get_metadata(name)
     return ManualCapability(
         task=task,
-        graph_name=metadata.name,
+        workflow_name=metadata.name,
         attachment={
             "attachment_type": "explicit_capability",
             "created_at": 0.0,
             "payload": {
-                "kind": "graph",
+                "kind": "workflow",
                 "name": metadata.name,
                 "description": metadata.description,
                 "input_schema": metadata.input_schema,
                 "output_schema": metadata.output_schema,
                 "instructions": (
-                    f"The user explicitly selected graph {metadata.name!r}. "
-                    "Use the temporarily available graph_tool with this exact name and "
-                    "build its payload from the supplied input schema."
+                    f"The user explicitly selected workflow {metadata.name!r}. "
+                    "Use the temporarily available workflow_run tool with this exact name and "
+                    "build its args from the supplied input schema."
                 ),
             },
         },
@@ -224,11 +228,11 @@ def resolve_manual_capability(message: str, *, context: ConfigurationContext) ->
         return None
     requested = str(matched.group("name") or "").strip()
     task = str(matched.group("task") or "").strip()
-    if requested.lower().startswith("graph:"):
-        graph_name = requested.split(":", 1)[1].strip()
-        if not graph_name:
-            raise ManualCapabilityError("$graph: 后必须提供 graph 名称")
-        return _resolve_graph(context, graph_name, task=task)
+    if requested.lower().startswith("workflow:"):
+        workflow_name = requested.split(":", 1)[1].strip()
+        if not workflow_name:
+            raise ManualCapabilityError("$workflow: 后必须提供 workflow 名称")
+        return _resolve_workflow(context, workflow_name, task=task)
     # A Skill intentionally wins over a Plugin with the same `$` alias.
     capability = _resolve_skill(context, requested, task=task)
     if capability is not None:
@@ -242,9 +246,9 @@ def resolve_manual_capability(message: str, *, context: ConfigurationContext) ->
 __all__ = [
     "ManualCapability",
     "ManualCapabilityError",
-    "ScopedGraphTool",
+    "ScopedWorkflowRunTool",
     "feature_enabled",
-    "graphs_enabled",
+    "workflows_enabled",
     "resolve_manual_capability",
     "self_evolution_enabled",
 ]

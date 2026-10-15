@@ -52,7 +52,7 @@ export interface CommandResult {
   blocks: MessageBlock[];
   clearMessages: boolean;
   exitRequested: boolean;
-  interactiveAction?: "model-selector" | "mode-selector" | "permissions-selector" | "agent-type-selector" | "resume-selector" | "config-panel" | "actor-selector" | "tasks-panel";
+  interactiveAction?: "model-selector" | "mode-selector" | "permissions-selector" | "agent-type-selector" | "resume-selector" | "config-panel" | "active-selector" | "tasks-panel";
   forwardMessage?: string;
   forwardAgentMode?: string;
   loadHistory?: boolean;
@@ -171,40 +171,6 @@ function jsonBlock(title: string, payload: unknown): MessageBlock {
   return { kind: "system", title, text: JSON.stringify(payload, null, 2) };
 }
 
-function parseJsonObject(raw: string, usage: string): Record<string, any> {
-  if (!raw.trim()) return {};
-  const value = JSON.parse(raw);
-  if (!value || Array.isArray(value) || typeof value !== "object") {
-    throw new Error(usage);
-  }
-  return value as Record<string, any>;
-}
-
-function parseDeepResearchRequest(raw: string): Record<string, any> {
-  let remaining = raw.trim();
-  let sourceMode = "web";
-
-  if (remaining.startsWith("{")) {
-    const payload = parseJsonObject(remaining, "Deep research payload must be a JSON object");
-    if (typeof payload.question !== "string" || !payload.question.trim()) {
-      throw new Error('Deep research payload must include a non-empty "question" string');
-    }
-    return payload;
-  }
-
-  // Keep /deep-research easy for the common case while still exposing source
-  // mode without requiring users to hand-write a JSON payload.
-  const flag = remaining.match(/^--(web-workspace|workspace|web)\b/);
-  if (flag) {
-    sourceMode = flag[1] === "web-workspace" ? "web_workspace" : flag[1];
-    remaining = remaining.slice(flag[0].length).trim();
-  }
-
-  if (!remaining) {
-    throw new Error("Usage: /deep-research [--web|--workspace|--web-workspace] <question>");
-  }
-  return { question: remaining, source_mode: sourceMode };
-}
 
 export function intervalToCron(interval: string): string {
   const match = interval.trim().toLowerCase().match(/^(\d+)\s*([a-z]+)$/);
@@ -563,6 +529,124 @@ export async function executeCommand(
     };
   }
 
+  if (command === "/strategy") {
+    // 无参数：显示帮助
+    if (parts.length === 1) {
+      return {
+        blocks: [{
+          kind: "system",
+          text: [
+            "Usage: /strategy [breadth=N] [depth=N] [beam_width=N]",
+            "       /strategy reset",
+            "",
+            "Parameters:",
+            "  breadth       Branches per node (int or [5,3,2] for per-layer)",
+            "  depth         Maximum exploration depth",
+            "  beam_width    Number of best paths to keep at each step",
+            "",
+            "Examples:",
+            "  /strategy reset                           # Default greedy (1,1,1)",
+            "  /strategy breadth=5 depth=1               # Best-of-N",
+            "  /strategy breadth=3 depth=5 beam_width=3  # Beam Search",
+            "  /strategy breadth=3 depth=5 beam_width=1  # Single-path exploration",
+            "  /strategy breadth=[5,3,2] depth=3         # Adaptive breadth",
+            "",
+            "Common patterns:",
+            "  breadth=N depth=1 beam_width=1            # Generate N, select best",
+            "  breadth=N depth=D beam_width=N            # Keep N paths for D layers",
+            "  breadth=N depth=D beam_width=1            # Explore N branches per step",
+          ].join("\n"),
+        }],
+        clearMessages: false,
+        exitRequested: false,
+      };
+    }
+
+    // 检查是否是 reset
+    if (parts[1] === "reset") {
+      try {
+        const result = await client.switchStrategy({ reset: true });
+        return {
+          blocks: [{ kind: "system", text: `✅ ${result.message}\n\nStrategy reset to greedy (default)` }],
+          clearMessages: false,
+          exitRequested: false,
+        };
+      } catch (error: any) {
+        return {
+          blocks: [{ kind: "error", text: `Failed to reset strategy: ${error.message}` }],
+          clearMessages: false,
+          exitRequested: false,
+        };
+      }
+    }
+
+    // 解析参数（key=value 格式）
+    const params: Record<string, any> = {};
+    for (let i = 1; i < parts.length; i++) {
+      const [key, value] = parts[i].split("=");
+      if (!key || !value) {
+        return {
+          blocks: [{ kind: "error", text: `Invalid parameter format: ${parts[i]}. Expected key=value` }],
+          clearMessages: false,
+          exitRequested: false,
+        };
+      }
+
+      // 处理数组格式 breadth=[5,3,2]
+      if (value.startsWith("[")) {
+        try {
+          params[key] = JSON.parse(value);
+        } catch {
+          return {
+            blocks: [{ kind: "error", text: `Invalid array format: ${value}` }],
+            clearMessages: false,
+            exitRequested: false,
+          };
+        }
+      } else {
+        // 尝试解析为数字
+        const numValue = parseFloat(value);
+        params[key] = isNaN(numValue) ? value : numValue;
+      }
+    }
+
+    try {
+      const result = await client.switchStrategy(params);
+      const strategyInfo = result.strategy;
+      const lines = [
+        `✅ ${result.message}`,
+        "",
+      ];
+
+      // 展示策略类型
+      if (strategyInfo.type === "greedy") {
+        lines.push("Strategy: Greedy (single deterministic path)");
+      } else {
+        lines.push("Strategy: Exploration");
+
+        // 展示参数
+        if (strategyInfo.params && Object.keys(strategyInfo.params).length > 0) {
+          lines.push("Parameters:");
+          for (const [key, value] of Object.entries(strategyInfo.params)) {
+            lines.push(`  ${key}: ${JSON.stringify(value)}`);
+          }
+        }
+      }
+
+      return {
+        blocks: [{ kind: "system", text: lines.join("\n") }],
+        clearMessages: false,
+        exitRequested: false,
+      };
+    } catch (error: any) {
+      return {
+        blocks: [{ kind: "error", text: `Failed to switch strategy: ${error.message}` }],
+        clearMessages: false,
+        exitRequested: false,
+      };
+    }
+  }
+
   if (command === "/skills") {
     if (!parts[1]) {
       const skills = await client.listSkills({});
@@ -603,60 +687,6 @@ export async function executeCommand(
     };
   }
 
-  if (command === "/graph") {
-    const action = (parts[1] || "list").toLowerCase();
-    if (action === "list") {
-      return { blocks: [jsonBlock("Graphs", await client.listGraphs({ base_dir: baseDir }))], clearMessages: false, exitRequested: false };
-    }
-    if (action === "view") {
-      if (!parts[2]) return { blocks: [{ kind: "error", text: "Usage: /graph view <name>" }], clearMessages: false, exitRequested: false };
-      return { blocks: [jsonBlock("Graph", await client.viewGraph({ base_dir: baseDir, name: parts[2] }))], clearMessages: false, exitRequested: false };
-    }
-    if (action === "run") {
-      if (!parts[2]) return { blocks: [{ kind: "error", text: "Usage: /graph run <name> [json]" }], clearMessages: false, exitRequested: false };
-      try {
-        const payload = parseJsonObject(parts.slice(3).join(" "), "Graph payload must be a JSON object");
-        return { blocks: [jsonBlock("Graph Run", await client.runGraph({ base_dir: baseDir, name: parts[2], payload }))], clearMessages: false, exitRequested: false };
-      } catch (error) {
-        return { blocks: [{ kind: "error", text: error instanceof Error ? error.message : String(error) }], clearMessages: false, exitRequested: false };
-      }
-    }
-    if (action === "runs") {
-      return { blocks: [jsonBlock("Graph Runs", await client.listGraphRuns({ base_dir: baseDir }))], clearMessages: false, exitRequested: false };
-    }
-    if (["pause", "resume", "stop", "restart"].includes(action)) {
-      if (!parts[2]) return { blocks: [{ kind: "error", text: `Usage: /graph ${action} <run_id>` }], clearMessages: false, exitRequested: false };
-      return {
-        blocks: [jsonBlock("Graph Run", await client.controlGraphRun({ base_dir: baseDir, graph_run_id: parts[2], action: action as "pause" | "resume" | "stop" | "restart" }))],
-        clearMessages: false,
-        exitRequested: false,
-      };
-    }
-    return { blocks: [{ kind: "error", text: `Unknown /graph action: ${action}` }], clearMessages: false, exitRequested: false };
-  }
-
-  if (command === "/deep-research") {
-    try {
-      const request = parseDeepResearchRequest(commandText.trim().slice(command.length));
-      const graphConfig = await client.graphsConfigStatus({ base_dir: baseDir });
-      if (!graphConfig.enabled) {
-        const question = String(request.question || "").trim();
-        return {
-          blocks: [{ kind: "system", text: `Graph automatic tools are disabled. Use $graph:deep_research ${question}`.trim() }],
-          clearMessages: false,
-          exitRequested: false,
-        };
-      }
-      return {
-        blocks: [],
-        clearMessages: false,
-        exitRequested: false,
-        forwardMessage: commandText.trim(),
-      };
-    } catch (error) {
-      return { blocks: [{ kind: "error", text: error instanceof Error ? error.message : String(error) }], clearMessages: false, exitRequested: false };
-    }
-  }
 
   if (command === "/permissions") {
     // 无参数时打开 selector；带合法取值时切换审批策略；其余情况仍然只读上报。
@@ -985,12 +1015,12 @@ export async function executeCommand(
     };
   }
 
-  if (command === "/actors") {
+  if (command === "/active") {
     return {
       blocks: [],
       clearMessages: false,
       exitRequested: false,
-      interactiveAction: "actor-selector",
+      interactiveAction: "active-selector",
     };
   }
 

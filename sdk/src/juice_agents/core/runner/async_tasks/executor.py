@@ -87,11 +87,11 @@ class _AsyncTaskExecutorMixin:
             return "local_agent 子任务失败"
         if public_type == "local_bash":
             return "后台 shell 命令执行失败"
-        if public_type == "local_graph":
-            graph_name = str(metadata.get("graph_name") or "").strip()
-            if graph_name:
-                return f"local_graph 任务失败：{graph_name}"
-            return "local_graph 任务执行失败"
+        if public_type == "local_workflow":
+            workflow_name = str(metadata.get("workflow_name") or "").strip()
+            if workflow_name:
+                return f"local_workflow 任务失败：{workflow_name}"
+            return "local_workflow 任务执行失败"
         return f"{public_type} 任务执行失败"
 
     def _run_async_task(

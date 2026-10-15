@@ -1,7 +1,7 @@
 """Small public data contracts for the declarative Runner boundary.
 
 Runtime object state intentionally does not live here. ``ManagedAgent``,
-``AsyncTaskManager`` and ``GraphRunManager`` each expose their own projection;
+``AsyncTaskManager`` and ``WorkflowRunManager`` each expose their own projection;
 the Runner manifest below contains only request information.
 """
 
@@ -9,13 +9,13 @@ from __future__ import annotations
 
 from typing import Any, Literal, TypedDict
 
-from juice_agents.core.agent.sessions import ActionStep
+from juice_agents.core.agent.context import ActionStep
 
 PermissionMode = Literal["default", "accept"]
 AgentMode = str
 RunnerStatus = Literal["idle", "running", "waiting", "paused", "failed"]
 AsyncTaskStatus = Literal["pending", "running", "completed", "failed", "killed"]
-AsyncTaskType = Literal["local_agent", "local_bash", "local_graph"]
+AsyncTaskType = Literal["local_agent", "local_bash", "local_workflow"]
 
 PERMISSION_MODES: frozenset[str] = frozenset({"default", "accept"})
 
@@ -107,7 +107,7 @@ class RunnerStreamEvent(TypedDict, total=False):
     action_step: ActionStep | None
     lifecycle_event: dict[str, Any] | None
     round_id: str
-    outcome: Literal["submitted", "yielded", "failed"]
+    outcome: Literal["submitted", "failed"]
     output: Any
     reason: str
     stop_reason: str

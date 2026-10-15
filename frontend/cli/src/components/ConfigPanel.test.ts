@@ -13,7 +13,7 @@ const session = {
   runner_id: "runner-1",
   permission_mode: "default",
   agent_mode: "agent",
-  root_actor_name: "root",
+  root_agent_name: "root",
   base_dir: "/tmp/workspace",
   started: true,
   resumed: false,
@@ -95,7 +95,7 @@ test("builds the initial config draft from session, memory, and model data", () 
     imageEnabled: false,
     skillsEnabled: true,
     selfEvolutionEnabled: true,
-    graphsEnabled: true,
+    workflowsEnabled: true,
     disabledSkills: [],
     skillsCount: 2,
     permissionMode: "default",
@@ -113,7 +113,7 @@ test("builds the initial config draft from session, memory, and model data", () 
       ["Image tools", "off", false],
       ["Skills", "on", false],
       ["Self evolution", "on", false],
-      ["Graphs", "on", false],
+      ["Workflows", "on", false],
       ["Agent mode", "agent", false],
       ["Agent type", "react", false],
       ["Model", "gpt4o_mini", false],
@@ -174,7 +174,7 @@ test("builds an empty apply plan when the draft is cancelled or unchanged", () =
     imageChanges: [],
     skillsChange: null,
     selfEvolutionChange: null,
-    graphsChange: null,
+    workflowsChange: null,
     runtimePatch: {},
     switchPermissionMode: null,
     switchAgentMode: null,
@@ -191,7 +191,7 @@ test("builds an apply plan with only changed config values", () => {
     imageEnabled: true,
     skillsEnabled: false,
     selfEvolutionEnabled: false,
-    graphsEnabled: false,
+    workflowsEnabled: false,
     disabledSkills: ["joke-expert"],
     agentMode: "team",
     modelName: "doubao_seed",
@@ -206,7 +206,7 @@ test("builds an apply plan with only changed config values", () => {
     imageChanges: [{ enabled: true }],
     skillsChange: { enabled: false, disabled: ["joke-expert"] },
     selfEvolutionChange: { enabled: false },
-    graphsChange: { enabled: false },
+    workflowsChange: { enabled: false },
     runtimePatch: {
       agent_mode: "team",
       model_name: "doubao_seed",
@@ -259,14 +259,14 @@ test("skills row toggles only the global skills flag and preserves disabled entr
   assert.deepEqual(plan.skillsChange, { enabled: false, disabled: [] });
 });
 
-test("self evolution and graph rows persist only their own feature switches", () => {
+test("self evolution and workflow rows persist only their own feature switches", () => {
   const initial = createConfigPanelDraft({ session, memory, models });
   const evolutionOff = changeConfigDraft(initial, "self_evolution", "next", models);
-  const graphsOff = changeConfigDraft(evolutionOff, "graphs", "next", models);
-  const plan = buildConfigApplyPlan(initial, graphsOff);
+  const workflowsOff = changeConfigDraft(evolutionOff, "workflows", "next", models);
+  const plan = buildConfigApplyPlan(initial, workflowsOff);
 
   assert.deepEqual(plan.selfEvolutionChange, { enabled: false });
-  assert.deepEqual(plan.graphsChange, { enabled: false });
+  assert.deepEqual(plan.workflowsChange, { enabled: false });
 });
 
 test("config panel does not expose mode as persistent runtime config", () => {

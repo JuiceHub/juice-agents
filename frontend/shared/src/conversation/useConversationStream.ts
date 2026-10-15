@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useReducer, useRef } from "react";
 
 import type {
-  ActorSessionsReport,
+  ActiveAgentsReport,
   AskRequest,
   RunnerLifecycleEvent,
   RunnerStreamEvent,
@@ -17,7 +17,7 @@ export type SendMessageOutcome = "completed" | "superseded" | "failed";
 
 export interface UseConversationStreamOptions {
   onEvent?: (event: RunnerStreamEvent) => void;
-  onActorSessionsReport?: (report: ActorSessionsReport) => void;
+  onActiveAgentsReport?: (report: ActiveAgentsReport) => void;
   onAskRequest?: (request: AskRequest | null) => void;
   acceptEvent?: (event: RunnerStreamEvent) => boolean;
   presentEvent?: (event: RunnerStreamEvent) => MessageBlock[];
@@ -51,8 +51,8 @@ export function useConversationStream(
     if (generation !== undefined && generationRef.current !== generation) return;
     if (optionsRef.current.acceptEvent && !optionsRef.current.acceptEvent(event)) return;
     optionsRef.current.onEvent?.(event);
-    if (event.actor_sessions_report) {
-      optionsRef.current.onActorSessionsReport?.(event.actor_sessions_report);
+    if (event.agent_sessions_report) {
+      optionsRef.current.onActiveAgentsReport?.(event.agent_sessions_report);
     }
     const lifecycleEvent: RunnerLifecycleEvent | null | undefined =
       event.kind === "runner_lifecycle" ? event.lifecycle_event ?? null : undefined;
@@ -151,8 +151,8 @@ export function useConversationStream(
     client.setAmbientStreamHandler((event) => {
       if (optionsRef.current.acceptEvent && !optionsRef.current.acceptEvent(event)) return;
       optionsRef.current.onEvent?.(event);
-      if (event.actor_sessions_report) {
-        optionsRef.current.onActorSessionsReport?.(event.actor_sessions_report);
+      if (event.agent_sessions_report) {
+        optionsRef.current.onActiveAgentsReport?.(event.agent_sessions_report);
       }
       dispatch({
         type: "ambient_event",

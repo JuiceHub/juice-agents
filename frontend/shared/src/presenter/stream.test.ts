@@ -74,7 +74,7 @@ test("presentStreamEvent keeps lifecycle progress out of the transcript", () => 
     round_id: "round-3",
     team_event: null,
     lifecycle_event: {
-      scope: "graph",
+      scope: "workflow",
       event: "node_started",
       node: "research_topic",
       completed: 0,

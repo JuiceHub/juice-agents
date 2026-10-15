@@ -33,11 +33,9 @@ const SLASH_COMMANDS: CandidateItem[] = [
   { label: "/worktree", description: "Manage git worktrees" },
   { label: "/skills", description: "List or view local skills" },
   { label: "/plugins", description: "List or view installed plugins" },
-  { label: "/graph", description: "List, inspect, run, or control graphs" },
-  { label: "/deep-research", description: "Run deep_research with a plain question" },
   { label: "/permissions", description: "Switch permission mode or inspect rules" },
   { label: "/tasks", description: "Inspect background async tasks (Ctrl+T)" },
-  { label: "/actors", description: "Switch between actor sessions (Ctrl+S)" },
+  { label: "/active", description: "View and switch active agents (Ctrl+S)" },
   { label: "/resume", description: "Resume an existing session" },
   { label: "/sessions", description: "List saved sessions" },
   { label: "/clear", description: "Clear the transcript" },
@@ -87,29 +85,6 @@ const WORKTREE_EXIT_OPTIONS: CandidateItem[] = [
   { label: "--discard", description: "Force cleanup dirty or ahead worktree" },
 ];
 
-const GRAPH_OPTIONS: CandidateItem[] = [
-  { label: "list", description: "List available graphs" },
-  { label: "view", description: "View one graph source" },
-  { label: "run", description: "Run one graph" },
-  { label: "runs", description: "List persisted graph runs" },
-  { label: "pause", description: "Pause a graph run" },
-  { label: "resume", description: "Resume a graph run" },
-  { label: "stop", description: "Stop a graph run" },
-  { label: "restart", description: "Restart a graph run" },
-];
-
-const GRAPH_NAME_OPTIONS: CandidateItem[] = [
-  { label: "deep_research", description: "Cross-checked research report" },
-];
-
-const RESEARCH_SOURCE_OPTIONS: CandidateItem[] = [
-  { label: "--web", description: "Use web sources (default)" },
-  { label: "--workspace", description: "Use workspace sources" },
-  { label: "--web-workspace", description: "Use web and workspace sources" },
-  { label: '{"question":"","source_mode":"web"}', description: "Advanced JSON payload" },
-  { label: '{"question":"","source_mode":"workspace"}', description: "Advanced JSON payload" },
-  { label: '{"question":"","source_mode":"web_workspace"}', description: "Advanced JSON payload" },
-];
 
 function normalizeCommandInput(input: string): string {
   return input.replace(/\s+/g, " ").trim();
@@ -169,9 +144,9 @@ export function getCommandCandidates(
   const firstTokenStart = input.search(/\S|$/);
   if (tokenAtCursor.start === firstTokenStart && tokenAtCursor.token.startsWith("$")) {
     const prefix = tokenAtCursor.token.toLowerCase();
-    const graphCandidates = [{ label: "$graph:deep_research", description: "Graph" }];
-    if (prefix.startsWith("$graph:")) {
-      return prefixFilter(graphCandidates, prefix);
+    const workflowCandidates = [{ label: "$workflow:deep_research", description: "Workflow" }];
+    if (prefix.startsWith("$workflow:")) {
+      return prefixFilter(workflowCandidates, prefix);
     }
     const skillCandidates = getUniqueNames(skillNames).map((name) => ({
       label: `$${name}`,
@@ -181,7 +156,7 @@ export function getCommandCandidates(
     const pluginCandidates = getUniqueNames(pluginNames)
       .map((name) => ({ label: `$${name}`, description: "Plugin" }))
       .filter((item) => !skillLabels.has(item.label.toLowerCase()));
-    return prefixFilter([...skillCandidates, ...pluginCandidates, ...graphCandidates], prefix);
+    return prefixFilter([...skillCandidates, ...pluginCandidates, ...workflowCandidates], prefix);
   }
   const normalized = tokenAtCursor.token.startsWith("/")
     ? tokenAtCursor.token
@@ -195,11 +170,19 @@ export function getCommandCandidates(
   const uniquePluginNames = getUniqueNames(pluginNames);
   const hasTrailingWhitespace = /\s$/.test(context);
 
+  // 无参数命令列表：输入完整后不再显示候选，允许历史导航
+  const COMMANDS_WITHOUT_PARAMS = new Set([
+    "/help", "/status", "/models", "/model", "/config", "/dream", "/clear", "/exit",
+    "/tasks", "/active", "/resume", "/sessions",
+  ]);
+
   if (parts.length === 1 && !hasTrailingWhitespace) {
     const prefix = parts[0].toLowerCase();
-    // Keep the candidate visible even when the command name matches exactly.
-    // A trailing space (added on completion) skips this branch and falls
-    // through to close the panel, so ↑/↓ can recall history uninterrupted.
+    // 对于无参数命令，完全匹配时关闭候选列表，让用户可以使用方向键切换历史
+    if (COMMANDS_WITHOUT_PARAMS.has(prefix)) {
+      return [];
+    }
+    // 对于有参数命令或部分匹配，继续显示候选列表
     return SLASH_COMMANDS.filter((candidate) =>
       candidate.label.toLowerCase().startsWith(prefix),
     );
@@ -217,17 +200,33 @@ export function getCommandCandidates(
     }
   }
 
-  if (parts[0] === "/model" && parts.length === 2) {
-    const prefix = parts[1].toLowerCase();
-    return runtimeModelNames
-      .filter((name) => {
-        const label = name.toLowerCase();
-        return label.startsWith(prefix) && label !== prefix;
-      })
-      .map((name) => ({
-        label: name,
-        description: "Runtime model",
-      }));
+  if (parts[0] === "/model") {
+    // /model 无参数时直接执行，显示当前模型
+    if (parts.length === 1 && hasTrailingWhitespace) {
+      const prefix = "";
+      return runtimeModelNames
+        .filter((name) => {
+          const label = name.toLowerCase();
+          return label.startsWith(prefix);
+        })
+        .map((name) => ({
+          label: name,
+          description: "Runtime model",
+        }));
+    }
+    // /model <partial> 时补全，完全匹配后关闭候选列表
+    if (parts.length === 2 && !hasTrailingWhitespace) {
+      const prefix = parts[1].toLowerCase();
+      return runtimeModelNames
+        .filter((name) => {
+          const label = name.toLowerCase();
+          return label.startsWith(prefix) && label !== prefix;
+        })
+        .map((name) => ({
+          label: name,
+          description: "Runtime model",
+        }));
+    }
   }
 
   if (parts[0] === "/agents" && parts.length === 2) {
@@ -256,18 +255,6 @@ export function getCommandCandidates(
     if (parts[1] === "exit" && parts.length === 3) {
       return prefixFilter(WORKTREE_EXIT_OPTIONS, parts[2]);
     }
-  }
-
-  if (parts[0] === "/graph" && parts.length === 2) {
-    return prefixFilter(GRAPH_OPTIONS, parts[1]);
-  }
-
-  if (parts[0] === "/graph" && ["view", "run"].includes(parts[1] || "") && parts.length === 3 && !hasTrailingWhitespace) {
-    return prefixFilter(GRAPH_NAME_OPTIONS, parts[2]);
-  }
-
-  if (parts[0] === "/deep-research" && ((parts.length === 1 && hasTrailingWhitespace) || parts.length === 2)) {
-    return prefixFilter(RESEARCH_SOURCE_OPTIONS, parts[1] || "");
   }
 
   if (parts[0] === "/skills") {
@@ -345,22 +332,13 @@ export function buildInlineHint(params: {
     if (parts[0] === "/worktree") {
       return "<enter|exit|list|status>";
     }
-    if (parts[0] === "/graph") {
-      return "<list|view|run|runs|pause|resume|stop|restart>";
-    }
     if (parts[0] === "/agents") {
       return "<agent-name>";
-    }
-    if (parts[0] === "/deep-research") {
-      return "<--web|--workspace|--web-workspace>";
     }
   } else if (parts.length === 2) {
     // 二级命令后的空格
     if (parts[0] === "/worktree" && parts[1] === "exit") {
       return "<--discard>";
-    }
-    if (parts[0] === "/graph" && (parts[1] === "view" || parts[1] === "run")) {
-      return "<deep_research>";
     }
   }
 

@@ -1,4 +1,4 @@
-"""Contracts for manager-owned tool, graph and async-task runtime state."""
+"""Contracts for manager-owned tool, workflow and async-task runtime state."""
 
 from __future__ import annotations
 
@@ -20,9 +20,8 @@ from juice_agents.core.agent.tools.runtime import (
     ToolExecutionPolicy,
 )
 from juice_agents.core.config.context import ConfigurationContext
-from juice_agents.core.graph import GraphCancelledError
-from juice_agents.core.graph.runs import GraphRunStore
-from juice_agents.core.managers import AsyncTaskManager, GraphRunManager, ToolManager
+from juice_agents.core.workflow import WorkflowCancelledError
+from juice_agents.core.managers import AsyncTaskManager, WorkflowRunManager, ToolManager
 from juice_agents.core.runner.config import AgentBinding, ToolPolicy, RunnerConfig
 
 
@@ -238,85 +237,86 @@ def test_async_task_manager_persists_agent_runtime_state(tmp_path: Path) -> None
 
 
 @dataclass
-class _GraphMetadata:
+class _WorkflowMetadata:
     name: str
+    tools: tuple[str, ...] = ()
+    read_only: bool = False
 
     def to_dict(self) -> dict[str, Any]:
-        return {"name": self.name, "path": ""}
+        return {"name": self.name, "path": "", "tools": list(self.tools), "read_only": self.read_only}
 
 
-class _Graph:
-    def stream(self, payload: dict[str, Any], *, config: dict[str, Any]):
-        yield {"node": "start", "state": {"value": payload["value"]}}
+class _Workflow:
+    def run(self, ctx: Any, args: dict[str, Any]) -> dict[str, Any]:
+        return {"node": "start", "state": {"value": args["value"]}}
 
 
-class _BlockingGraph:
-    def stream(self, payload: dict[str, Any], *, config: dict[str, Any]):
-        del payload
-        while not config["cancel_event"].is_set():
+class _BlockingWorkflow:
+    def run(self, ctx: Any, args: dict[str, Any]) -> dict[str, Any]:
+        del args
+        while not ctx.build.cancel_event.is_set():
             time.sleep(0.01)
-        raise GraphCancelledError("cancelled")
+        raise WorkflowCancelledError("cancelled")
 
 
-class _GraphRegistry:
-    def __init__(self, graph: Any) -> None:
-        self.graph = graph
+class _WorkflowRegistry:
+    def __init__(self, workflow: Any) -> None:
+        self.workflow = workflow
         self.instantiate_calls = 0
 
-    def get_metadata(self, name: str) -> _GraphMetadata:
-        return _GraphMetadata(name)
+    def get_metadata(self, name: str) -> _WorkflowMetadata:
+        return _WorkflowMetadata(name)
 
-    def instantiate(self, name: str, *, context: Any) -> Any:
-        del name, context
+    def validate(self, raw: str | _WorkflowMetadata) -> _WorkflowMetadata:
+        if isinstance(raw, _WorkflowMetadata):
+            return raw
+        return _WorkflowMetadata(raw)
+
+    def instantiate(self, meta: _WorkflowMetadata) -> Any:
+        del meta
         self.instantiate_calls += 1
-        return self.graph
-
-    def instantiate_from_path(self, path: Path, *, context: Any) -> Any:
-        del path, context
-        self.instantiate_calls += 1
-        return self.graph
+        return self.workflow.run
 
 
-def _graph_manager(tmp_path: Path, graph: Any) -> tuple[GraphRunManager, _GraphRegistry]:
-    registry = _GraphRegistry(graph)
-    manager = GraphRunManager(
-        store=GraphRunStore(tmp_path / "runner"),
+def _workflow_manager(tmp_path: Path, workflow: Any) -> tuple[WorkflowRunManager, _WorkflowRegistry]:
+    registry = _WorkflowRegistry(workflow)
+    manager = WorkflowRunManager(
+        runner_root=tmp_path / "runner",
         registry=registry,  # type: ignore[arg-type]
         config_context=ConfigurationContext.from_workspace(tmp_path),
     )
     return manager, registry
 
 
-def test_graph_run_manager_instantiates_executes_and_stops(tmp_path: Path) -> None:
-    manager, registry = _graph_manager(tmp_path, _Graph())
-    try:
-        completed = manager.run("demo", {"value": "ok"})
-        assert completed["status"] == "completed"
-        assert registry.instantiate_calls == 1
-        result_path = manager.store.run_dir(completed["graph_run_id"]) / "result.json"
-        assert result_path.exists()
-    finally:
-        manager.release()
+def test_workflow_run_manager_instantiates_executes_and_stops(tmp_path: Path) -> None:
+    manager, registry = _workflow_manager(tmp_path, _Workflow())
+    result = manager.call("demo", {"value": "ok"})
+    assert result["result"]["state"]["value"] == "ok"
+    assert registry.instantiate_calls == 1
 
-    manager, _ = _graph_manager(tmp_path, _BlockingGraph())
-    try:
-        manifest = manager.create_run("blocking", {})
-        future = manager.submit(manifest["graph_run_id"])
-        deadline = time.monotonic() + 1
-        while time.monotonic() < deadline:
-            if manager.store.get(manifest["graph_run_id"])["status"] == "running":
-                break
-            time.sleep(0.01)
-        manager.stop(manifest["graph_run_id"])
-        assert future.result(timeout=2)["status"] == "stopped"
-    finally:
-        manager.release()
+    # Test cancellation
+    manager_blocking, _ = _workflow_manager(tmp_path, _BlockingWorkflow())
+    cancel_event = threading.Event()
+    exception_caught = threading.Event()
+
+    def run_blocking() -> None:
+        try:
+            manager_blocking.call("blocking", {}, cancel_event=cancel_event)
+        except WorkflowCancelledError:
+            exception_caught.set()
+
+    thread = threading.Thread(target=run_blocking, daemon=True)
+    thread.start()
+    time.sleep(0.1)  # Give workflow time to start
+    cancel_event.set()
+    thread.join(timeout=2)
+    assert exception_caught.is_set(), "WorkflowCancelledError should have been raised"
 
 
-def test_graph_manager_receives_a_narrow_agent_dispatcher_not_runner() -> None:
-    """Graphs may request Agent work without making a Manager own Runner."""
+def test_workflow_manager_receives_a_narrow_agent_dispatcher_not_runner() -> None:
+    """Workflows may request Agent work without making a Manager own Runner."""
 
-    source = inspect.getsource(GraphRunManager)
+    source = inspect.getsource(WorkflowRunManager)
     assert "runtime_context" not in source
     assert "from juice_agents.core.runner" not in source
     assert "agent_dispatcher" in source

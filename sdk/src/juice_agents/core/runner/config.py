@@ -18,7 +18,7 @@ class Capability(StrEnum):
 
     AGENTS = "agents"
     TOOLS = "tools"
-    GRAPHS = "graphs"
+    WORKFLOWS = "workflows"
     ASYNC_TASKS = "async_tasks"
     COLLABORATION = "collaboration"
     PLANNING = "planning"
@@ -233,7 +233,7 @@ def _install_builtin_configs() -> None:
     common = frozenset({
         Capability.AGENTS,
         Capability.TOOLS,
-        Capability.GRAPHS,
+        Capability.WORKFLOWS,
         Capability.ASYNC_TASKS,
     })
     mode_registry.register(

@@ -27,7 +27,7 @@ export function buildComposerDockModel(params: {
   completionVisible: boolean;
   ghostText: string | null;
   inlineHint: string | null;
-  actorViewHint?: string | null;
+  activeViewHint?: string | null;
 }): ComposerDockModel {
   const overlay = getCandidatePanelModel({
     candidates: params.candidates,
@@ -40,12 +40,12 @@ export function buildComposerDockModel(params: {
   const agentMode = (params.agentMode || "agent").trim() || "agent";
 
   // 在 append-only 模型下不再有「未读消息」概念——所有完成的消息已经追加到
-  // 终端 scrollback，鼠标向上即可回看。loading 与 actorViewHint 仍走 transientHint。
+  // 终端 scrollback，鼠标向上即可回看。loading 与 activeViewHint 仍走 transientHint。
   let transientHint: string | null = null;
   if (params.loading) {
     transientHint = TUI_COPY.booting;
-  } else if (params.actorViewHint) {
-    transientHint = params.actorViewHint;
+  } else if (params.activeViewHint) {
+    transientHint = params.activeViewHint;
   }
 
   return {
@@ -90,7 +90,7 @@ interface ComposerDockProps {
   completionVisible: boolean;
   ghostText: string | null;
   inlineHint: string | null;
-  actorViewHint?: string | null;
+  activeViewHint?: string | null;
   /** active 异步后台任务数；>0 才显示 mode 行右侧的徽标。 */
   asyncRunningCount: number;
 }
@@ -108,7 +108,7 @@ export function ComposerDock(props: ComposerDockProps) {
     completionVisible: props.completionVisible,
     ghostText: props.ghostText,
     inlineHint: props.inlineHint,
-    actorViewHint: props.actorViewHint,
+    activeViewHint: props.activeViewHint,
   });
 
   return (

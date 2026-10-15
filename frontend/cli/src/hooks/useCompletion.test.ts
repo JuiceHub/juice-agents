@@ -89,7 +89,7 @@ test("offers loop and cron command completions", () => {
 
 test("offers worktree command completions", () => {
   assert.deepEqual(
-    getCommandCandidates("/wor").map((item) => item.label),
+    getCommandCandidates("/workt").map((item) => item.label),
     ["/worktree"],
   );
   assert.deepEqual(
@@ -145,10 +145,10 @@ test("offers plugin dollar invocation and /plugins query arguments", () => {
   );
 });
 
-test("offers the reserved graph dollar namespace", () => {
+test("offers the reserved workflow dollar namespace", () => {
   assert.deepEqual(
-    getCommandCandidates("$graph:d").map((item) => item.label),
-    ["$graph:deep_research"],
+    getCommandCandidates("$workflow:d").map((item) => item.label),
+    ["$workflow:deep_research"],
   );
 });
 
@@ -171,29 +171,10 @@ test("offers availability-filtered agent names for /agents", () => {
   assert.deepEqual(candidates.map((item) => item.label), ["research_worker", "reviewer"]);
 });
 
-test("offers graph names for generic graph commands", () => {
+test("offers plugin names for plugin commands", () => {
   assert.deepEqual(
-    getCommandCandidates("/graph run d").map((item) => item.label),
-    ["deep_research"],
-  );
-});
-
-test("offers direct deep research command, source flags, and JSON payload templates", () => {
-  assert.deepEqual(
-    getCommandCandidates("/deep").map((item) => item.label),
-    ["/deep-research"],
-  );
-  assert.deepEqual(
-    getCommandCandidates("/deep-research --w").map((item) => item.label),
-    ["--web", "--workspace", "--web-workspace"],
-  );
-  assert.deepEqual(
-    getCommandCandidates("/deep-research {").map((item) => item.label),
-    [
-      '{"question":"","source_mode":"web"}',
-      '{"question":"","source_mode":"workspace"}',
-      '{"question":"","source_mode":"web_workspace"}',
-    ],
+    getCommandCandidates("/plugins d", [], [], undefined, ["demo-plugin"]).map((item) => item.label),
+    ["demo-plugin"],
   );
 });
 
@@ -248,6 +229,16 @@ test("keeps top-level candidates visible until a trailing space closes the panel
   );
   // 补全时补入的尾随空格会关闭面板，让 ↑/↓ 回到历史记录导航
   assert.deepEqual(getCommandCandidates("/mode "), []);
+});
+
+test("hides candidates for parameterless commands to allow history navigation", () => {
+  // 无参数命令：输入完整时不显示候选列表，让用户可以用方向键切换历史
+  assert.deepEqual(getCommandCandidates("/help"), []);
+  assert.deepEqual(getCommandCandidates("/status"), []);
+  assert.deepEqual(getCommandCandidates("/clear"), []);
+  assert.deepEqual(getCommandCandidates("/exit"), []);
+  // 部分输入时仍显示候选
+  assert.ok(getCommandCandidates("/hel").length > 0);
 });
 
 test("accepts completion by replacing only the token at the cursor", () => {

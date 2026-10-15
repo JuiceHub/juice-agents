@@ -23,7 +23,7 @@ _PLAN_ROOT_INSTRUCTIONS = (
     "codebase, compare implementation options, and make the final design "
     "decision yourself. You may delegate bounded read-only investigation to "
     "the `general` and `explore` agents, but they only provide evidence. Do "
-    "not edit repository files, execute code, or run graphs in this mode. "
+    "not edit repository files, execute code, or run workflows in this mode. "
     "When the plan is ready, write the complete approved artifact with `plan` "
     "and use `exit_plan` to request approval. The only writable artifact is "
     "the Runner-owned plan file shown by the plan tool."

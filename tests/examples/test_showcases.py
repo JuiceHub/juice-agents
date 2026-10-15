@@ -96,7 +96,7 @@ SHOWCASES = (
         "examples.agent_research.__main__",
         "调查量子计算在药物研发中的最新可验证进展",
         "agent",
-        stream_task="/deep-research 调查量子计算在药物研发中的最新可验证进展",
+        stream_task="$workflow:deep_research 调查量子计算在药物研发中的最新可验证进展",
     ),
     _Showcase(
         "examples.agent_evolution.__main__",

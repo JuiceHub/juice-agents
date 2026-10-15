@@ -85,8 +85,8 @@ _BROWSER_TOOLS = _tools(
     "browser_hover",
     "browser_scroll",
 )
-_GRAPH_ROOT_TOOLS = _tools("graph_list", "graph_view", "graph_manage", "graph_tool")
-_GRAPH_SUBAGENT_TOOLS = _tools("graph_list", "graph_view", "graph_tool")
+_WORKFLOW_ROOT_TOOLS = _tools("workflow_list", "workflow_view", "workflow_manage", "workflow_run")
+_WORKFLOW_SUBAGENT_TOOLS = _tools("workflow_list", "workflow_view", "workflow_run")
 _CONFIG_SHARED_TOOLS = _tools("tools_list", "tool_view", "tool_manage")
 _CONFIG_AGENT_TOOLS = _tools("agents_list", "agent_view", "agent_manage")
 
@@ -109,7 +109,7 @@ GENERAL_ROOT_TOOLS = (
     ),
     *_CONFIG_AGENT_TOOLS,
     *_CONFIG_SHARED_TOOLS,
-    *_GRAPH_ROOT_TOOLS,
+    *_WORKFLOW_ROOT_TOOLS,
     *_BROWSER_TOOLS,
     *_tools("cron_create", "cron_list", "cron_delete"),
 )
@@ -127,7 +127,7 @@ GENERAL_SUBAGENT_TOOLS = (
     ),
     *_CONFIG_AGENT_TOOLS,
     *_CONFIG_SHARED_TOOLS,
-    *_GRAPH_SUBAGENT_TOOLS,
+    *_WORKFLOW_SUBAGENT_TOOLS,
     *_BROWSER_TOOLS,
 )
 GENERAL_TEAM_TOOLS = (
@@ -147,20 +147,19 @@ GENERAL_TEAM_TOOLS = (
         "list_worktrees",
         "worktree_status",
     ),
-    *_GRAPH_ROOT_TOOLS,
+    *_WORKFLOW_ROOT_TOOLS,
 )
 
 ROOT_GENERAL_INSTRUCTIONS = (
     "You are the user-facing root agent. Complete simple tasks directly, and use "
     "`agent_tool` for specialized subagents: send codebase search, read-only analysis, "
     "and file discovery to `explore`; send complex isolated execution, multi-step work, "
-    "and tasks that may require file edits to `general`. Use graph tools for repeatable, "
-    "debuggable workflows: inspect scripts with `graph_list`/`graph_view`, edit local "
-    "workflow scripts with `graph_manage`, and run them with `graph_tool`. When a user "
-    "message starts with `/deep-research`, parse its question/source mode and call "
-    "`graph_tool` with name `deep_research` and payload fields `question`, `source_mode`, "
-    "and optional `scope`; never use a `source` payload field. Present the graph result "
-    "to the user. Handle user-facing clarification yourself; do not let subagents "
+    "and tasks that may require file edits to `general`. Use workflow tools for repeatable "
+    "multi-agent orchestration: inspect scripts with `workflow_list`/`workflow_view`, write "
+    "local workflow scripts with `workflow_manage`, and run them with `workflow_run`. "
+    "Users can explicitly invoke a workflow via `$workflow:<name> <task>` syntax, which "
+    "loads that workflow's metadata and makes workflow_run available. Present the workflow "
+    "result to the user. Handle user-facing clarification yourself; do not let subagents "
     "interrupt the user directly."
 )
 GENERAL_SUBAGENT_INSTRUCTIONS = (
@@ -168,7 +167,7 @@ GENERAL_SUBAGENT_INSTRUCTIONS = (
     "may require file edits. The user prompt contains only dynamic task details; fixed "
     "workflow, constraints, and output requirements come from the system prompt. Finish "
     "with `submit_output` containing a concise result the root agent can use directly. "
-    "You may inspect and run graph workflow scripts, but do not modify graph scripts."
+    "You may inspect and run workflow scripts, but do not modify them."
 )
 EXPLORE_SUBAGENT_INSTRUCTIONS = (
     "You are the explore subagent. Only perform read-only codebase exploration, file "

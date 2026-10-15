@@ -7,6 +7,7 @@ Managers.  No mode is allowed to inject an execution callback into this class.
 
 from __future__ import annotations
 
+import json
 import logging
 from collections import deque
 from pathlib import Path
@@ -22,9 +23,9 @@ from juice_agents.core.agent.root_config import build_root_config
 from juice_agents.core.agent.tools.runtime import ToolExecutionContext
 from juice_agents.core.config.context import ConfigurationContext
 from juice_agents.core.config.model_catalog import DEFAULT_RUNTIME_CONFIG_PATH
-from juice_agents.core.graph.runs import GraphRunStore
-from juice_agents.core.managers import AsyncTaskManager, GraphRunManager, ToolManager
-from juice_agents.core.registry import AgentRegistry, GraphRegistry
+from juice_agents.core.managers import AsyncTaskManager, ToolManager, WorkflowRunManager
+from juice_agents.core.registry import AgentRegistry, WorkflowRegistry
+from juice_agents.core.registry.agents.types import AgentConfig
 
 from .config import AgentBinding, Capability, RunnerConfig, mode_registry
 from .errors import RunnerBusyError
@@ -40,11 +41,11 @@ logger = logging.getLogger(__name__)
 AskHandler = Callable[[dict[str, Any]], dict[str, Any]]
 
 
-class _GraphAgentDispatcher:
-    """Weak, narrow bridge from graph work to Runner-owned AgentManager.
+class _WorkflowAgentDispatcher:
+    """Weak, narrow bridge from workflow work to Runner-owned AgentManager.
 
-    GraphRunManager needs to request structured Agent work, but it must not
-    own the Runner or a live Agent.  The bridge exposes only graph-required
+    WorkflowRunManager needs to request ephemeral Agent work, but it must not
+    own the Runner or a live Agent.  The bridge exposes only workflow-required
     methods and uses a weak reference, so a manager can never extend a closed
     Runner's lifetime.
     """
@@ -55,32 +56,37 @@ class _GraphAgentDispatcher:
     def _runner(self) -> "Runner":
         runner = self._runner_ref()
         if runner is None:
-            raise RuntimeError("graph Agent dispatch target has been released")
+            raise RuntimeError("workflow Agent dispatch target has been released")
         return runner
 
     @property
     def runner_id(self) -> str:
         return self._runner().runner_id
 
-    @property
-    def root_agent_name(self) -> str:
-        return self._runner().root_agent_name
+    def resolve_agent(self, agent_name: str) -> AgentConfig:
+        """按名字取已注册声明；沿用 ``/agents`` 的 mode/禁用可用性判断。"""
+
+        runner = self._runner()
+        if not runner.is_agent_available(agent_name):
+            raise PermissionError(f"workflow 不能调用当前 mode 不可用的 agent: {agent_name!r}")
+        return runner.agent_registry.load_config(agent_name)
+
+    def tool_is_read_only(self, tool_name: str) -> bool:
+        return self._runner().tool_is_read_only(tool_name)
 
     def invoke_agent(self, spec: dict[str, Any]) -> dict[str, Any]:
-        return self._runner().invoke_agent(spec)
+        """workflow 内部调用固定为 functional + ephemeral + accept。"""
 
-    def agent_type_for(self, agent_name: str) -> str | None:
-        instance = self._runner().agent_manager.get_by_name(agent_name).instance
-        if instance is None:
-            return None
-        resolved = str(getattr(instance, "_resolved_agent_type", "") or "").strip()
-        if resolved:
-            return resolved
-        declared = getattr(instance, "_declared_agent_config", None)
-        configured = str(getattr(declared, "agent_type", "") or "").strip()
-        if configured and configured != "default":
-            return configured
-        return "codeact" if "codeact" in type(instance).__name__.lower() else None
+        return self._runner().invoke_agent(
+            {
+                **spec,
+                "execution": "sync",
+                "lifecycle": "functional",
+                "agent_role": "workflow",
+                "ephemeral": True,
+                "permission_mode": "accept",
+            }
+        )
 
 
 class _RunnerStream:
@@ -211,18 +217,22 @@ class Runner:
                 after_release=self._after_agent_release,
             ),
         )
-        self.graph_manager = GraphRunManager(
-            store=GraphRunStore(self.layout.root_dir),
-            registry=GraphRegistry(config_context=self.config_context),
-            config_context=self.config_context,
-            runner_id=self.runner_id,
-            agent_dispatcher=_GraphAgentDispatcher(self),
-            owner_agent_name=self.root_agent_name,
-            concurrency_limit=self.config.concurrency_limit,
-            lifecycle_callback=self._emit_manager_lifecycle,
-        )
+        self.workflow_manager = self._create_workflow_manager()
         self.team_manager = self._create_team_manager()
         logger.info("runner_initialized runner_id=%s mode_id=%s", self.runner_id, self.mode_id)
+
+    def _create_workflow_manager(self) -> WorkflowRunManager:
+        """构造与当前 RunnerConfig 绑定的 WorkflowRunManager（init 与 reconfigure 共用）。"""
+
+        return WorkflowRunManager(
+            runner_root=self.layout.root_dir,
+            registry=WorkflowRegistry(config_context=self.config_context),
+            config_context=self.config_context,
+            runner_id=self.runner_id,
+            agent_dispatcher=_WorkflowAgentDispatcher(self),
+            owner_agent_name="root",
+            lifecycle_callback=self._emit_manager_lifecycle,
+        )
 
     def _create_team_manager(self) -> Any | None:
         """Bind mutable Team state only when the declarative config enables it."""
@@ -385,7 +395,7 @@ class Runner:
             if task_id:
                 current = next((item for item in manager.list_tasks() if item["task_id"] == task_id), None)
                 if current is not None and current.get("status") == "in_progress":
-                    last_step = managed.session.steps[-1] if managed.session.steps else None
+                    last_step = managed.context.steps[-1] if managed.context.steps else None
                     if getattr(last_step, "round_outcome", None) == "submitted" and not getattr(last_step, "error", None):
                         manager.complete_task(task_id, member_name, result=str(result or ""))
                     else:
@@ -561,14 +571,36 @@ class Runner:
         if manager is None:
             return
         member_name = str(snapshot.get("agent_name") or "")
-        ids = {
-            str(attachment.get("payload", {}).get("message_id") or "")
-            for step in dict(snapshot.get("session") or {}).get("steps") or []
-            if isinstance(step, dict)
-            for attachment in step.get("attachments") or []
-            if isinstance(attachment, dict) and attachment.get("attachment_type") == "inbox_message"
-        }
-        ids.discard("")
+        session = dict(snapshot.get("session") or {})
+
+        # 收集所有 inbox_message 类型附件的 message_id
+        ids: set[str] = set()
+
+        # 从 nodes 结构中收集（新版本 ContextTree 结构）
+        nodes = session.get("nodes")
+        if isinstance(nodes, dict):
+            for node in nodes.values():
+                if not isinstance(node, dict):
+                    continue
+                step = node.get("step")
+                if not isinstance(step, dict):
+                    continue
+                for attachment in step.get("attachments") or []:
+                    if isinstance(attachment, dict) and attachment.get("attachment_type") == "inbox_message":
+                        message_id = str(attachment.get("payload", {}).get("message_id") or "")
+                        if message_id:
+                            ids.add(message_id)
+
+        # 从 steps 列表中收集（旧版本兼容）
+        for step in session.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            for attachment in step.get("attachments") or []:
+                if isinstance(attachment, dict) and attachment.get("attachment_type") == "inbox_message":
+                    message_id = str(attachment.get("payload", {}).get("message_id") or "")
+                    if message_id:
+                        ids.add(message_id)
+
         if ids:
             manager.reconcile_messages(member_name, sorted(ids))
 
@@ -738,8 +770,6 @@ class Runner:
             return "存在正在执行的 Agent"
         if self.async_task_manager.list_tasks(statuses={"pending", "running"}):
             return "存在未完成的异步任务"
-        if self.graph_manager.store.list(statuses={"pending", "running", "paused"}):
-            return "存在未完成的 Graph"
         if self.team_manager is not None and self.team_manager.has_pending_work():
             return "存在未完成的 Team 工作"
         return None
@@ -780,7 +810,6 @@ class Runner:
 
         # Managers holding worker pools are recreated only after the activity
         # check above.  Their durable stores remain in the same Runner layout.
-        self.graph_manager.release(wait=True)
         self.async_task_manager.release(wait=True)
         self.config = target
         self.permission_mode = target_permission
@@ -806,16 +835,7 @@ class Runner:
             default_base_dir=self.base_dir,
             max_workers=target.concurrency_limit,
         )
-        self.graph_manager = GraphRunManager(
-            store=GraphRunStore(self.layout.root_dir),
-            registry=GraphRegistry(config_context=self.config_context),
-            config_context=self.config_context,
-            runner_id=self.runner_id,
-            agent_dispatcher=_GraphAgentDispatcher(self),
-            owner_agent_name="root",
-            concurrency_limit=target.concurrency_limit,
-            lifecycle_callback=self._emit_manager_lifecycle,
-        )
+        self.workflow_manager = self._create_workflow_manager()
         self._team_stopping = False
         self.team_manager = self._create_team_manager()
         self.agent_manager.permission_mode = target_permission
@@ -939,7 +959,6 @@ class Runner:
             runtime_config_path=runtime_config_path,
         )
         runner.async_task_manager.recover()
-        runner.graph_manager.recover()
         if runner.team_manager is not None:
             runner._team_stopping = True
             try:
@@ -1006,12 +1025,15 @@ class Runner:
                 agent=instance,
                 runner_context=context,
                 runner=self,
-                permission_mode=self.permission_mode,
+                permission_mode=managed.permission_mode or self.permission_mode,
                 agent_mode=self.mode_id,
                 cancel_event=cancel_event,
             ),
         )
-        instance.set_log_file_path(self.layout.agents_dir / managed.agent_id / "log.txt")
+        # ManagedAgent 级审批覆盖（workflow 内部 agent 为 accept）交给 PermissionEngine 读取。
+        instance.permission_mode_override = managed.permission_mode
+        # ephemeral agent 不写文件日志；运行过程只经 logger 输出。
+        instance.set_log_file_path(None if managed.ephemeral else self.layout.agents_dir / managed.agent_id / "log.txt")
 
     def _after_agent_step(self, managed: ManagedAgent, _step: Any) -> None:
         self.state["root_agent_name"] = self.root_agent_name
@@ -1068,8 +1090,8 @@ class Runner:
             return {"allowed": False, "reason": f"RunnerConfig 不允许工具 {name!r}"}
         if name == "agent_tool" and not self.has_capability(Capability.AGENTS):
             return {"allowed": False, "reason": "当前 RunnerConfig 未启用 agents capability"}
-        if name.startswith("graph_") and not self.has_capability(Capability.GRAPHS):
-            return {"allowed": False, "reason": "当前 RunnerConfig 未启用 graphs capability"}
+        if name.startswith("workflow_") and not self.has_capability(Capability.WORKFLOWS):
+            return {"allowed": False, "reason": "当前 RunnerConfig 未启用 workflows capability"}
         if name.startswith("async_task") and not self.has_capability(Capability.ASYNC_TASKS):
             return {"allowed": False, "reason": "当前 RunnerConfig 未启用 async_tasks capability"}
         policy = self.config.tool_policy
@@ -1123,7 +1145,7 @@ class Runner:
                         attachments=self._team_initial_attachments("root"),
                     ):
                         outcome = str(step.round_outcome or "continue")
-                        if outcome in {"submitted", "yielded", "failed"}:
+                        if outcome in {"submitted", "failed"}:
                             output = step.output if step.output is not None else step.model_output
                         event = {
                             "kind": "action_step", "runner_id": self.runner_id, "mode_id": self.mode_id,
@@ -1222,25 +1244,34 @@ class Runner:
 
     def close(self) -> None:
         self.stop(reason="runner_closed")
-        self.graph_manager.release(wait=False)
         self.async_task_manager.release(wait=False)
         self.tool_manager.release(wait=False)
 
     # -- generic Manager capabilities ---------------------------------------------------
 
     def invoke_agent(self, spec: dict[str, Any]) -> dict[str, Any]:
-        """Acquire and run a declaration through AgentManager, never directly."""
+        """调用 agent 的唯一入口；构造、运行、释放全部交给 AgentManager。
+
+        - ``agent_ref`` 为名字：按 ``/agents`` 同一套可用性判断（mode、禁用列表），
+          functional / persistent 均可。
+        - ``agent_ref`` 为 ``AgentConfig``：调用方已组装并校验声明，不按名字查可用性；
+          临时声明没有稳定身份，只允许 functional。
+        - ``ephemeral=True``：不写 snapshot / 日志（要求 functional）。
+        - ``permission_mode``：覆盖本次 agent 的审批模式；``cancel_event``：调用方取消信号。
+        - 未指定 ``model`` 时继承发起者（owner）的模型。
+        """
 
         self._require_capability(Capability.AGENTS)
         raw_ref = spec.get("agent_ref") or spec.get("agent_name")
         task = str(spec.get("task") or "").strip()
         if raw_ref is None or not task:
             raise ValueError("agent_ref 和 task 不能为空")
+        is_inline = isinstance(raw_ref, AgentConfig)
         agent_name = str(
             getattr(raw_ref, "name", "")
             or (raw_ref.get("name") if isinstance(raw_ref, dict) else raw_ref)
         ).strip()
-        if not self.is_agent_available(agent_name):
+        if not is_inline and not self.is_agent_available(agent_name):
             allowed = ", ".join(self._discover_available_agent_names()) or "(none)"
             raise PermissionError(
                 f"当前 Runner 不允许调用 Agent ({allowed}); got {agent_name!r}"
@@ -1249,11 +1280,19 @@ class Runner:
         owner_name = str(spec.get("owner_agent_name") or self.root_agent_name).strip()
         owner = self.agent_manager.get_by_name(owner_name)
         role = str(spec.get("agent_role") or self.config.member_binding.role).strip()
-        lifecycle = str(spec.get("lifecycle") or self.config.member_binding.lifecycle).strip()
+        lifecycle = str(spec.get("lifecycle") or ("functional" if is_inline else self.config.member_binding.lifecycle)).strip()
+        if is_inline and lifecycle != "functional":
+            raise ValueError("临时 AgentConfig 只支持 functional 生命周期")
         binding: Any = raw_ref if not isinstance(raw_ref, str) else AgentBinding(agent_name, role, lifecycle)
+        model = spec.get("model")
+        if model is None and owner.instance is not None:
+            model = getattr(owner.instance, "model", None)
         managed = self.agent_manager.acquire(
             binding, agent_name=agent_name or None, role=role, lifecycle=lifecycle,
-            model=spec.get("model"), metadata={"parent_agent": owner.agent_name, **dict(spec.get("metadata") or {})},
+            model=model, metadata={"parent_agent": owner.agent_name, **dict(spec.get("metadata") or {})},
+            ephemeral=bool(spec.get("ephemeral")),
+            permission_mode=str(spec.get("permission_mode") or ""),
+            external_cancel=spec.get("cancel_event"),
         )
         run_args = {"task_images": list(spec.get("task_images") or []), "reset_session": not bool(spec.get("inherit_session"))}
         if execution == "sync":
@@ -1280,22 +1319,38 @@ class Runner:
             metadata={"max_observation_chars": max_observation_chars},
         )
 
-    def launch_local_graph_async_task(self, *, owner_agent_name: str, graph_name: str, payload: dict[str, Any], config: dict[str, Any] | None = None, max_observation_chars: int | None = None) -> dict[str, Any]:
-        self._require_capability(Capability.GRAPHS)
+    def launch_local_workflow_async_task(self, *, owner_agent_name: str, workflow: Any, args: dict[str, Any], config: dict[str, Any] | None = None, max_observation_chars: int | None = None) -> dict[str, Any]:
+        """后台调用 workflow；``workflow`` 可以是名称或已通过权限检查的 WorkflowMetadata。
+
+        取消复用 AsyncTaskManager 的任务取消信号（``async_task_stop``）。
+        """
+
+        self._require_capability(Capability.WORKFLOWS)
         self._require_capability(Capability.ASYNC_TASKS)
         owner = self.agent_manager.get_by_name(owner_agent_name)
+        name = str(getattr(workflow, "name", workflow) or "")
         return self.async_task_manager.launch(
-            task_type="local_graph", owner_agent_id=owner.agent_id, owner_agent_name=owner.agent_name,
-            description=f"graph:{graph_name}",
-            runner=lambda _task, _path: self.graph_manager.run(
-                graph_name,
-                payload,
+            task_type="local_workflow", owner_agent_id=owner.agent_id, owner_agent_name=owner.agent_name,
+            description=f"workflow:{name}",
+            runner=lambda task, _path: self.workflow_manager.call(
+                workflow,
+                args,
                 config,
                 owner_agent_name=owner.agent_name,
+                # async_task_stop 会 set 这个信号，workflow 在下一个调用边界停下。
+                cancel_event=self.async_task_manager.cancel_event_for(str(task.get("async_task_id") or "")),
             ),
-            summary_builder=lambda result: f"graph {graph_name} {result.get('status', 'finished')}",
-            metadata={"graph_name": graph_name, "max_observation_chars": max_observation_chars},
+            summary_builder=lambda _result: f"workflow {name} completed",
+            metadata={"workflow_name": name, "max_observation_chars": max_observation_chars},
         )
+
+    def tool_is_read_only(self, tool_name: str) -> bool:
+        """按工具类声明判断只读，不实例化工具（未知工具视为非只读，fail-closed）。"""
+
+        from juice_agents.core.registry.tools.defaults import get_default_tool_factories
+
+        factory = get_default_tool_factories().get(str(tool_name or "").strip())
+        return bool(getattr(factory, "is_read_only", False))
 
     def list_async_tasks(self, *, statuses: set[str] | None = None) -> list[dict[str, Any]]:
         return self.async_task_manager.list_tasks(statuses=statuses)

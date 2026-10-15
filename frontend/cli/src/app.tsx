@@ -3,11 +3,11 @@
  */
 
 import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
-import { Box, Text, useInput } from "ink";
+import { Box, Text, useApp, useInput } from "ink";
 import { GatewayClient } from "./gateway/client.js";
 import type {
-  ActorSessionsReport,
-  ActorSessionSnapshot,
+  ActiveAgentsReport,
+  ActiveAgentSnapshot,
   AskRequest,
   AskResponse,
   AsyncTaskState,
@@ -64,7 +64,7 @@ import {
 import { normalizeEffortForModel, normalizeModelEffort, type ModelEffortSource } from "./lib/modelEffort.js";
 import {
   buildIntroPanel,
-  presentActorSession,
+  presentActiveAgent,
   presentAgentTypeConfigSaved,
   shouldShowIntroPanel,
   type MessageBlock,
@@ -92,7 +92,7 @@ interface AppProps {
   mouseEmitter?: EventEmitter | null;
 }
 
-const ACTOR_SELECTOR_TITLE = "Select Actor Session";
+const ACTIVE_SELECTOR_TITLE = "Select Active Agent";
 const MIN_TRANSCRIPT_WINDOW_SIZE = 3;
 
 /**
@@ -167,9 +167,9 @@ export function shouldRenderIntroPanel(params: {
   return params.hasSession && params.firstVisibleIndex === 0;
 }
 
-export function buildActorViewHint(activeActorName: string | null): string | null {
-  return activeActorName
-    ? `Viewing: ${activeActorName} · interactive · Esc return`
+export function buildActiveViewHint(activeAgentName: string | null): string | null {
+  return activeAgentName
+    ? `Viewing: ${activeAgentName} · interactive · Esc return`
     : null;
 }
 
@@ -232,6 +232,22 @@ export function resolveInputLayer(params: {
     composerActive:
       !configActive && !skillsConfigActive && !selectorActive && !tasksDialogActive && !askActive,
   };
+}
+
+/**
+ * composer 空输入时 Ctrl+C 的去向。
+ * - streaming：同一次按键也会派发给 streamingCancelActive 层去取消 stream，
+ *   这里必须忽略，否则「取消」会顺带把整个 CLI 退出。
+ * - 正在查看 agent：中断该 agent，留在 CLI。
+ * - 其余：退出 CLI。
+ */
+export function resolveCtrlCAction(params: {
+  streaming: boolean;
+  activeAgentName: string | null;
+}): "ignore" | "interrupt-agent" | "exit" {
+  if (params.streaming) return "ignore";
+  if (params.activeAgentName) return "interrupt-agent";
+  return "exit";
 }
 
 export function shouldRenderComposerDock(inputLayer: InputLayerState): boolean {
@@ -313,62 +329,62 @@ interface DeferredModelSwitch {
   modelEffort: string;
 }
 
-export function resolveActorSelectorIdentity(
-  actor: ActorSessionSnapshot
+export function resolveActiveSelectorIdentity(
+  agent: ActiveAgentSnapshot
 ): { label: string; value: string } | null {
-  const actorName = String(actor.actor_name || "").trim();
-  const actorId = String(actor.actor_id || "").trim();
-  const fallback = actorId ? `Unnamed actor · ${actorId}` : "";
-  const value = actorName || actorId;
-  const label = actorName || fallback;
+  const agentName = String(agent.agent_name || "").trim();
+  const agentId = String(agent.agent_id || "").trim();
+  const fallback = agentId ? `Unnamed agent · ${agentId}` : "";
+  const value = agentName || agentId;
+  const label = agentName || fallback;
   if (!value || !label) {
     return null;
   }
   return { label, value };
 }
 
-export function buildActorSelectorItems(
-  report: ActorSessionsReport | null,
-  activeActorName: string | null
+export function buildActiveSelectorItems(
+  report: ActiveAgentsReport | null,
+  activeAgentName: string | null
 ): SelectorItem[] {
-  const actors = report?.actors || [];
-  const root = actors.find((actor) => actor.is_root)
-    || actors.find((actor) => actor.actor_name === report?.root_actor_name);
-  const rootName = root?.actor_name || report?.root_actor_name || "main";
+  const agents = report?.agents || [];
+  const root = agents.find((agent) => agent.is_root)
+    || agents.find((agent) => agent.agent_name === report?.root_agent_name);
+  const rootName = root?.agent_name || report?.root_agent_name || "main";
   const items: SelectorItem[] = [
     {
       label: `Main · ${rootName}`,
       value: "",
       description: "primary transcript",
-      active: activeActorName === null,
+      active: activeAgentName === null,
     },
   ];
 
-  for (const actor of actors) {
-    if (actor.is_root || actor.actor_name === rootName) {
+  for (const agent of agents) {
+    if (agent.is_root || agent.agent_name === rootName) {
       continue;
     }
-    const identity = resolveActorSelectorIdentity(actor);
+    const identity = resolveActiveSelectorIdentity(agent);
     if (!identity) {
       continue;
     }
     const description = [
-      actor.actor_kind || actor.actor_role || "actor",
-      actor.status || "unknown",
-      actor.current_async_task_id || "",
+      agent.agent_kind || agent.agent_role || "agent",
+      agent.status || "unknown",
+      agent.current_async_task_id || "",
     ].filter(Boolean).join(" · ");
     items.push({
       label: identity.label,
       value: identity.value,
       description,
-      active: activeActorName === identity.value,
+      active: activeAgentName === identity.value,
     });
   }
 
   if (items.length === 1) {
     items.push({
       label: "No subagent sessions yet",
-      value: "__empty_actor_sessions__",
+      value: "__empty_agent_sessions__",
       description: "workers appear here after team/group registers them",
       active: false,
     });
@@ -377,44 +393,44 @@ export function buildActorSelectorItems(
   return items;
 }
 
-export function resolveActorTranscriptMessages(
-  report: ActorSessionsReport | null,
-  activeActorName: string | null,
+export function resolveActiveTranscriptMessages(
+  report: ActiveAgentsReport | null,
+  activeAgentName: string | null,
   mainMessages: MessageBlock[]
 ): MessageBlock[] {
-  if (!activeActorName) {
+  if (!activeAgentName) {
     return mainMessages;
   }
-  const actor = findActorSession(report, activeActorName);
-  return presentActorSession(actor);
+  const agent = findActiveAgent(report, activeAgentName);
+  return presentActiveAgent(agent);
 }
 
-function loadHistoryFromActorSessions(
-  report: ActorSessionsReport | null
+function loadHistoryFromActiveAgents(
+  report: ActiveAgentsReport | null
 ): MessageBlock[] {
-  if (!report || !report.actors || report.actors.length === 0) {
+  if (!report || !report.agents || report.agents.length === 0) {
     return [];
   }
-  const rootActor = report.actors.find((actor) => actor.is_root)
-    || report.actors.find((actor) => actor.actor_name === report.root_actor_name);
-  if (!rootActor || !rootActor.steps || rootActor.steps.length === 0) {
+  const rootAgent = report.agents.find((agent) => agent.is_root)
+    || report.agents.find((agent) => agent.agent_name === report.root_agent_name);
+  if (!rootAgent || !rootAgent.steps || rootAgent.steps.length === 0) {
     return [];
   }
-  const allBlocks = presentActorSession(rootActor);
-  // Skip the first system block (actor status) to avoid duplication with presentStatus
+  const allBlocks = presentActiveAgent(rootAgent);
+  // Skip the first system block (agent status) to avoid duplication with presentStatus
   return allBlocks.slice(1);
 }
 
-function findActorSession(
-  report: ActorSessionsReport | null,
-  actorName: string | null
-): ActorSessionSnapshot | null {
-  if (!report || !actorName) {
+function findActiveAgent(
+  report: ActiveAgentsReport | null,
+  agentName: string | null
+): ActiveAgentSnapshot | null {
+  if (!report || !agentName) {
     return null;
   }
-  return report.actors.find((actor) => {
-    const identity = resolveActorSelectorIdentity(actor);
-    return actor.actor_name === actorName || identity?.value === actorName;
+  return report.agents.find((agent) => {
+    const identity = resolveActiveSelectorIdentity(agent);
+    return agent.agent_name === agentName || identity?.value === agentName;
   }) || null;
 }
 
@@ -451,7 +467,7 @@ function buildPendingSessionPreview(runtime: PendingSessionRuntime): SessionStat
     runner_id: "",
     permission_mode: runtime.permission_mode,
     agent_mode: runtime.agent_mode,
-    root_actor_name: "root_agent",
+    root_agent_name: "root_agent",
     base_dir: runtime.base_dir,
     started: false,
     resumed: false,
@@ -498,6 +514,15 @@ export function App({
   // 详情视图里展示 duration 时需要"现在"的时间戳；用 state + 1s tick 驱动重渲染。
   const [tasksNow, setTasksNow] = useState<number>(() => Date.now() / 1000);
   const [exitRequested, setExitRequested] = useState(false);
+  const { exit } = useApp();
+  // 退出请求（Ctrl+C / /exit）先渲染 resume 提示帧，再卸载 Ink：
+  // 只有调用 exit() 才会让 entry.tsx 的 waitUntilExit() resolve，进而执行
+  // client.stop() 关闭 gateway 子进程并释放 stdin，否则进程会一直挂住。
+  useEffect(() => {
+    if (exitRequested) {
+      exit();
+    }
+  }, [exitRequested, exit]);
   const [inputValue, setInputValue] = useState("");
   const [inputCursor, setInputCursor] = useState(0);
   // ComposerDock is unmounted while overlays are open, so App owns the
@@ -506,8 +531,8 @@ export function App({
     createComposerController()
   );
   const [queuedMessages, setQueuedMessages] = useState<string[]>([]);
-  const [actorSessionsReport, setActorSessionsReport] = useState<ActorSessionsReport | null>(null);
-  const [activeActorName, setActiveActorName] = useState<string | null>(null);
+  const [activeAgentsReport, setActiveAgentsReport] = useState<ActiveAgentsReport | null>(null);
+  const [activeAgentName, setActiveAgentName] = useState<string | null>(null);
   // 仅缓存 active (pending/running) 后台任务，用于计数徽标和 /tasks 面板。
   const [asyncTasks, setAsyncTasks] = useState<AsyncTaskState[]>([]);
   const [pendingAsk, setPendingAsk] = useState<AskRequest | null>(null);
@@ -569,15 +594,15 @@ export function App({
     setConfigPanelLoad(closeConfigPanelLoad<ConfigPanelState>(generation));
   }, []);
 
-  const handleStreamActorSessionsReport = useCallback(
-    (report: ActorSessionsReport) => {
-      setActorSessionsReport(report);
+  const handleStreamActiveAgentsReport = useCallback(
+    (report: ActiveAgentsReport) => {
+      setActiveAgentsReport(report);
       selector.updateItemsIfOpen(
-        ACTOR_SELECTOR_TITLE,
-        buildActorSelectorItems(report, activeActorName)
+        ACTIVE_SELECTOR_TITLE,
+        buildActiveSelectorItems(report, activeAgentName)
       );
     },
-    [activeActorName, selector]
+    [activeAgentName, selector]
   );
 
   const handleAskRequest = useCallback(
@@ -598,7 +623,7 @@ export function App({
   );
 
   const messagesHook = useConversationStream(client, {
-    onActorSessionsReport: handleStreamActorSessionsReport,
+    onActiveAgentsReport: handleStreamActiveAgentsReport,
     onAskRequest: handleAskRequest,
   });
   // While a stale mode response is being reconciled, React may still render
@@ -715,30 +740,30 @@ export function App({
     setAvailableAgentNames((agents.agents || []).map((agent) => agent.name).filter(Boolean));
   }, [client]);
 
-  const refreshActorSessions = useCallback(async (statusOverride?: SessionStatus | null) => {
+  const refreshActiveAgents = useCallback(async (statusOverride?: SessionStatus | null) => {
     if (!statusOverride && !session.status) {
-      setActorSessionsReport(null);
+      setActiveAgentsReport(null);
       setAsyncTasks([]);
       return null;
     }
-    // 并发拉 actor sessions 与 active async tasks，互不阻塞。
+    // 并发拉 agent sessions 与 active async tasks，互不阻塞。
     // 任一失败都不应影响另一路：单独 catch 后吞掉错误。
     const [report, tasks] = await Promise.all([
-      client.describeActorSessions().catch(() => null),
+      client.describeActiveAgents().catch(() => null),
       client
         .listAsyncTasks({ statuses: ["pending", "running"] })
         .catch(() => [] as AsyncTaskState[]),
     ]);
     if (report) {
-      setActorSessionsReport(report);
+      setActiveAgentsReport(report);
     }
     setAsyncTasks(tasks);
     return report;
   }, [client, session.status]);
 
   const visibleMessages = useMemo(
-    () => resolveActorTranscriptMessages(actorSessionsReport, activeActorName, messagesHook.messages),
-    [actorSessionsReport, activeActorName, messagesHook.messages]
+    () => resolveActiveTranscriptMessages(activeAgentsReport, activeAgentName, messagesHook.messages),
+    [activeAgentsReport, activeAgentName, messagesHook.messages]
   );
 
   // resume / clear-and-load 历史：alt-screen 架构下历史块直接进 messages 数组，
@@ -767,14 +792,14 @@ export function App({
         model_effort: deferred.modelEffort,
       });
       const currentStatus = await session.refreshStatus();
-      await refreshActorSessions(currentStatus ?? session.status);
+      await refreshActiveAgents(currentStatus ?? session.status);
     } catch (e: any) {
       messagesHook.addMessage({
         kind: "error",
         text: `Deferred model switch failed: ${e.message}`,
       });
     }
-  }, [client, messagesHook, messagesHook.streamInFlight, refreshActorSessions, session]);
+  }, [client, messagesHook, messagesHook.streamInFlight, refreshActiveAgents, session]);
 
   useEffect(() => {
     if (!messagesHook.streamInFlight) {
@@ -826,8 +851,8 @@ export function App({
             model_effort: normalizeModelEffort(runtimeConfig.model_effort),
           });
           setPendingRuntime(runtimeFromSession(resumedStatus, baseDir));
-          const report = await refreshActorSessions(resumedStatus);
-          const historyBlocks = loadHistoryFromActorSessions(report);
+          const report = await refreshActiveAgents(resumedStatus);
+          const historyBlocks = loadHistoryFromActiveAgents(report);
           commitResumedHistory(historyBlocks);
         } else {
           setPendingRuntime(
@@ -888,13 +913,13 @@ export function App({
       const modelsRequest = runtimeModels.length > 0
         ? Promise.resolve(runtimeModels)
         : client.listModels({ base_dir: baseDir });
-      const [memory, workspaceConfig, models, skillsConfig, selfEvolutionConfig, graphsConfig] = await Promise.all([
+      const [memory, workspaceConfig, models, skillsConfig, selfEvolutionConfig, workflowsConfig] = await Promise.all([
         client.memoryStatus(),
         client.loadWorkspaceConfig({ base_dir: baseDir }),
         modelsRequest,
         client.skillsConfigStatus({ base_dir: baseDir }),
         client.selfEvolutionConfigStatus({ base_dir: baseDir }),
-        client.graphsConfigStatus({ base_dir: baseDir }),
+        client.workflowsConfigStatus({ base_dir: baseDir }),
       ]);
       const currentStatus = session.status || buildPendingSessionPreview(pendingRuntime);
       const panel: ConfigPanelState = {
@@ -905,7 +930,7 @@ export function App({
           skillsConfig,
           workspaceConfig,
           selfEvolutionEnabled: selfEvolutionConfig.enabled,
-          graphsEnabled: graphsConfig.enabled,
+          workflowsEnabled: workflowsConfig.enabled,
         }),
         models,
       };
@@ -932,10 +957,10 @@ export function App({
       // Safe root-level commands keep their slash-command meaning in an actor
       // transcript, matching the global Ctrl+S/Ctrl+T shortcuts. Other input
       // remains an actor message exactly as before.
-      if (activeActorName && executionPolicy !== "immediate") {
+      if (activeAgentName && executionPolicy !== "immediate") {
         try {
-          const result = await client.sendActorMessage({
-            actor_name: activeActorName,
+          const result = await client.sendAgentMessage({
+            agent_name: activeAgentName,
             message: text,
           });
           const suffix = result.started_async_task_id
@@ -944,15 +969,15 @@ export function App({
           messagesHook.addMessage({
             kind: result.accepted ? "system" : "error",
             text: result.accepted
-              ? `Sent to ${activeActorName}${suffix}`
-              : `Actor message rejected for ${activeActorName}: ${result.error || result.status || "not_live"}`,
+              ? `Sent to ${activeAgentName}${suffix}`
+              : `Agent message rejected for ${activeAgentName}: ${result.error || result.status || "not_live"}`,
           });
           const currentStatus = await session.refreshStatus();
-          await refreshActorSessions(currentStatus ?? session.status);
+          await refreshActiveAgents(currentStatus ?? session.status);
         } catch (e: any) {
           messagesHook.addMessage({
             kind: "error",
-            text: `Actor message failed: ${e.message || String(e)}`,
+            text: `Agent message failed: ${e.message || String(e)}`,
           });
         }
         return;
@@ -1013,8 +1038,8 @@ export function App({
           if (result.loadHistory) {
             try {
               const currentStatus = await session.refreshStatus();
-              const report = await refreshActorSessions(currentStatus ?? session.status);
-              const historyBlocks = loadHistoryFromActorSessions(report);
+              const report = await refreshActiveAgents(currentStatus ?? session.status);
+              const historyBlocks = loadHistoryFromActiveAgents(report);
               commitResumedHistory(historyBlocks);
             } catch (e: any) {
               console.error("Failed to load history:", e);
@@ -1032,7 +1057,7 @@ export function App({
             if (outcome === "failed") return "retry" as const;
             if (outcome === "superseded") return;
             const currentStatus = await session.refreshStatus();
-            await refreshActorSessions(currentStatus ?? session.status);
+            await refreshActiveAgents(currentStatus ?? session.status);
             return;
           }
 
@@ -1087,7 +1112,7 @@ export function App({
                     model_effort: selectedEffort,
                   });
                   const currentStatus = await session.refreshStatus();
-                  await refreshActorSessions(currentStatus ?? session.status);
+                  await refreshActiveAgents(currentStatus ?? session.status);
                   messagesHook.addMessage({
                     kind: "system",
                     text: `Switched to model: ${item.value} · effort: ${selectedEffort}`,
@@ -1143,7 +1168,7 @@ export function App({
                     agent_type: currentAgentType,
                   });
                   const currentStatus = await session.refreshStatus();
-                  await refreshActorSessions(currentStatus ?? session.status);
+                  await refreshActiveAgents(currentStatus ?? session.status);
                   await refreshCapabilityAliases();
                 } else {
                   setPendingRuntime((current) =>
@@ -1238,7 +1263,7 @@ export function App({
               sessions.map((s) => ({
                 label: s.first_user_request_preview || s.goal_objective_preview || s.runner_id,
                 value: s.runner_id,
-                description: `${s.runner_id} | ${s.agent_mode || "agent"}/${s.permission_mode} | ${s.root_actor_name} | ${s.updated_at}`,
+                description: `${s.runner_id} | ${s.agent_mode || "agent"}/${s.permission_mode} | ${s.root_agent_name} | ${s.updated_at}`,
                 active: s.runner_id === currentRunnerId,
               })),
               async (item) => {
@@ -1248,8 +1273,8 @@ export function App({
                 });
                 const currentStatus = await session.refreshStatus();
                 messagesHook.clearMessages();
-                const report = await refreshActorSessions(currentStatus ?? session.status);
-                const historyBlocks = loadHistoryFromActorSessions(report);
+                const report = await refreshActiveAgents(currentStatus ?? session.status);
+                const historyBlocks = loadHistoryFromActiveAgents(report);
                 commitResumedHistory(historyBlocks);
               }
             );
@@ -1263,8 +1288,8 @@ export function App({
             return;
           }
 
-          if (result.interactiveAction === "actor-selector") {
-            handleToggleActors();
+          if (result.interactiveAction === "active-selector") {
+            handleToggleActive();
             return;
           }
 
@@ -1275,7 +1300,7 @@ export function App({
 
           if (result.syncSession) {
             const currentStatus = await session.refreshStatus();
-            await refreshActorSessions(currentStatus ?? session.status);
+            await refreshActiveAgents(currentStatus ?? session.status);
             // `/agents` completion is mode-scoped. Refresh it with the
             // authoritative post-switch Runner state rather than retaining
             // names collected before `/mode` changed the available workers.
@@ -1299,10 +1324,10 @@ export function App({
       // Only the still-current completion is allowed to refresh session state.
       if (outcome === "completed") {
         const refreshedStatus = await session.refreshStatus();
-        await refreshActorSessions(refreshedStatus ?? currentStatus);
+        await refreshActiveAgents(refreshedStatus ?? currentStatus);
       }
     },
-    [applyDeferredModelSwitch, activeActorName, baseDir, client, ensureSession, messagesHook, openConfigPanel, pendingRuntime, queuedMessages.length, refreshActorSessions, refreshCapabilityAliases, requestModeSwitch, runtimeModels, selector, session]
+    [applyDeferredModelSwitch, activeAgentName, baseDir, client, ensureSession, messagesHook, openConfigPanel, pendingRuntime, queuedMessages.length, refreshActiveAgents, refreshCapabilityAliases, requestModeSwitch, runtimeModels, selector, session]
   );
 
   const queueFlushInFlight = useRef(false);
@@ -1424,7 +1449,7 @@ export function App({
         agent_type: currentAgentType,
       });
       const currentStatus = await session.refreshStatus();
-      await refreshActorSessions(currentStatus ?? session.status);
+      await refreshActiveAgents(currentStatus ?? session.status);
       await refreshCapabilityAliases();
     } else {
       setPendingRuntime((current) =>
@@ -1438,56 +1463,60 @@ export function App({
         })
       );
     }
-  }, [baseDir, client, pendingRuntime.agent_mode, pendingRuntime.agent_type, pendingRuntime.model_effort, pendingRuntime.model_name, pendingRuntime.permission_mode, refreshActorSessions, refreshCapabilityAliases, session, setPendingRuntime]);
+  }, [baseDir, client, pendingRuntime.agent_mode, pendingRuntime.agent_type, pendingRuntime.model_effort, pendingRuntime.model_name, pendingRuntime.permission_mode, refreshActiveAgents, refreshCapabilityAliases, session, setPendingRuntime]);
 
   const handleEscape = useCallback(() => {
-    if (activeActorName) {
-      setActiveActorName(null);
+    if (activeAgentName) {
+      setActiveAgentName(null);
       return;
     }
     completion.dismiss();
-  }, [activeActorName, completion]);
+  }, [activeAgentName, completion]);
 
   const handleExit = useCallback(() => {
-    if (activeActorName) {
-      client.interruptActor({ actor_name: activeActorName }).then((result) => {
+    const action = resolveCtrlCAction({ streaming: messagesHook.streaming, activeAgentName });
+    if (action === "ignore") {
+      return;
+    }
+    if (action === "interrupt-agent" && activeAgentName) {
+      client.interruptAgent({ agent_name: activeAgentName }).then((result) => {
         messagesHook.addMessage({
           kind: result.interrupted ? "system" : "error",
           text: result.interrupted
-            ? `Interrupted ${activeActorName}`
-            : `Actor interrupt skipped for ${activeActorName}: ${result.status}`,
+            ? `Interrupted ${activeAgentName}`
+            : `Agent interrupt skipped for ${activeAgentName}: ${result.status}`,
         });
-        return refreshActorSessions(session.status);
+        return refreshActiveAgents(session.status);
       }).catch((e: any) => {
         messagesHook.addMessage({
           kind: "error",
-          text: `Actor interrupt failed: ${e.message || String(e)}`,
+          text: `Agent interrupt failed: ${e.message || String(e)}`,
         });
       });
       return;
     }
     setExitRequested(true);
     client.stopSession().catch(() => {});
-  }, [activeActorName, client, messagesHook, refreshActorSessions, session.status]);
+  }, [activeAgentName, client, messagesHook, messagesHook.streaming, refreshActiveAgents, session.status]);
 
-  const handleToggleActors = useCallback(async () => {
+  const handleToggleActive = useCallback(async () => {
     if (selector.isOpen) {
       selector.close();
       return;
     }
-    const selectActorItem = async (item: SelectorItem) => {
-      if (item.value === "__empty_actor_sessions__") {
+    const selectAgentItem = async (item: SelectorItem) => {
+      if (item.value === "__empty_agent_sessions__") {
         return;
       }
-      setActiveActorName(item.value ? item.value : null);
+      setActiveAgentName(item.value ? item.value : null);
     };
 
     selector.open(
-      ACTOR_SELECTOR_TITLE,
-      buildActorSelectorItems(actorSessionsReport, activeActorName),
-      selectActorItem
+      ACTIVE_SELECTOR_TITLE,
+      buildActiveSelectorItems(activeAgentsReport, activeAgentName),
+      selectAgentItem
     );
-  }, [selector, actorSessionsReport, activeActorName]);
+  }, [selector, activeAgentsReport, activeAgentName]);
 
   // /tasks 与 Ctrl+T 都走这里。打开后立刻拉一次最新任务，确保面板看到的是新鲜数据。
   const handleToggleTasks = useCallback(async () => {
@@ -1628,13 +1657,13 @@ export function App({
         if (plan.selfEvolutionChange) {
           await client.setSelfEvolutionConfig({ base_dir: baseDir, ...plan.selfEvolutionChange });
         }
-        if (plan.graphsChange) {
-          await client.setGraphsConfig({ base_dir: baseDir, ...plan.graphsChange });
+        if (plan.workflowsChange) {
+          await client.setWorkflowsConfig({ base_dir: baseDir, ...plan.workflowsChange });
         }
         dismissConfigPanel();
         if (hasLiveSession) {
           const currentStatus = await session.refreshStatus();
-          await refreshActorSessions(currentStatus ?? session.status);
+          await refreshActiveAgents(currentStatus ?? session.status);
           if (plan.switchAgentMode) {
             await refreshCapabilityAliases();
           }
@@ -1663,7 +1692,7 @@ export function App({
         });
       }
     },
-    [baseDir, client, dismissConfigPanel, messagesHook, pendingRuntime.permission_mode, refreshActorSessions, refreshCapabilityAliases, session],
+    [baseDir, client, dismissConfigPanel, messagesHook, pendingRuntime.permission_mode, refreshActiveAgents, refreshCapabilityAliases, session],
   );
 
   const handleSkillsConfigSave = useCallback(
@@ -1674,7 +1703,7 @@ export function App({
         setSkillsConfigPanel(null);
         if (session.status) {
           const currentStatus = await session.refreshStatus();
-          await refreshActorSessions(currentStatus ?? session.status);
+          await refreshActiveAgents(currentStatus ?? session.status);
         }
         messagesHook.addMessage({
           kind: "system",
@@ -1687,7 +1716,7 @@ export function App({
         });
       }
     },
-    [baseDir, client, messagesHook, refreshActorSessions, refreshCapabilityAliases, session],
+    [baseDir, client, messagesHook, refreshActiveAgents, refreshCapabilityAliases, session],
   );
 
   const handleCandidateUp = useCallback(() => {
@@ -1703,8 +1732,8 @@ export function App({
   // IntroPanel 始终显示（只要有 session），不管消息多少。
   // runtimeReady 在 init() 完成（成功或失败）后才会置为 true，
   // 这样首屏不会出现 "unknown-model · disabled" 的半成品状态。
-  const showIntroPanel = shouldShowIntroPanel({ introPanel, activeActorName, runtimeReady });
-  const actorViewHint = buildActorViewHint(activeActorName);
+  const showIntroPanel = shouldShowIntroPanel({ introPanel, activeAgentName, runtimeReady });
+  const activeViewHint = buildActiveViewHint(activeAgentName);
 
   // Ink broadcasts each keypress to every active useInput subscriber. Keep
   // overlay prompts and the main composer mutually exclusive so Enter/Esc
@@ -1750,13 +1779,13 @@ export function App({
   // Ink 的 clearTerminal 灾难分支。
   const transcriptRows = useMemo<RowVM[]>(() => {
     const cols = terminalColumns || 80;
-    if (activeActorName !== null) {
+    if (activeAgentName !== null) {
       // actor 只读视图：banner + 该 actor messages（visibleMessages 已是 actor transcript）
       const bannerRow: RowVM = {
         key: "actor-banner",
         prefix: "",
         prefixColor: "",
-        text: actorViewHint || `Viewing: ${activeActorName}`,
+        text: activeViewHint || `Viewing: ${activeAgentName}`,
         textColor: "#888888",
         dim: true,
       };
@@ -1766,15 +1795,15 @@ export function App({
       showIntroPanel && runtimeReady ? flattenIntroToRows(introPanel, cols) : [];
     const msgRows = flattenBlocksToRows(visibleMessages, cols, (b, i) => b.id ?? `m${i}`);
     return [...introRows, ...msgRows];
-    // actorViewHint / introPanel 是每帧重算的轻量对象，纳入依赖确保内容变化即重算。
+    // activeViewHint / introPanel 是每帧重算的轻量对象，纳入依赖确保内容变化即重算。
   }, [
-    activeActorName,
+    activeAgentName,
     visibleMessages,
     showIntroPanel,
     runtimeReady,
     introPanel,
     terminalColumns,
-    actorViewHint,
+    activeViewHint,
   ]);
 
   // streaming 期间独占 ESC / Ctrl+C：立即恢复 composer 并通知后端停止。
@@ -1801,6 +1830,7 @@ export function App({
     },
     { isActive: configPanelLoading }
   );
+
   const currentWorkStatusInteractive = !inputLayer.composerActive || completion.visible;
 
   if (exitRequested) {
@@ -1824,6 +1854,8 @@ export function App({
           行级摊平 + 窗口裁剪，渲染行数恒 ≤ viewportHeight，永不触发 Ink 的
           clearTerminal 灾难分支。历史回看靠应用内滚动（PgUp/PgDn），不碰原生
           scrollback，从根上消除「重复显示 + 滚动上滑」竞态。 */}
+
+
       <Box
         flexDirection="column"
         paddingX={1}
@@ -1978,7 +2010,7 @@ export function App({
             onCycleMode={handleCycleMode}
             onEscape={handleEscape}
             onExit={handleExit}
-            onToggleActors={handleToggleActors}
+            onToggleActors={handleToggleActive}
             onToggleTasks={handleToggleTasks}
             onCandidateUp={handleCandidateUp}
             onCandidateDown={handleCandidateDown}
@@ -1990,7 +2022,7 @@ export function App({
             completionVisible={completion.visible}
             ghostText={completion.ghostText}
             inlineHint={completion.inlineHint}
-            actorViewHint={actorViewHint}
+            activeViewHint={activeViewHint}
             asyncRunningCount={asyncTasks.length}
           />
         </Box>

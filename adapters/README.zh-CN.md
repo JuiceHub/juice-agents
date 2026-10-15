@@ -26,7 +26,7 @@ Web 服务默认监听 `127.0.0.1:8003`。它提供会话和模型状态、工�
 CLI / Web ── JSON-RPC / HTTP / WebSocket ──> adapters ──> juice_agents Runner
 ```
 
-- 依赖只能从 `adapters` 指向 `juice_agents`。新增协议入口放在 `adapters/` 的独立子目录；不要在接入层复制 Runner、Agent、Graph 或配置存储逻辑。
+- 依赖只能从 `adapters` 指向 `juice_agents`。新增协议入口放在 `adapters/` 的独立子目录；不要在接入层复制 Runner、Agent、Workflow 或配置存储逻辑。
 - stdio 的 stdout 只承载 JSON-RPC；日志写 stderr。stdio 和 WebSocket 共用事件序列化，原样透传 Runner 的 Team 任务状态、session 标题预览及模型能力信息。
 - 工作区配置只读写 `.juice/config.yaml`，通过 SDK 的配置接口持久化。冷查询 Plugin、Skill 和 Team 配置时不创建 Runner；仅在已有 Runner 上重装配变更。
 - Web 服务没有身份认证，仅允许监听 loopback 地址；HTTP/WebSocket 的 Host 与浏览器 WebSocket 的 Origin 均须限制为本机。文件预览只能读取工作区内路径，符号链接目录不能展开到工作区外。

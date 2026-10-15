@@ -27,8 +27,6 @@ export const WEB_SLASH_COMMANDS: CompletionCandidate[] = [
   { label: "/cron", description: "Manage scheduled prompts" },
   { label: "/skills", description: "List or view local skills" },
   { label: "/plugins", description: "List or view installed plugins" },
-  { label: "/graph", description: "List, inspect, run, or control graphs" },
-  { label: "/deep-research", description: "Run deep_research with a plain question" },
   { label: "/permissions", description: "Inspect permission rules" },
   { label: "/sessions", description: "List runner threads" },
   { label: "/clear", description: "Clear visible transcript" },
@@ -71,29 +69,6 @@ const CRON_OPTIONS: CompletionCandidate[] = [
   { label: "status", description: "Show scheduler status" },
 ];
 
-const GRAPH_OPTIONS: CompletionCandidate[] = [
-  { label: "list", description: "List available graphs" },
-  { label: "view", description: "View one graph source" },
-  { label: "run", description: "Run one graph" },
-  { label: "runs", description: "List persisted graph runs" },
-  { label: "pause", description: "Pause a graph run" },
-  { label: "resume", description: "Resume a graph run" },
-  { label: "stop", description: "Stop a graph run" },
-  { label: "restart", description: "Restart a graph run" },
-];
-
-const GRAPH_NAME_OPTIONS: CompletionCandidate[] = [
-  { label: "deep_research", description: "Cross-checked research report" },
-];
-
-const RESEARCH_SOURCE_OPTIONS: CompletionCandidate[] = [
-  { label: "--web", description: "Use web sources (default)" },
-  { label: "--workspace", description: "Use workspace sources" },
-  { label: "--web-workspace", description: "Use web and workspace sources" },
-  { label: '{"question":"","source_mode":"web"}', description: "Advanced JSON payload" },
-  { label: '{"question":"","source_mode":"workspace"}', description: "Advanced JSON payload" },
-  { label: '{"question":"","source_mode":"web_workspace"}', description: "Advanced JSON payload" },
-];
 
 interface CursorToken {
   token: string;
@@ -167,9 +142,9 @@ export function getWebCommandCandidates(params: {
   const context = input.slice(0, clampCursor(input, params.cursor));
   const firstTokenStart = input.search(/\S|$/);
   if (token.start === firstTokenStart && token.token.startsWith("$")) {
-    const graphCandidates = [{ label: "$graph:deep_research", description: "Graph" }];
-    if (token.token.toLowerCase().startsWith("$graph:")) {
-      return prefixFilter(graphCandidates, token.token);
+    const workflowCandidates = [{ label: "$workflow:deep_research", description: "Workflow" }];
+    if (token.token.toLowerCase().startsWith("$workflow:")) {
+      return prefixFilter(workflowCandidates, token.token);
     }
     const skillAliases = collectSkillAliases(params.skills || []);
     const skillCandidates = skillAliases.map((name) => ({ label: `$${name}`, description: "Skill" }));
@@ -177,7 +152,7 @@ export function getWebCommandCandidates(params: {
     const pluginCandidates = [...new Set((params.plugins || []).map((plugin) => plugin.name).filter(Boolean))]
       .map((name) => ({ label: `$${name}`, description: "Plugin" }))
       .filter((item) => !skillLabels.has(item.label.toLowerCase()));
-    return prefixFilter([...skillCandidates, ...pluginCandidates, ...graphCandidates], token.token);
+    return prefixFilter([...skillCandidates, ...pluginCandidates, ...workflowCandidates], token.token);
   }
   const normalized = token.token.startsWith("/")
     ? token.token
@@ -188,7 +163,17 @@ export function getWebCommandCandidates(params: {
   const skillAliases = collectSkillAliases(params.skills || []);
   const hasTrailingWhitespace = /\s$/.test(context);
 
-  if (parts.length === 1) {
+  // 无参数命令列表：输入完整后不再显示候选，允许历史导航
+  const COMMANDS_WITHOUT_PARAMS = new Set([
+    "/help", "/status", "/models", "/clear", "/sessions",
+  ]);
+
+  if (parts.length === 1 && !hasTrailingWhitespace) {
+    const prefix = parts[0].toLowerCase();
+    // 对于无参数命令，完全匹配时关闭候选列表，让用户可以使用方向键切换历史
+    if (COMMANDS_WITHOUT_PARAMS.has(prefix)) {
+      return [];
+    }
     return prefixFilter(WEB_SLASH_COMMANDS, parts[0]);
   }
 
@@ -198,13 +183,6 @@ export function getWebCommandCandidates(params: {
   if (parts[0] === "/memory" && parts.length === 2) return prefixFilter(MEMORY_OPTIONS, parts[1]);
   if (parts[0] === "/goal" && parts.length === 2) return prefixFilter(GOAL_OPTIONS, parts[1]);
   if ((parts[0] === "/cron" || parts[0] === "/loop") && parts.length === 2) return prefixFilter(CRON_OPTIONS, parts[1]);
-  if (parts[0] === "/graph" && parts.length === 2) return prefixFilter(GRAPH_OPTIONS, parts[1]);
-  if (parts[0] === "/graph" && ["view", "run"].includes(parts[1] || "") && parts.length === 3 && !hasTrailingWhitespace) {
-    return prefixFilter(GRAPH_NAME_OPTIONS, parts[2]);
-  }
-  if (parts[0] === "/deep-research" && ((parts.length === 1 && hasTrailingWhitespace) || parts.length === 2)) {
-    return prefixFilter(RESEARCH_SOURCE_OPTIONS, parts[1] || "");
-  }
   if (parts[0] === "/agents" && parts.length === 2) {
     const names = [...new Set((params.availableAgentNames || []).filter(Boolean))];
     return prefixFilter(names.map((label) => ({ label, description: "Available agent" })), parts[1]);

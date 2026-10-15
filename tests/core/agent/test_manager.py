@@ -15,7 +15,7 @@ from juice_agents.core.agent.manager import (
     AgentManagerCallbacks,
     AgentStatus,
 )
-from juice_agents.core.agent.sessions import ActionStep, AgentSession, TaskStep
+from juice_agents.core.agent.context import ActionStep, ContextTree, TaskStep
 
 
 class _ScriptedAgent:
@@ -25,7 +25,7 @@ class _ScriptedAgent:
         self.name = name
         self.agent_id = ""
         self.max_steps = 1
-        self.session = AgentSession(system_prompt=f"system for {name}")
+        self.context = ContextTree(tree_id=f"test_{name}", system_prompt=f"system for {name}")
         self.wait_for_cancel = wait_for_cancel
         self.cancel_event: threading.Event | None = None
         self.step_started = threading.Event()
@@ -90,7 +90,7 @@ def test_root_is_lazily_acquired_fresh_and_restores_session(tmp_path: Path) -> N
     resumed = _manager(tmp_path, registry).acquire_root({"name": "root"})
     assert len(registry.instances) == 2  # resume never revives the released object
     assert resumed.instance is not registry.instances[0]
-    assert [step.task for step in resumed.session.steps if isinstance(step, TaskStep)] == ["first request"]
+    assert [step.task for step in resumed.context.steps if isinstance(step, TaskStep)] == ["first request"]
     assert resumed.status is AgentStatus.READY
 
 
@@ -112,7 +112,10 @@ def test_functional_agent_is_released_but_transcript_remains_inspectable(tmp_pat
     snapshot = manager.load_snapshot(worker.agent_id)
     assert snapshot is not None
     assert snapshot["status"] == "released"
-    assert [step["task"] for step in snapshot["session"]["steps"] if step["type"] == "task"] == ["do work"]
+    # 从新的序列化格式中提取任务
+    tree = manager.deserialize_snapshot(snapshot)
+    tasks = [step.task for step in tree.steps if isinstance(step, TaskStep)]
+    assert tasks == ["do work"]
     report = manager.describe_sessions()
     assert report["agents"][0]["agent_id"] == worker.agent_id
 
@@ -137,7 +140,7 @@ def test_persistent_agent_reuses_live_instance_and_checkpoints_each_step(tmp_pat
         tmp_path,
         registry,
         callbacks=AgentManagerCallbacks(
-            after_persist=lambda snapshot: persisted_steps.append(len(snapshot["session"]["steps"])),
+            after_persist=lambda snapshot: persisted_steps.append(len(snapshot["session"]["nodes"])),
         ),
     )
 
@@ -147,7 +150,7 @@ def test_persistent_agent_reuses_live_instance_and_checkpoints_each_step(tmp_pat
     assert manager.run(first, "one") == "output:planner"
     assert manager.run(second, "two") == "output:planner"
 
-    tasks = [step.task for step in first.session.steps if isinstance(step, TaskStep)]
+    tasks = [step.task for step in first.context.steps if isinstance(step, TaskStep)]
     assert tasks == ["one", "two"]
     assert len(registry.instances) == 1
     assert max(persisted_steps) >= 4  # task + action are checkpointed for both rounds

@@ -15,7 +15,7 @@ name / config ──> resolve() ──> validate() ──> instantiate() ──>
 | --- | --- | --- |
 | `AgentRegistry` | Agent YAML and class selection | `AgentManager` |
 | `ToolRegistry` | Tool declaration and class mapping | `ToolManager` |
-| `GraphRegistry` | Graph source validation | `GraphRunManager` |
+| `WorkflowRegistry` | Workflow source validation | `WorkflowRunManager` |
 | `SkillRegistry` / `PluginRegistry` | metadata discovery | requesting Manager |
 | `TeamRegistry` | Team relationship declaration | Runner capability dispatch |
 
@@ -24,7 +24,7 @@ references or live objects. `instantiate()` always returns a fresh object;
 execution, cancellation and persistence are Manager responsibilities.
 
 Workspace declarations live under `.juice/agents`, `.juice/tools`,
-`.juice/graphs`, `.juice/skills` and `.juice/teams`. They are never copied
+`.juice/workflows`, `.juice/skills` and `.juice/teams`. They are never copied
 into a Runner snapshot.
 
 Team declarations use `.juice/teams/<team_name>/manifest.yaml`. They can be
@@ -53,7 +53,7 @@ That inspection scope does not expand Team dispatch or Agent write authority.
 
 ## Development conventions
 
-- Registry only implements `resolve()`, `validate()`, and `instantiate()`. The first two must not import executable Graph/Plugin code or create sessions; the third returns a fresh object every time without caching or executing it.
+- Registry only implements `resolve()`, `validate()`, and `instantiate()`. The first two must not import executable Workflow/Plugin code or create sessions; the third returns a fresh object every time without caching or executing it.
 - Write declarations atomically. Keep static Agent and Team definitions separate from Runner/Manager sessions, tasks, and tool records; do not silently migrate the old layout.
 - An omitted `allowed_modes` allows every mode; an explicit value is a non-empty list and may contain custom mode names. Reuse `agents.availability.is_agent_available()` for availability. `root` exists only in Runner memory and must not be written to YAML or listed by `/agents`.
 - When deleting a shared Agent referenced by a Team, or removing its Team availability, report every referencing Team. Put tests in `tests/core/registry/` covering independent validation, fresh construction, and the absence of live state.

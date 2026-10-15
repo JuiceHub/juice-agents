@@ -6,7 +6,7 @@ from typing import Any, Literal, TypedDict
 
 from juice_agents.core.agent.attachments import AsyncTaskNotification, RuntimeEvent
 
-AsyncTaskKind = Literal["agent_dispatch", "shell_command", "graph_run", "teammate"]
+AsyncTaskKind = Literal["agent_dispatch", "shell_command", "workflow_run", "teammate"]
 AsyncTaskStatus = Literal["pending", "running", "completed", "failed", "killed"]
 # Scope kinds are declarative RunnerConfig identifiers, including registered
 # custom configuration templates.
@@ -65,14 +65,14 @@ class TeammateAsyncTaskState(AsyncTaskStateBase, total=False):
     kind: Literal["teammate"]
 
 
-class GraphRunAsyncTaskState(AsyncTaskStateBase, total=False):
-    kind: Literal["graph_run"]
+class WorkflowRunAsyncTaskState(AsyncTaskStateBase, total=False):
+    kind: Literal["workflow_run"]
 
 
 AsyncTaskState = (
     AgentDispatchAsyncTaskState
     | ShellCommandAsyncTaskState
-    | GraphRunAsyncTaskState
+    | WorkflowRunAsyncTaskState
     | TeammateAsyncTaskState
 )
 
@@ -113,7 +113,7 @@ __all__ = [
     "RunnerScopeKind",
     "RunnerScopeStatus",
     "RuntimeEvent",
-    "GraphRunAsyncTaskState",
+    "WorkflowRunAsyncTaskState",
     "ShellCommandAsyncTaskState",
     "TeammateAsyncTaskState",
 ]

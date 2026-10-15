@@ -11,7 +11,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SDK_ROOT = REPO_ROOT / "sdk"
 CORE_SOURCE = REPO_ROOT / "sdk" / "src" / "juice_agents" / "core"
 MODULES = {
-    "agent", "cron", "exporter", "graph", "group", "managers", "memory",
+    "agent", "cron", "workflow", "group", "managers", "memory",
     "models", "permissions", "prebuilt", "registry", "runner", "team",
 }
 MARKDOWN_LINK = re.compile(r"\[[^]]+\]\(([^)]+)\)")

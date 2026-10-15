@@ -682,7 +682,7 @@ class _ToolExecutionEngine:
                         for method in (
                             "launch_local_agent",
                             "launch_local_bash",
-                            "launch_local_graph",
+                            "launch_local_workflow",
                             "launch_async_task",
                         )
                     )

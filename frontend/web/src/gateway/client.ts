@@ -262,26 +262,6 @@ export class WebGatewayClient {
     return this.command<SessionSummary[]>("list_sessions", { base_dir: baseDir });
   }
 
-  listGraphs(baseDir: string): Promise<Record<string, unknown>> {
-    return this.command("list_graphs", { base_dir: baseDir });
-  }
-
-  viewGraph(baseDir: string, name: string): Promise<Record<string, unknown>> {
-    return this.command("view_graph", { base_dir: baseDir, name });
-  }
-
-  runGraph(baseDir: string, name: string, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
-    return this.command("run_graph", { base_dir: baseDir, name, payload });
-  }
-
-  listGraphRuns(baseDir: string): Promise<Record<string, unknown>> {
-    return this.command("list_graph_runs", { base_dir: baseDir });
-  }
-
-  controlGraphRun(baseDir: string, graphRunId: string, action: string): Promise<Record<string, unknown>> {
-    return this.command("control_graph_run", { base_dir: baseDir, graph_run_id: graphRunId, action });
-  }
-
   permissionStatus(baseDir: string): Promise<Record<string, unknown>> {
     return this.command("permission_status", { base_dir: baseDir });
   }
@@ -350,8 +330,8 @@ export class WebGatewayClient {
     return this.command<SkillsConfigStatusResponse>("set_skills_config", params);
   }
 
-  graphsConfigStatus(baseDir: string): Promise<{ success: boolean; enabled: boolean }> {
-    return this.command("graphs_config_status", { base_dir: baseDir });
+  workflowsConfigStatus(baseDir: string): Promise<{ success: boolean; enabled: boolean }> {
+    return this.command("workflows_config_status", { base_dir: baseDir });
   }
 
   selfEvolutionConfigStatus(baseDir: string): Promise<{ success: boolean; enabled: boolean }> {

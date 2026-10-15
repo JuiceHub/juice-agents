@@ -9,7 +9,7 @@ flowchart LR
   R[Registry\nstatic definitions] -->|instantiate fresh| M[Manager\nlive runtime + persistence]
   U[Runner request] --> M
   M --> T[ToolManager\nguards · pool · audit]
-  M --> G[GraphRunManager\ninstance · checkpoint · result]
+  M --> W[WorkflowRunManager\nfunction call · artifacts]
   M --> A[AsyncTaskManager\ntasks · processes · notifications]
   M --> Tm[TeamManager\ntask board · inbox · members]
 ```
@@ -17,7 +17,7 @@ flowchart LR
 | Manager | Owns | Durable data | Recovery behavior |
 | --- | --- | --- | --- |
 | `ToolManager` | tool pool, bound permission/cancel context, call records | `tool_calls.jsonl` | restores audit identifiers only; never recreates a Tool from an audit record |
-| `GraphRunManager` | live graph instance, run lock/future, cancel event | manifest, source snapshot, events, checkpoint, result | active runs become `stopped(stale_on_resume)`; an explicit resume builds fresh |
+| `WorkflowRunManager` | workflow context, inner agent dispatcher, artifacts | artifacts in `<runner_root>/workflows/<name>-<id>/` | stateless function call; no persistence or recovery |
 | `AsyncTaskManager` | task state, pool, subprocesses, notifications and task-output access | `registry.json`, task output files | active opaque callbacks become `killed(stale_on_recovery)`; notifications are replayed |
 | `TeamManager` | Team tasks, dependencies, eligibility, claims, inboxes, members and finish gate | `team.json` | failed member work remains `in_progress` with an error for root review; saved message IDs can be reconciled and acknowledged |
 

@@ -50,8 +50,8 @@ from juice_agents.core.agent.tools.builtin.web.browser import (
 from juice_agents.core.agent.tools.builtin.scheduling.schedules_tools import CronCreateTool, CronDeleteTool, CronListTool
 from juice_agents.core.agent.tools.builtin.code_execution.code_tools import PythonTool, ShellTool
 from juice_agents.core.agent.tools.builtin.filesystem.files_tools import EditTool, GlobTool, GrepTool, ReadTool, WriteTool
-from juice_agents.core.agent.tools.builtin.graphs.graphs_tools import GraphListTool, GraphTool, GraphViewTool
-from juice_agents.core.agent.tools.builtin.evolution.graph_manage import GraphManageTool
+from juice_agents.core.agent.tools.builtin.workflows.workflows_tools import WorkflowListTool, WorkflowRunTool, WorkflowViewTool
+from juice_agents.core.agent.tools.builtin.evolution.workflow_manage import WorkflowManageTool
 from juice_agents.core.agent.tools.builtin.images.attachments_tools import AddImageTool
 from juice_agents.core.agent.tools.builtin.output.completion_tools import SubmitOutputTool
 from juice_agents.core.agent.tools.builtin.planning.planning_tools import ExitPlanTool, PlanTool, TodosTool
@@ -117,10 +117,10 @@ def get_default_tool_factories() -> dict[str, Callable[..., Tool]]:
         "exit_worktree": ExitWorktreeTool,
         "list_worktrees": ListWorktreesTool,
         "worktree_status": WorktreeStatusTool,
-        "graph_tool": GraphTool,
-        "graph_list": GraphListTool,
-        "graph_view": GraphViewTool,
-        "graph_manage": GraphManageTool,
+        "workflow_run": WorkflowRunTool,
+        "workflow_list": WorkflowListTool,
+        "workflow_view": WorkflowViewTool,
+        "workflow_manage": WorkflowManageTool,
         "read": ReadTool,
         "write": WriteTool,
         "edit": EditTool,

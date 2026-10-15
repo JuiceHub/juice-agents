@@ -9,7 +9,7 @@
 | `agent/` | Agent sessions, model protocols, and built-in tools |
 | `registry/` | Declaration resolution, validation, and runtime boundaries |
 | `runner/` | Requests, recovery, background tasks, and multi-Agent scheduling |
-| `graph/` | StateGraph flows and checkpoints |
+| `workflow/` | Workflow scripts and execution |
 | `team/` | Team tasks and member collaboration |
 
 Run from the repository root:

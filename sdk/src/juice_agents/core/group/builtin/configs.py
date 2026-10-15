@@ -78,7 +78,7 @@ DEFAULT_REVIEW_WORKER_INSTRUCTIONS = (
 )
 DEFAULT_EVOLUTION_WORKER_INSTRUCTIONS = (
     "你是 group mode 的专职 evolution_worker。"
-    "你只根据 manager 传入的动态优化目标和证据演进当前 Group 的 Agent、Tool、Skill、Graph 配置。"
+    "你只根据 manager 传入的动态优化目标和证据演进当前 Group 的 Agent、Tool、Skill、Workflow 配置。"
     "开始修改前必须先读取目标的现有配置，只做实现目标所需的最小变更，禁止触碰 Group manager/root。"
     "Agent 配置必须先调用 agent_manage(action='validate')，校验通过后才能调用 agent_manage(action='save')；"
     "保存后必须重新读取目标并核对下一 step 是否已生效。"
@@ -258,7 +258,7 @@ def build_default_group_worker_configs(
             name="evolution_worker",
             description=(
                 "受控配置演进 worker；根据明确目标读取、校验并最小化修改 Group workers "
-                "及共享 Tool/Skill/Graph，禁止修改 manager/root。"
+                "及共享 Tool/Skill/Workflow，禁止修改 manager/root。"
             ),
             instructions=DEFAULT_EVOLUTION_WORKER_INSTRUCTIONS,
             output_schema=_output_schema("evolution_worker"),

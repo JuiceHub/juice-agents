@@ -178,32 +178,23 @@ class RpcHandlers:
         }
         return self._runtime.list_async_tasks(statuses=statuses or None)
 
-    def handle_list_graphs(self, params: dict[str, Any]) -> dict[str, Any]:
-        return self._bootstrap_runtime(params).list_graphs()
+    def handle_list_workflows(self, params: dict[str, Any]) -> dict[str, Any]:
+        return self._bootstrap_runtime(params).list_workflows()
 
-    def handle_view_graph(self, params: dict[str, Any]) -> dict[str, Any]:
-        return self._bootstrap_runtime(params).view_graph(str(params.get("name") or ""))
+    def handle_view_workflow(self, params: dict[str, Any]) -> dict[str, Any]:
+        return self._bootstrap_runtime(params).view_workflow(str(params.get("name") or ""))
 
-    def handle_run_graph(self, params: dict[str, Any]) -> dict[str, Any]:
-        payload = params.get("payload") or {}
+    def handle_run_workflow(self, params: dict[str, Any]) -> dict[str, Any]:
+        args = params.get("args") or {}
         config = params.get("config")
-        if not isinstance(payload, dict):
-            raise ValueError("payload 必须为 object")
+        if not isinstance(args, dict):
+            raise ValueError("args 必须为 object")
         if config is not None and not isinstance(config, dict):
             raise ValueError("config 必须为 object")
-        return self._bootstrap_runtime(params).run_graph(
+        return self._bootstrap_runtime(params).run_workflow(
             str(params.get("name") or ""),
-            payload,
+            args,
             config,
-        )
-
-    def handle_list_graph_runs(self, params: dict[str, Any]) -> dict[str, Any]:
-        return self._bootstrap_runtime(params).list_graph_runs()
-
-    def handle_control_graph_run(self, params: dict[str, Any]) -> dict[str, Any]:
-        return self._bootstrap_runtime(params).control_graph_run(
-            str(params.get("graph_run_id") or ""),
-            str(params.get("action") or ""),
         )
 
     def handle_permission_status(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -423,15 +414,15 @@ class RpcHandlers:
             enabled=bool(params.get("enabled")),
         )
 
-    def handle_graphs_config_status(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Return the workspace automatic-Graph switch."""
+    def handle_workflows_config_status(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Return the workspace automatic-workflow switch."""
 
-        return self._bootstrap_runtime(params).graphs_config_status()
+        return self._bootstrap_runtime(params).workflows_config_status()
 
-    def handle_set_graphs_config(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Persist Graph tool visibility and reload a live runner."""
+    def handle_set_workflows_config(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Persist workflow tool visibility and reload a live runner."""
 
-        return self._bootstrap_runtime(params).set_graphs_config(enabled=bool(params.get("enabled")))
+        return self._bootstrap_runtime(params).set_workflows_config(enabled=bool(params.get("enabled")))
 
     def handle_plugins_config_status(self, params: dict[str, Any]) -> dict[str, Any]:
         """Return editable plugin enablement state."""
@@ -492,6 +483,31 @@ class RpcHandlers:
             model_effort=params.get("model_effort"),
         )
         return _serialize_session_status(status)
+
+    def handle_switch_strategy(self, params: dict[str, Any]) -> dict[str, Any]:
+        """切换 Agent 的探索策略
+
+        统一使用 breadth/depth/beam_width 参数配置策略。
+
+        Args:
+            params: 包含策略参数的字典
+                - breadth: 每步展开分支数 (int 或 list)
+                - depth: 最大探索深度
+                - beam_width: 每步保留路径数
+                - reset: 是否重置为默认贪心策略
+
+        Returns:
+            包含策略切换状态和信息的字典
+        """
+        runtime = self._bootstrap_runtime(params)
+
+        # 提取策略参数（移除 base_dir 等非策略参数）
+        strategy_params = {
+            k: v for k, v in params.items()
+            if k not in ("base_dir", "runtime_config_path")
+        }
+
+        return runtime.switch_strategy(strategy_params)
 
     def handle_stop_session(self, params: dict[str, Any]) -> dict[str, bool]:
         """Stop active backend work for the current session before CLI exit."""

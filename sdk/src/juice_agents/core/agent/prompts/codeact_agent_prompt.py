@@ -43,7 +43,7 @@ CODEACT_PROTOCOL_SECTION_EN = PromptSection(
 - If you see `<attachments>`, runtime injected external information such as background async task notifications or inbox messages. Treat attachments like observations and include them in later reasoning.
 - Background async tasks are truly asynchronous: they return a receipt immediately and do not block. Task completion is pushed via `<attachments>` as `async_task_notification` in a later step.
 - A background async task start receipt is not the result. `async_task_notification.summary` is runtime status; `async_task_notification.result` is the actual subtask output.
-- Do not read task files or poll after launch. End the current round and wait for the completion notification. To cancel a task, use `async_task_stop(async_task_id)`.
+- Do not read task files or poll after launch. To wait for the completion notification, call `submit_output` to end the current round and state what is running. To cancel a task, use `async_task_stop(async_task_id)`.
 - Finish by calling the `submit_output` tool from Python.
 - **Important**: Once you receive an `async_task_notification` in `<attachments>` and present the result to the user, you should call `submit_output` to complete the task. Do not repeat the same output in subsequent steps without new information or user requests.
 - If the model output lacks a valid `<code>` block, or `submit_output` validation fails, the next step in the same round will contain `<error>`. Fix the protocol issue before continuing.
@@ -64,7 +64,7 @@ CODEACT_PROTOCOL_SECTION_ZH = PromptSection(
 - 如果看到 `<attachments>`，表示 runtime 注入了外部信息，例如后台 async task 通知或 inbox 消息；它们和 observations 一样都要纳入后续推理。
 - 后台 async task 是真正异步的：启动后立即返回 receipt，不会阻塞本步。任务完成时会通过下一步的 `<attachments>` 推送 `async_task_notification`。
 - 后台 async task 启动回执不是最终结果；`async_task_notification.summary` 是运行时状态，`async_task_notification.result` 才是子任务实际产出。
-- 启动后不要读取任务文件或轮询；结束当前 round 并等待完成通知。想中止任务调用 `async_task_stop(async_task_id)`。
+- 启动后不要读取任务文件或轮询；要等待完成通知时，调用 `submit_output` 结束当前 round 并说明正在运行的任务。想中止任务调用 `async_task_stop(async_task_id)`。
 - 最终必须在 Python 中调用 `submit_output` 工具。
 - **重要**：一旦你在 `<attachments>` 中收到 `async_task_notification` 并向用户展示了结果，应该调用 `submit_output` 完成任务。不要在后续步骤中重复输出相同内容，除非有新信息或用户有新要求。
 - 如果模型输出缺少合法 `<code>` 块，或 `submit_output` 校验失败，同一 round 的下一 step 会收到 `<error>`；必须先修复协议问题再继续。
@@ -281,7 +281,7 @@ CODEACT_BACKGROUND_SHELL_SECTION_EN = PromptSection(
 {%- if tools.get("shell") %}
 # Background Shell Async Tasks
 - `shell(command="...", background=True)` starts a background shell async task. The current code block receives only the start receipt (with `async_task_id` and `output_dir`).
-- A synchronous `shell(...)` call is used unless `background=True` is explicitly passed. End the round and wait for the later `async_task_notification`.
+- A synchronous `shell(...)` call is used unless `background=True` is explicitly passed. Call `submit_output` to end the round and wait for the later `async_task_notification`.
 {%- endif %}
 """,
 )
@@ -293,7 +293,7 @@ CODEACT_BACKGROUND_SHELL_SECTION_ZH = PromptSection(
 {%- if tools.get("shell") %}
 # 后台 Shell 任务
 - `shell(command="...", background=True)` 会启动后台 shell async task；当前代码块只能拿到启动回执（含 `async_task_id` 和 `output_dir`）。
-- 未显式传入 `background=True` 的 `shell(...)` 仍是同步执行。后台结果会稍后通过 `async_task_notification` 到达；请结束当前 round 等待通知。
+- 未显式传入 `background=True` 的 `shell(...)` 仍是同步执行。后台结果会稍后通过 `async_task_notification` 到达；请调用 `submit_output` 结束当前 round 等待通知。
 {%- endif %}
 """,
 )

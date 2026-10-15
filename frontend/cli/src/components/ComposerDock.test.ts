@@ -121,7 +121,7 @@ test("surfaces actor view hint as transient text under the composer", () => {
     completionVisible: false,
     ghostText: null,
     inlineHint: null,
-    actorViewHint: "Viewing: researcher · interactive · Esc return",
+    activeViewHint: "Viewing: researcher · interactive · Esc return",
   });
 
   assert.equal(

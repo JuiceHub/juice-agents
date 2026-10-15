@@ -22,7 +22,7 @@ export type ConfigRowId =
   | "image"
   | "skills"
   | "self_evolution"
-  | "graphs"
+  | "workflows"
   | "agent_mode"
   | "agent_type"
   | "model"
@@ -37,7 +37,7 @@ export interface ConfigPanelDraft {
   imageEnabled: boolean;
   skillsEnabled: boolean;
   selfEvolutionEnabled: boolean;
-  graphsEnabled: boolean;
+  workflowsEnabled: boolean;
   disabledSkills: string[];
   skillsCount: number;
   permissionMode: string;
@@ -69,7 +69,7 @@ export interface ConfigApplyPlan {
   imageChanges: Array<{ enabled: boolean }>;
   skillsChange: { enabled: boolean; disabled: string[] } | null;
   selfEvolutionChange: { enabled: boolean } | null;
-  graphsChange: { enabled: boolean } | null;
+  workflowsChange: { enabled: boolean } | null;
   runtimePatch: {
     agent_mode?: string;
     agent_type?: string;
@@ -94,7 +94,7 @@ interface ConfigPanelProps {
 // 执行模式取值域；每个值由已注册的 ModeProfile 定义。
 const AGENT_MODE_OPTIONS = ["agent", "plan", "team", "group"];
 const AGENT_TYPE_OPTIONS = ["react", "codeact"];
-const STATIC_ROW_ORDER: ConfigRowId[] = ["memory", "dream", "browser", "image", "skills", "self_evolution", "graphs"];
+const STATIC_ROW_ORDER: ConfigRowId[] = ["memory", "dream", "browser", "image", "skills", "self_evolution", "workflows"];
 
 function boolLabel(value: boolean): string {
   return value ? "on" : "off";
@@ -139,7 +139,7 @@ export function createConfigPanelDraft(params: {
   models: RuntimeModelInfo[];
   skillsConfig?: SkillsConfigStatusResponse;
   selfEvolutionEnabled?: boolean;
-  graphsEnabled?: boolean;
+  workflowsEnabled?: boolean;
   workspaceConfig?: WorkspaceRuntimeConfig;
 }): ConfigPanelDraft {
   const runtime = params.workspaceConfig?.runtime || {};
@@ -162,7 +162,7 @@ export function createConfigPanelDraft(params: {
     imageEnabled: params.workspaceConfig?.image?.enabled === true,
     skillsEnabled: params.skillsConfig?.enabled !== false,
     selfEvolutionEnabled: params.selfEvolutionEnabled ?? (params.workspaceConfig?.self_evolution?.enabled !== false),
-    graphsEnabled: params.graphsEnabled ?? (params.workspaceConfig?.graphs?.enabled !== false),
+    workflowsEnabled: params.workflowsEnabled ?? (params.workspaceConfig?.workflows?.enabled !== false),
     disabledSkills: normalizeDisabledSkills([...disabledSkills]),
     skillsCount: params.skillsConfig?.skills?.length || 0,
     permissionMode,
@@ -197,8 +197,8 @@ export function changeConfigDraft(
   if (rowId === "self_evolution") {
     return { ...draft, selfEvolutionEnabled: !draft.selfEvolutionEnabled };
   }
-  if (rowId === "graphs") {
-    return { ...draft, graphsEnabled: !draft.graphsEnabled };
+  if (rowId === "workflows") {
+    return { ...draft, workflowsEnabled: !draft.workflowsEnabled };
   }
   if (rowId === "agent_mode") {
     const agentMode = cycleValue(AGENT_MODE_OPTIONS, draft.agentMode, direction);
@@ -260,8 +260,8 @@ export function buildConfigApplyPlan(
   const selfEvolutionChange = initialDraft.selfEvolutionEnabled !== draft.selfEvolutionEnabled
     ? { enabled: draft.selfEvolutionEnabled }
     : null;
-  const graphsChange = initialDraft.graphsEnabled !== draft.graphsEnabled
-    ? { enabled: draft.graphsEnabled }
+  const workflowsChange = initialDraft.workflowsEnabled !== draft.workflowsEnabled
+    ? { enabled: draft.workflowsEnabled }
     : null;
 
   const runtimePatch: ConfigApplyPlan["runtimePatch"] = {};
@@ -296,7 +296,7 @@ export function buildConfigApplyPlan(
     imageChanges,
     skillsChange,
     selfEvolutionChange,
-    graphsChange,
+    workflowsChange,
     runtimePatch,
     switchPermissionMode: null,
     switchAgentMode,
@@ -356,16 +356,16 @@ export function buildConfigPanelModel(params: {
       id: "self_evolution",
       label: "Self evolution",
       value: boolLabel(params.draft.selfEvolutionEnabled),
-      description: "controls Agent, Tool, Skill, and Graph management tools",
+      description: "controls Agent, Tool, Skill, and Workflow management tools",
       changed: params.draft.selfEvolutionEnabled !== params.initialDraft.selfEvolutionEnabled,
       selected: false,
     },
     {
-      id: "graphs",
-      label: "Graphs",
-      value: boolLabel(params.draft.graphsEnabled),
-      description: "controls automatic graph tools; $graph:<name> remains explicit",
-      changed: params.draft.graphsEnabled !== params.initialDraft.graphsEnabled,
+      id: "workflows",
+      label: "Workflows",
+      value: boolLabel(params.draft.workflowsEnabled),
+      description: "controls automatic workflow tools; $workflow:<name> remains explicit",
+      changed: params.draft.workflowsEnabled !== params.initialDraft.workflowsEnabled,
       selected: false,
     },
     {

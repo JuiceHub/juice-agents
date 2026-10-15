@@ -14,10 +14,10 @@ from juice_agents.core.config.runtime_config import read_workspace_config, write
 def test_write_workspace_config_replaces_complete_yaml() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         workspace = Path(temp_dir)
-        written = write_workspace_config(workspace, {"graphs": {"enabled": False}})
+        written = write_workspace_config(workspace, {"workflows": {"enabled": False}})
 
         assert written == workspace_config_path(workspace)
-        assert read_workspace_config(workspace) == {"graphs": {"enabled": False}}
+        assert read_workspace_config(workspace) == {"workflows": {"enabled": False}}
         assert not list(written.parent.glob(f".{written.name}.*.tmp"))
 
 

@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from juice_agents.core.agent.sessions import ActionStep, AgentSession
+from juice_agents.core.agent.context import ActionStep, ContextTree
 from juice_agents.core.prebuilt import create_prebuilt_runner
 from juice_agents.core.runner import Runner
 from juice_agents.core.runner.config import AgentBinding, ModeRegistry, RunnerConfig, mode_registry
@@ -24,7 +24,7 @@ class _ManagedTestAgent:
         self.max_steps = 1
         self.tools: dict[str, Any] = {}
         self.tool_executor_max_workers = 1
-        self.session = AgentSession(system_prompt="test")
+        self.context = ContextTree(tree_id=f"test_{name}", system_prompt="test")
 
     def bind_manager_infra(self, **_kwargs: Any) -> None:
         """The real Agent binds queue/workspace here; this double has none."""
@@ -91,7 +91,7 @@ def test_runner_contains_managers_not_live_domain_maps(tmp_path: Path) -> None:
     runner, _ = _runner(tmp_path, "agent")
     assert hasattr(runner, "agent_manager")
     assert hasattr(runner, "tool_manager")
-    assert hasattr(runner, "graph_manager")
+    assert hasattr(runner, "workflow_manager")
     assert hasattr(runner, "async_task_manager")
     assert not hasattr(runner, "_live_actors")
     assert not hasattr(runner, "mode_coordinator")

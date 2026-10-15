@@ -9,7 +9,7 @@ from typing import Any
 from juice_agents.core.config.context import ConfigurationContext
 from juice_agents.core.registry import (
     AgentRegistry,
-    GraphRegistry,
+    WorkflowRegistry,
     PluginRegistry,
     SkillRegistry,
     TeamRegistry,
@@ -41,7 +41,7 @@ def test_registries_expose_only_static_resolve_validate_instantiate_contract(tmp
     registries = [
         AgentRegistry(config_context=context),
         ToolRegistry(config_context=context),
-        GraphRegistry(config_context=context),
+        WorkflowRegistry(config_context=context),
         SkillRegistry(
             local_dir=tmp_path / ".juice" / "skills",
             builtin_dir=tmp_path / "builtin-skills",
@@ -78,9 +78,9 @@ def test_registry_instantiation_is_fresh_and_manager_independent(tmp_path: Path)
     assert tool_registry.resolve("read") == "read"
     assert tool_registry.instantiate("read") is not tool_registry.instantiate("read")
 
-    graph_registry = GraphRegistry(config_context=context)
-    assert graph_registry.validate("deep_research").name == "deep_research"
-    assert graph_registry.instantiate("deep_research") is not graph_registry.instantiate("deep_research")
+    workflow_registry = WorkflowRegistry(config_context=context)
+    assert workflow_registry.validate("deep_research").name == "deep_research"
+    assert workflow_registry.instantiate("deep_research") is not workflow_registry.instantiate("deep_research")
 
     skill_file = tmp_path / ".juice" / "skills" / "demo" / "SKILL.md"
     skill_file.parent.mkdir(parents=True)

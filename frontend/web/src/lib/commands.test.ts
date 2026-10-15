@@ -44,15 +44,15 @@ test("web slash model command returns a runtime switch request", async () => {
 });
 
 test("web slash model command rejects effort unsupported by target model", async () => {
-  const result = await executeWebCommand("/model claude-sonnet-4-6 xhigh", {} as WebGatewayClient, {
+  const result = await executeWebCommand("/model claude-sonnet-5-5 xhigh", {} as WebGatewayClient, {
     baseDir: "/tmp/work",
     status: null,
     sessions: [],
     models: [
       {
-        model_name: "claude-sonnet-4-6",
+        model_name: "claude-sonnet-5-5",
         backend: "anthropic",
-        provider_model_name: "claude-sonnet-4-6",
+        provider_model_name: "claude-sonnet-5-5",
         supported_efforts: ["disabled", "low", "medium", "high", "max"],
       },
     ],
@@ -238,45 +238,13 @@ test("web /plugins lists and views read-only plugins", async () => {
   assert.match(viewed.blocks[0]?.text || "", /plugin file/);
 });
 
-test("web /graph and /permissions use gateway helpers", async () => {
+test("web /permissions uses permission gateway helper", async () => {
   const client = {
-    listGraphs: async () => ({ graphs: [{ name: "deep_research" }], count: 1 }),
-    runGraph: async (_baseDir: string, name: string, payload: Record<string, unknown>) => ({
-      manifest: { graph_name: name, status: "completed" },
-      result: payload,
-    }),
     permissionStatus: async () => ({ permission_mode: "default", workspace_rules: [], session_rules: [] }),
-    graphsConfigStatus: async () => ({ success: true, enabled: true }),
   } as unknown as WebGatewayClient;
   const context = { baseDir: "/tmp/work", status: null, sessions: [], models: [] };
 
-  const listed = await executeWebCommand("/graph list", client, context);
-  const run = await executeWebCommand('/graph run custom_graph {"value":"test"}', client, context);
-  const research = await executeWebCommand("/deep-research --web-workspace compare graph APIs", client, context);
-  const advanced = await executeWebCommand('/deep-research {"question":"compare graph APIs","source_mode":"workspace"}', client, context);
   const permissions = await executeWebCommand("/permissions", client, context);
 
-  assert.match(listed.blocks[0]?.text || "", /deep_research/);
-  assert.match(run.blocks[0]?.text || "", /completed/);
-  assert.deepEqual(research.blocks, []);
-  assert.equal(research.forwardMessage, "/deep-research --web-workspace compare graph APIs");
-  assert.deepEqual(advanced.blocks, []);
-  assert.equal(advanced.forwardMessage, '/deep-research {"question":"compare graph APIs","source_mode":"workspace"}');
   assert.match(permissions.blocks[0]?.text || "", /default/);
-});
-
-test("web /deep-research suggests explicit graph invocation when automatic Graph tools are disabled", async () => {
-  const client = {
-    graphsConfigStatus: async () => ({ success: true, enabled: false }),
-  } as unknown as WebGatewayClient;
-
-  const result = await executeWebCommand("/deep-research compare graph APIs", client, {
-    baseDir: "/tmp/work",
-    status: null,
-    sessions: [],
-    models: [],
-  });
-
-  assert.equal(result.forwardMessage, undefined);
-  assert.match(result.blocks[0]?.text || "", /\$graph:deep_research compare graph APIs/);
 });

@@ -332,10 +332,10 @@ class AgentConfig:
     skill_names: tuple[str, ...] = field(default_factory=tuple)
     disabled_skill_names: tuple[str, ...] = field(default_factory=tuple)
     enable_skill_tools: bool = True
-    # Graph capabilities follow the same per-agent declaration rule as Skills.
-    # Global ``graphs.enabled`` is applied later by AgentRegistry, so this field
+    # Workflow capabilities follow the same per-agent declaration rule as Skills.
+    # Global ``workflows.enabled`` is applied later by AgentRegistry, so this field
     # remains portable when the same AgentConfig is used in another workspace.
-    enable_graph_tools: bool = True
+    enable_workflow_tools: bool = True
     output_schema: dict[str, Any] | None = None
     log_file_path: str | None = None
     additional_authorized_imports: tuple[str, ...] = field(default_factory=tuple)
@@ -498,7 +498,7 @@ class AgentConfig:
                 field_name="disabled_skill_names",
             ),
             enable_skill_tools=bool(payload.get("enable_skill_tools", True)),
-            enable_graph_tools=bool(payload.get("enable_graph_tools", True)),
+            enable_workflow_tools=bool(payload.get("enable_workflow_tools", True)),
             output_schema=deepcopy(payload.get("output_schema")),
             log_file_path=None if payload.get("log_file_path") is None else str(payload.get("log_file_path")),
             additional_authorized_imports=_normalize_string_list(
@@ -531,7 +531,7 @@ class AgentConfig:
             "system_prompt": self.system_prompt,
             "skill_names": list(self.skill_names),
             "enable_skill_tools": self.enable_skill_tools,
-            "enable_graph_tools": self.enable_graph_tools,
+            "enable_workflow_tools": self.enable_workflow_tools,
             "output_schema": deepcopy(self.output_schema),
             "log_file_path": self.log_file_path,
             "additional_authorized_imports": list(self.additional_authorized_imports),

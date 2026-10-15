@@ -50,8 +50,8 @@ def _attach_prompt_agent(agent, tmp_dir: str | Path, name: str, description: str
         }
     )
     agent._runtime_managed_agent_refs[name] = {"agent_config_dir": str(config_dir)}
-    agent.system_prompt = agent.init_system_prompt()
-    agent.session.system_prompt = agent.system_prompt
+    # 走唯一的重建入口，避免手动拼装 system_prompt 与分段字段。
+    agent.refresh_system_prompt()
 
 
 class _PromptBrowserTool(Tool):

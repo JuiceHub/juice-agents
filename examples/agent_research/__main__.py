@@ -13,8 +13,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m examples.agent_research",
         description=(
-            "Ask an Agent to run the built-in deep-research Graph and preserve its "
-            "report, sources, claims, and Graph trace in this Showcase workspace."
+            "Ask an Agent to run the built-in deep_research workflow and preserve its "
+            "report, sources, claims, and workflow trace in this Showcase workspace."
         )
     )
     parser.add_argument(
@@ -29,14 +29,13 @@ def main(argv: list[str] | None = None):
     """Run a real research request inside this package's dedicated workspace."""
 
     args = build_parser().parse_args(argv)
-    # ``/deep-research`` is the Agent's stable system-level Graph capability.
-    # The CLI only accepts a business question, keeping Graph routing details
-    # out of user input while retaining the normal Agent interaction surface.
+    # ``$workflow:deep_research`` 是显式 workflow 入口：只传纯文本问题，
+    # 其余参数（如 source_mode）由 root agent 依据 input_schema 自行补全或向用户追问。
     return run_showcase(
         args,
         agent_mode="agent",
         workspace=showcase_workspace(__file__),
-        task=f"/deep-research {args.question}",
+        task=f"$workflow:deep_research {args.question}",
     )
 
 

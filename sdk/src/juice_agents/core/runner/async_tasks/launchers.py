@@ -1,4 +1,4 @@
-"""Launchers mixin: launch_async_task, local_bash, local_graph."""
+"""Launchers mixin: launch_async_task, local_bash."""
 
 from __future__ import annotations
 
@@ -132,28 +132,4 @@ class _AsyncTaskLaunchersMixin:
             },
             runner=_runner,
             summary_builder=lambda _result: "后台 shell 命令已完成",
-        )
-
-    def launch_local_graph_async_task(
-        self,
-        *,
-        owner_agent_id: str,
-        owner_agent_name: str,
-        graph_name: str,
-        runner: Callable[[InternalAsyncTaskState, Path], Any],
-        max_observation_chars: int | None = None,
-    ) -> dict[str, Any]:
-        return self.launch_async_task(
-            async_task_type="local_graph",
-            owner_agent_id=owner_agent_id,
-            owner_agent_name=owner_agent_name,
-            description=f"graph background run: {graph_name}",
-            extra_fields={
-                "metadata": {
-                    "graph_name": graph_name,
-                    "max_observation_chars": max_observation_chars,
-                }
-            },
-            runner=runner,
-            summary_builder=lambda _result: f"local_graph 已完成：{graph_name}",
         )

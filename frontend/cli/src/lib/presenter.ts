@@ -7,13 +7,13 @@
 
 import type {
   ActionStep,
-  ActorSessionSnapshot,
+  ActiveAgentSnapshot,
   RunnerStreamEvent,
   SessionStatus,
 } from "@juice-agents/shared/gateway/types";
 import {
   INTERRUPT_MESSAGE,
-  presentActorSession as presentSharedActorSession,
+  presentActiveAgent as presentSharedActiveAgent,
   presentStreamEvent as presentSharedStreamEvent,
   presentStreamStep as presentSharedStreamStep,
   type MessageBlock as SharedMessageBlock,
@@ -70,8 +70,8 @@ export function presentStreamEvent(event: RunnerStreamEvent): MessageBlock[] {
   return presentSharedStreamEvent(event as any) as MessageBlock[];
 }
 
-export function presentActorSession(actor: ActorSessionSnapshot | null | undefined): MessageBlock[] {
-  return presentSharedActorSession(actor as any) as MessageBlock[];
+export function presentActiveAgent(agent: ActiveAgentSnapshot | null | undefined): MessageBlock[] {
+  return presentSharedActiveAgent(agent as any) as MessageBlock[];
 }
 
 export function formatModeLabel(status: SessionStatus): string {
@@ -107,8 +107,8 @@ export function buildIntroPanel(status: SessionStatus): IntroPanelModel {
 // 渲染出 "unknown-model · disabled" 的占位字样，而不是真实的 workspace 配置。
 export function shouldShowIntroPanel(params: {
   introPanel: IntroPanelModel | null | undefined;
-  activeActorName: string | null;
+  activeAgentName: string | null;
   runtimeReady: boolean;
 }): boolean {
-  return Boolean(params.introPanel) && params.activeActorName === null && params.runtimeReady;
+  return Boolean(params.introPanel) && params.activeAgentName === null && params.runtimeReady;
 }

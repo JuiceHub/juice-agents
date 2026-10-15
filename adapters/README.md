@@ -26,7 +26,7 @@ The Web service listens on `127.0.0.1:8003` by default. It exposes session and m
 CLI / Web ── JSON-RPC / HTTP / WebSocket ──> adapters ──> juice_agents Runner
 ```
 
-- Dependencies point from `adapters` to `juice_agents`. Put new protocol entry points in a separate `adapters/` subdirectory; do not duplicate Runner, Agent, Graph, or configuration-storage logic.
+- Dependencies point from `adapters` to `juice_agents`. Put new protocol entry points in a separate `adapters/` subdirectory; do not duplicate Runner, Agent, Workflow, or configuration-storage logic.
 - stdout from stdio carries JSON-RPC only; write logs to stderr. Stdio and WebSocket share event serialization and pass through Team task state, session title previews, and model capability data.
 - Workspace configuration is read and written only through `.juice/config.yaml` and SDK configuration APIs. Cold Plugin, Skill, and Team queries must not create a Runner; reassembly changes only on an existing Runner.
 - The Web service has no authentication and may bind only to loopback. Restrict HTTP/WebSocket Host and browser WebSocket Origin to the local host. File previews must stay inside the workspace and must not follow symlinked directories outside it.

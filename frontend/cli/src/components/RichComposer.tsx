@@ -71,7 +71,7 @@ export function getRichComposerModel(params: {
 }
 
 export function isActorsHotkey(input: string, key: { ctrl?: boolean }): boolean {
-  // Ctrl+S: 打开 actor-selector（即旧 /tasks 行为，迁到 /actors）
+  // Ctrl+S: 打开 active-selector，查看活跃的 agents
   return input === "\x13" || (input.toLowerCase() === "s" && Boolean(key.ctrl));
 }
 

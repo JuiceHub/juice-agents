@@ -10,12 +10,12 @@ from uuid import uuid4
 
 from juice_agents.core.config.context import ConfigurationContext
 from juice_agents.core.config.runtime_config import update_workspace_config
-from juice_agents.core.registry.graphs import GraphRegistry
+from juice_agents.core.registry.workflows import WorkflowRegistry
 from juice_agents.core.runner.types.ask import normalize_ask_response
 from juice_agents.core.agent.tools.builtin.evolution.constants import SELF_EVOLUTION_TOOL_NAMES
-from juice_agents.core.agent.tools.builtin.graphs.constants import GRAPH_TOOL_NAMES
+from juice_agents.core.agent.tools.builtin.workflows.constants import WORKFLOW_TOOL_NAMES
 from juice_agents.core.agent.tools.builtin.capabilities.manual_capabilities import (
-    graphs_enabled,
+    workflows_enabled,
     self_evolution_enabled,
 )
 
@@ -35,17 +35,17 @@ class PermissionResult:
     updated_args: dict[str, Any] | None = None
 
 
-_EDIT_TOOLS = {"write", "edit", "graph_manage"}
+_EDIT_TOOLS = {"write", "edit", "workflow_manage"}
 _APPROVAL_TOOLS = _EDIT_TOOLS | {
     "shell",
     "python",
-    "graph_tool",
+    "workflow_run",
     # 配置与 Skill 变更会永久改变后续 agent 行为，不能静默放行。
     "skill_manage",
     "agent_manage",
     "tool_manage",
 }
-_SHARED_CONFIG_WRITE_TOOLS = frozenset({"tool_manage", "skill_manage", "graph_manage"})
+_SHARED_CONFIG_WRITE_TOOLS = frozenset({"tool_manage", "skill_manage", "workflow_manage"})
 
 
 class PermissionDenied(PermissionError):
@@ -103,7 +103,7 @@ def _target_for(tool_name: str, args: dict[str, Any]) -> str:
         return hashlib.sha256(str(args.get("code") or "").encode("utf-8")).hexdigest()
     if tool_name in {"write", "edit", "read"}:
         return str(args.get("path") or args.get("file_path") or "").strip()
-    if tool_name in {"graph_tool", "graph_manage", "graph_view"}:
+    if tool_name in {"workflow_run", "workflow_manage", "workflow_view"}:
         return str(args.get("name") or "").strip()
     if tool_name in {"agent_manage", "tool_manage", "skill_manage"}:
         action = str(args.get("action") or "").strip()
@@ -115,13 +115,13 @@ def _target_for(tool_name: str, args: dict[str, Any]) -> str:
 
 
 def _source_hash(agent: Any, tool_name: str, args: dict[str, Any]) -> str:
-    if tool_name != "graph_tool":
+    if tool_name != "workflow_run":
         return ""
     name = str(args.get("name") or "").strip()
     if not name:
         return ""
     try:
-        return GraphRegistry(config_context=_config_context(agent)).get_metadata(name).source_hash
+        return WorkflowRegistry(config_context=_config_context(agent)).get_metadata(name).source_hash
     except Exception:
         return ""
 
@@ -186,8 +186,17 @@ class PermissionEngine:
 
     @property
     def mode(self) -> PermissionMode:
-        """权限维度：只回答"是否需要审批"，与 agent 执行模式无关。"""
+        """权限维度：只回答"是否需要审批"，与 agent 执行模式无关。
 
+        AgentManager 可为单个 agent 设置审批覆盖（Runner 绑定时写入
+        ``permission_mode_override``）。workflow 内部 agent 固定为 accept：用户已在
+        启动 workflow 时审批过一次。accept 只跳过「询问」，deny 规则、只读策略和
+        硬开关仍然生效。
+        """
+
+        override = str(getattr(self.agent, "permission_mode_override", "") or "").strip()
+        if override:
+            return _normalize_mode(override)
         runner_mode = str(getattr(self.runner, "permission_mode", "") or "").strip()
         if runner_mode:
             return _normalize_mode(runner_mode)
@@ -204,11 +213,15 @@ class PermissionEngine:
 
     def action(self, tool: Any, args: dict[str, Any]) -> PermissionAction:
         name = str(getattr(tool, "name", "") or "").strip()
+        # 只读属性通常是工具类的静态声明；workflow_run 这类工具的只读性取决于
+        # 本次调用的目标，因此允许工具提供按参数判断的 is_read_only_for(args)。
+        per_call = getattr(tool, "is_read_only_for", None)
+        is_read_only = bool(per_call(dict(args))) if callable(per_call) else bool(getattr(tool, "is_read_only", False))
         return PermissionAction(
             tool=name,
             target=_target_for(name, args),
             source_hash=_source_hash(self.agent, name, args),
-            is_read_only=bool(getattr(tool, "is_read_only", False)),
+            is_read_only=is_read_only,
         )
 
     def _load_rules(self) -> list[dict[str, Any]]:
@@ -247,11 +260,11 @@ class PermissionEngine:
         """Return a non-bypassable policy rejection, or an empty string.
 
         Workspace allow rules are convenience approvals, never authority to
-        re-enable self-modification or a disabled automatic Graph surface.
+        re-enable self-modification or a disabled automatic Workflow surface.
         """
 
         if action.tool in SELF_EVOLUTION_TOOL_NAMES and not self_evolution_enabled(self.context):
-            return "self_evolution.enabled=false，禁止修改 Agent、Tool、Skill 或 Graph"
+            return "self_evolution.enabled=false，禁止修改 Agent、Tool、Skill 或 Workflow"
 
         if action.tool in _SHARED_CONFIG_WRITE_TOOLS:
             runner_context = getattr(self.agent, "runner_context", None)
@@ -279,17 +292,17 @@ class PermissionEngine:
                     f"当前 agent_id={agent_id or 'unbound'}, role={role or 'unbound'}"
                 )
 
-        automatic_graphs_enabled = graphs_enabled(self.context) and bool(
-            getattr(self.agent, "graph_tools_enabled", True)
+        automatic_workflows_enabled = workflows_enabled(self.context) and bool(
+            getattr(self.agent, "workflow_tools_enabled", True)
         )
-        if action.tool not in GRAPH_TOOL_NAMES or automatic_graphs_enabled:
+        if action.tool not in WORKFLOW_TOOL_NAMES or automatic_workflows_enabled:
             return ""
-        # Only a gateway-installed, current-stream `$graph:<name>` scope may
-        # execute a Graph while automatic Graph tools are hidden.
-        allowed_graph = str(getattr(self.agent, "_manual_graph_authorization", "") or "").strip()
-        if action.tool == "graph_tool" and allowed_graph and action.target == allowed_graph:
+        # Only a gateway-installed, current-stream `$workflow:<name>` scope may
+        # execute a Workflow while automatic Workflow tools are hidden.
+        allowed_workflow = str(getattr(self.agent, "_manual_workflow_authorization", "") or "").strip()
+        if action.tool == "workflow_run" and allowed_workflow and action.target == allowed_workflow:
             return ""
-        return "graphs.enabled=false 或当前 Agent 已关闭 Graph 自动能力；仅 $graph:<name> 当前轮可执行指定 graph"
+        return "workflows.enabled=false 或当前 Agent 已关闭 Workflow 自动能力；仅 $workflow:<name> 当前轮可执行指定 workflow"
 
     def decide(
         self,
