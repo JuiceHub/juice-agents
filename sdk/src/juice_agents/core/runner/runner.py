@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import logging
 from collections import deque
+from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 import threading
 import time
@@ -22,10 +24,10 @@ from juice_agents.core.agent.attachments import RuntimeAttachment, merge_runtime
 from juice_agents.core.agent.root_config import build_root_config
 from juice_agents.core.agent.tools.runtime import ToolExecutionContext
 from juice_agents.core.config.context import ConfigurationContext
-from juice_agents.core.config.model_catalog import DEFAULT_RUNTIME_CONFIG_PATH
+from juice_agents.core.config.model_catalog import DEFAULT_RUNTIME_CONFIG_PATH, normalize_runtime_model_effort
 from juice_agents.core.managers import AsyncTaskManager, ToolManager, WorkflowRunManager
 from juice_agents.core.registry import AgentRegistry, WorkflowRegistry
-from juice_agents.core.registry.agents.types import AgentConfig
+from juice_agents.core.registry.agents.types import AgentConfig, normalize_agent_type
 
 from .config import AgentBinding, Capability, RunnerConfig, mode_registry
 from .errors import RunnerBusyError
@@ -36,6 +38,7 @@ from .status import settle_status
 from .types.definitions import PermissionMode, RunnerState, normalize_permission_mode
 from .types.identity import new_runner_id
 from .workspace import RuntimeWorkspace
+from .project_rules import load_workspace_rules
 
 logger = logging.getLogger(__name__)
 AskHandler = Callable[[dict[str, Any]], dict[str, Any]]
@@ -140,6 +143,7 @@ class Runner:
         base_dir: str | Path,
         state: RunnerState,
         runtime_config_path: str | Path | None = None,
+        runtime_overrides: dict[str, Any] | None = None,
         storage_root: str | Path | None = None,
     ) -> None:
         self.permission_mode = normalize_permission_mode(permission_mode)
@@ -150,8 +154,14 @@ class Runner:
         self.base_dir = Path(base_dir).expanduser().resolve()
         self.layout = build_layout(self.base_dir, self.runner_id, root_dir=storage_root)
         self.layout.ensure_dirs()
-        self.config_context = ConfigurationContext.from_workspace(self.base_dir)
         self.runtime_config_path = Path(runtime_config_path or DEFAULT_RUNTIME_CONFIG_PATH).expanduser().resolve()
+        self.config_context = ConfigurationContext.from_workspace(
+            self.base_dir, project_config_path=self.runtime_config_path,
+            overrides=runtime_overrides,
+        )
+        # Rules are one launch-scoped snapshot shared by root, children, Team
+        # and Workflow Agents. A resumed Runner reads today's files afresh.
+        self.workspace_rules = load_workspace_rules(self.base_dir)
         self.state: RunnerState = dict(state)
         self.state.update({
             "permission_mode": self.permission_mode,
@@ -197,10 +207,14 @@ class Runner:
         self._team_member_names = self._load_team_member_names()
         if self.config.mode_id == "team":
             self.state["team_name"] = str(self.state.get("team_name") or "default")
+        # The workspace owns a portable root declaration. Mode-specific paths
+        # and workflows belong only to the effective copy passed to Manager.
+        self._root_declaration = self.agent_registry.load_config("root")
         self.root_config = build_root_config(
             mode_id=self.config.mode_id,
             plan_file=self.layout.plans_dir / "root.md",
             managed_agent_names=self._discover_available_agent_names(),
+            declaration=self._root_declaration,
         )
         self.agent_manager = AgentManager(
             registry=self.agent_registry,
@@ -550,18 +564,19 @@ class Runner:
         from juice_agents.core.registry.teams import TeamRegistry
 
         teams = TeamRegistry(config_context=self.config_context)
+        previous_source = teams.get_source(self.team_name)
         declaration = teams.add_member(self.team_name, name, agent_name=agent_name, config=config)
         try:
             member = manager.create_member(name, declaration.name)
         except Exception:
             teams.remove_member(self.team_name, name)
+            if previous_source == "builtin":
+                # The failed first edit must restore the read-only default,
+                # including removing its newly materialized local manifest.
+                teams.delete(self.team_name)
             raise
         self._team_member_names = frozenset({*(self._team_member_names or ()), name})
-        self.root_config = build_root_config(
-            mode_id=self.mode_id,
-            plan_file=self.plan_file_path(),
-            managed_agent_names=self._discover_available_agent_names(),
-        )
+        self._refresh_root_config()
         return member
 
     def _after_agent_persist(self, snapshot: dict[str, Any]) -> None:
@@ -638,22 +653,13 @@ class Runner:
         if str(mode_id or self.config.mode_id) != "team":
             return None
         from juice_agents.core.registry import TeamRegistry
-        from juice_agents.core.team.builtin.configs import (
-            DEFAULT_TEAM_NAME,
-            build_default_team_config,
-        )
+        from juice_agents.core.team.builtin.configs import DEFAULT_TEAM_NAME
 
         selected = str(self.state.get("team_name") or DEFAULT_TEAM_NAME).strip()
         teams = TeamRegistry(config_context=self.config_context)
-        try:
-            manifest = teams.validate(selected)
-        except FileNotFoundError:
-            # Only the known default is initialized implicitly. Its manifest
-            # starts empty; membership is always an explicit root decision.
-            if selected != DEFAULT_TEAM_NAME:
-                raise
-            teams.create(build_default_team_config())
-            manifest = teams.validate(selected)
+        # Default and saved Teams share Registry resolution. Looking up the
+        # built-in default must not persist a manifest or worker declarations.
+        manifest = teams.validate(selected)
         return frozenset(manifest.member_names)
 
     def available_agent_names(self) -> frozenset[str] | None:
@@ -780,6 +786,27 @@ class Runner:
         mode_id: str | RunnerConfig | None = None,
         permission_mode: PermissionMode | str | None = None,
         plan_return_mode: str | None = None,
+        runtime_overrides: dict[str, Any] | None = None,
+    ) -> None:
+        """Commit configuration at the same request gate used by stream()."""
+
+        if not self._request_lock.acquire(blocking=False):
+            raise RunnerBusyError(f"runner {self.runner_id} 正忙，不能切换配置")
+        try:
+            self._reconfigure_at_idle(
+                mode_id=mode_id, permission_mode=permission_mode,
+                plan_return_mode=plan_return_mode, runtime_overrides=runtime_overrides,
+            )
+        finally:
+            self._request_lock.release()
+
+    def _reconfigure_at_idle(
+        self,
+        *,
+        mode_id: str | RunnerConfig | None,
+        permission_mode: PermissionMode | str | None,
+        plan_return_mode: str | None,
+        runtime_overrides: dict[str, Any] | None,
     ) -> None:
         """Apply a new declarative mode at an explicit idle boundary.
 
@@ -791,15 +818,45 @@ class Runner:
 
         target = mode_registry.resolve(mode_id or self.config)
         target_permission = normalize_permission_mode(permission_mode or self.permission_mode)
-        if target == self.config and target_permission == self.permission_mode:
+        runtime_changed = runtime_overrides is not None and runtime_overrides != self.config_context.overrides
+        mode_unchanged = target == self.config and target_permission == self.permission_mode
+        if mode_unchanged and not runtime_changed:
             return
         blocked = self.mode_switch_block_reason()
         if blocked:
             raise RunnerBusyError(f"runner {self.runner_id} 正忙，不能切换模式：{blocked}")
 
-        # Validate a selected Team before releasing the current root.  A bad
-        # manifest must leave the current mode and its session untouched.
+        # Validate before releasing anything, including simultaneous model /
+        # protocol changes. A bad Team manifest leaves the old session usable.
         target_team_members = self._load_team_member_names(mode_id=target.mode_id)
+
+        if runtime_changed:
+            # Validate static choices before touching live Agents. Provider
+            # construction remains lazy, so no API key or network is needed.
+            if not isinstance(runtime_overrides, dict):
+                raise TypeError("runtime_overrides 必须为映射")
+            candidate_context = replace(self.config_context, overrides=deepcopy(runtime_overrides))
+            runtime = candidate_context.read_merged_config().get("runtime", {})
+            if not isinstance(runtime, dict):
+                raise ValueError("runtime 必须为映射")
+            normalize_agent_type(runtime.get("agent_type"))
+            normalize_runtime_model_effort(runtime.get("model_effort"))
+            candidate_registry = AgentRegistry(config_context=candidate_context)
+            candidate_registry.load_config("root")
+            # Fresh objects consume new model/protocol choices, while their
+            # session snapshots and Team board remain owned by the same Runner.
+            # Do not mutate a shared frozen context or persistent declarations.
+            for managed in list(self.agent_manager.live_agents.values()):
+                self.agent_manager.release(managed)
+            self.config_context = candidate_context
+            self.agent_registry = candidate_registry
+            self.agent_manager.registry = self.agent_registry
+            if mode_unchanged:
+                self._refresh_root_config()
+                self.workflow_manager = self._create_workflow_manager()
+                self.persist_runner_state()
+                logger.info("runner_runtime_reconfigured runner_id=%s", self.runner_id)
+                return
 
         try:
             root = self.agent_manager.get(self.root_agent_id)
@@ -820,11 +877,7 @@ class Runner:
             # Re-entering Team mode starts a fresh board from its reusable
             # definition, even when a previous Team run is already finished.
             self.state["team_run_id"] = uuid4().hex
-        self.root_config = build_root_config(
-            mode_id=target.mode_id,
-            plan_file=self.plan_file_path(),
-            managed_agent_names=self._discover_available_agent_names(),
-        )
+        self._refresh_root_config()
         self.async_task_manager = AsyncTaskManager(
             event_sink=self.event_queue,
             state_dir=self.layout.async_tasks_dir,
@@ -879,6 +932,7 @@ class Runner:
         base_dir: str | Path | None = None,
         runner_id: str | None = None,
         runtime_config_path: str | Path | None = None,
+        runtime_overrides: dict[str, Any] | None = None,
         storage_root: str | Path | None = None,
         **removed: Any,
     ) -> "Runner":
@@ -897,7 +951,10 @@ class Runner:
             )
 
             selected_team_name = selected_team_name or DEFAULT_TEAM_NAME
-            context = ConfigurationContext.from_workspace(resolved_base)
+            context = ConfigurationContext.from_workspace(
+                resolved_base, project_config_path=runtime_config_path,
+                overrides=runtime_overrides,
+            )
             teams = TeamRegistry(config_context=context)
             try:
                 teams.get_manifest(selected_team_name)
@@ -927,6 +984,7 @@ class Runner:
             base_dir=resolved_base,
             state=state,
             runtime_config_path=runtime_config_path,
+            runtime_overrides=runtime_overrides,
             storage_root=root,
         )
         runner.persist_runner_state()
@@ -941,6 +999,7 @@ class Runner:
         runner_id: str,
         base_dir: str | Path,
         runtime_config_path: str | Path | None = None,
+        runtime_overrides: dict[str, Any] | None = None,
         **removed: Any,
     ) -> "Runner":
         if removed:
@@ -957,6 +1016,7 @@ class Runner:
             base_dir=resolved_base,
             state=state,
             runtime_config_path=runtime_config_path,
+            runtime_overrides=runtime_overrides,
         )
         runner.async_task_manager.recover()
         if runner.team_manager is not None:
@@ -985,13 +1045,34 @@ class Runner:
             agent=instance,
         )
         instance.runner_context = context
+        instance.workspace_rules = self.workspace_rules.prompt
         # Prompt-facing AgentTool data must use the exact same availability
         # predicate as `/agents` and direct Runner dispatch.  Declarations
         # are copied by AgentRegistry, so updating this runtime projection
         # cannot mutate shared YAML or another Runner.
         if managed.is_root:
+            # Evolution persists the portable declaration, never this Runner's
+            # effective Plan/Team copy. Keep effective tool metadata produced
+            # by Registry intact for prompt/executor construction.
+            instance._declared_agent_config = AgentConfig.from_dict(self._root_declaration)
             visible_names = self._discover_available_agent_names()
         else:
+            if managed.role == "teammate":
+                from juice_agents.core.registry.teams import TeamRegistry
+
+                teams = TeamRegistry(config_context=self.config_context)
+                member_name = str(managed.metadata["team_member"])
+                manifest = teams.get_manifest(self.team_name)
+                shared_name = manifest.shared_agent_name(member_name)
+                declaration_dir = (
+                    self.config_context.agents_dir
+                    if shared_name is not None
+                    else teams.member_config_dir(self.team_name)
+                )
+                # Keep the original portable declaration, since the Team turn
+                # adds coordination instructions/tools only to its runtime copy.
+                instance._declared_agent_config = teams.load_member_config(self.team_name, member_name)
+                instance._declared_agent_config_dir = str(declaration_dir)
             declared = getattr(instance, "_declared_agent_config", None)
             candidates = tuple(getattr(declared, "managed_agent_names", ()) or ())
             visible_names = tuple(name for name in candidates if self.is_agent_available(name))
@@ -1034,6 +1115,11 @@ class Runner:
         instance.permission_mode_override = managed.permission_mode
         # ephemeral agent 不写文件日志；运行过程只经 logger 输出。
         instance.set_log_file_path(None if managed.ephemeral else self.layout.agents_dir / managed.agent_id / "log.txt")
+        # Render after replacing the restored ContextTree and binding the
+        # current role/tools. This replaces historical rules, never appends.
+        refresh_prompt = getattr(instance, "refresh_system_prompt", None)
+        if callable(refresh_prompt):
+            refresh_prompt()
 
     def _after_agent_step(self, managed: ManagedAgent, _step: Any) -> None:
         self.state["root_agent_name"] = self.root_agent_name
@@ -1061,10 +1147,30 @@ class Runner:
             *inbox,
         ]
 
+    def _refresh_root_config(self, declaration: AgentConfig | None = None) -> None:
+        """Read shared root data and apply the current mode only in memory."""
+
+        self._root_declaration = declaration or self.agent_registry.load_config("root")
+        self.root_config = build_root_config(
+            mode_id=self.mode_id,
+            plan_file=self.plan_file_path(),
+            managed_agent_names=self._discover_available_agent_names(),
+            declaration=self._root_declaration,
+        )
+
     def _root(self) -> ManagedAgent:
-        # The root config is detached in memory.  Passing it through the
-        # standard Registry -> Manager construction flow preserves prompt and
-        # tool rendering without making ``root`` editable Registry state.
+        # A live root retains its session and reconciles tool additions on the
+        # next step. A fresh acquire must observe persisted declaration edits.
+        try:
+            current = self.agent_manager.get(self.root_agent_id)
+        except KeyError:
+            current = None
+        if current is None or not current.is_live:
+            declaration = self.agent_registry.load_config("root")
+            if declaration != self._root_declaration:
+                self._refresh_root_config(declaration)
+            # If YAML did not change, retain intentional in-memory overrides
+            # (for example an embedded host selecting ReAct versus CodeAct).
         return self.agent_manager.acquire_root(self.root_config, role="root")
 
     def _require_capability(self, capability: Capability | str) -> None:
@@ -1397,6 +1503,10 @@ class Runner:
 
     def describe_agent_sessions(self) -> dict[str, Any]:
         return {"runner_id": self.runner_id, "mode_id": self.mode_id, **self.agent_manager.describe_sessions()}
+
+    def token_usage(self) -> dict[str, Any]:
+        """只读代理 AgentManager 的用量汇总，不持有第二份账本或唤醒 Agent。"""
+        return self.agent_manager.token_usage()
 
     def queue_agent_user_message(self, *, agent_name: str, message: str) -> dict[str, Any]:
         managed = self.agent_manager.get_by_name(agent_name)

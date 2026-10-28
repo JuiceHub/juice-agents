@@ -1,30 +1,25 @@
 #!/usr/bin/env bash
-# Juice CLI - TypeScript + Ink
+# Run the source checkout without changing the user's project environment.
+set -euo pipefail
 
-set -e
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CLI_DIR="$SCRIPT_DIR/frontend/cli"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+PYTHON_BIN="${JUICE_PYTHON_PATH:-$(command -v python || true)}"
+NODE_BIN="${JUICE_NODE_PATH:-$(command -v node || true)}"
 FRONTEND_DIR="$SCRIPT_DIR/frontend"
-DEPENDENCY_CHECK="$FRONTEND_DIR/check-cli-dependencies.mjs"
-WORKSPACE_DIR="$(pwd -P)"
 
-export JUICE_WORKSPACE_DIR="$WORKSPACE_DIR"
-export PYTHONPATH="$SCRIPT_DIR/sdk/src${PYTHONPATH:+:$PYTHONPATH}"
-# 所有前端 workspace 共享唯一的 React 实例。不能在 cli/shared 目录分别安装，
-# 否则共享 Hook 会加载另一份 React，导致 Ink 报 Invalid hook call。
-if ! node "$DEPENDENCY_CHECK" "$FRONTEND_DIR"; then
-    echo "Synchronizing frontend CLI dependencies..."
-    (
-        cd "$FRONTEND_DIR"
-        # 删除旧版独立安装留下的共享依赖；workspace 只允许根级安装。
-        rm -rf shared/node_modules cli/node_modules
-        npm install --workspace juice-cli
-    )
-    # 安装完成后再次核验真实包版本与解析位置，避免 npm 缓存留下遮蔽依赖。
-    node "$DEPENDENCY_CHECK" "$FRONTEND_DIR"
+fail() { printf 'juice: %s\n' "$*" >&2; exit 1; }
+[[ -x "$PYTHON_BIN" ]] || fail "Python path is invalid: $PYTHON_BIN. Activate juice-agents and rerun $SCRIPT_DIR/install-juice."
+[[ -x "$NODE_BIN" ]] || fail "Node path is invalid: $NODE_BIN. Restore Node and rerun $SCRIPT_DIR/install-juice."
+export JUICE_PYTHON_PATH="$PYTHON_BIN"
+# Only module lookup is extended. PATH remains exactly the user's project PATH,
+# so Shell tools can use project virtual environments and executable wrappers.
+export PYTHONPATH="$SCRIPT_DIR/sdk/src:$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+if ! "$PYTHON_BIN" -P -c 'import juice_agents; import adapters.stdio_gateway.entry' >/dev/null; then
+    fail "Python dependencies are missing. Run: conda activate juice-agents; python -m pip install -e '$SCRIPT_DIR/sdk'"
 fi
-
-# Run the TypeScript + Ink CLI
-cd "$CLI_DIR"
-exec npm run start -- "$@"
+if ! "$NODE_BIN" "$FRONTEND_DIR/check-cli-dependencies.mjs" "$FRONTEND_DIR"; then
+    fail "Frontend dependencies are missing or stale. Run: cd '$FRONTEND_DIR' && npm ci"
+fi
+# Invoke the recorded Node directly: npm and tsx executable shebangs otherwise
+# rediscover Node from PATH, which may belong to an unrelated project.
+exec "$NODE_BIN" --import "$FRONTEND_DIR/node_modules/tsx/dist/loader.mjs" "$FRONTEND_DIR/cli/src/entry.tsx" "$@"

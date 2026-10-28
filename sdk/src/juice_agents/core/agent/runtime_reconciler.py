@@ -1,9 +1,9 @@
-"""Static declaration reconciliation for Agent evolution tools.
+"""Persist evolution declarations and synchronize runtime name references.
 
-The functions here change Registry declarations and return an explicit
-``fresh_acquire`` receipt. They never touch a live Agent, construct a
-temporary Agent, or look up a Runner. ``AgentManager`` is the only component
-allowed to turn these declarations into runtime instances.
+Tool changes update the owning Agent's existing reference table; its next step
+refreshes the derived prompt and callable view. No Agent is reconstructed and
+no Tool is instantiated here. Other declaration changes still take effect on
+fresh acquisition through ``AgentManager``.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 def _receipt(owner_agent: Any, *, config: AgentConfig | None = None) -> dict[str, Any]:
-    """Describe a persisted declaration change without a live refresh path."""
+    """Default to fresh acquisition unless a runtime projection is updated."""
 
     return {
         "status": "scheduled",
@@ -116,27 +116,85 @@ def _runner_local_receipt(owner_agent: Any, *, name: str, action: str) -> dict[s
     }
 
 
-def bind_tool(owner_agent: Any, name: str) -> dict[str, Any]:
-    """Persist a Tool reference; a later Manager acquire realizes it."""
+def _sync_tool_reference(
+    owner_agent: Any,
+    name: str,
+    *,
+    saved: AgentConfig | None,
+    tool_config_dir: str | Path | None = None,
+    unload: bool = False,
+) -> dict[str, Any]:
+    """Project one persisted reference change into the current Agent.
 
-    return _require_saved(
+    The Registry declaration remains the durable source, including for root.
+    Only name references and the disabled set are changed here: the existing
+    lazy-tool adapter, Runner permissions and ToolManager still own execution.
+    The next step refreshes CodeAct's injected functions and the system prompt
+    together, so the model never needs to guess a newly registered tool name.
+    """
+
+    receipt = _require_saved(owner_agent, saved)
+    refs = getattr(owner_agent, "_runtime_tool_refs", None)
+    disabled = getattr(owner_agent, "_runtime_disabled_tool_names", None)
+    if saved is None or not isinstance(refs, dict) or not isinstance(disabled, set):
+        return receipt
+    if unload:
+        refs.pop(name, None)
+        # An original self.tools entry may still exist. Hiding it as well is
+        # necessary or unloading a baseline tool would immediately expose it.
+        disabled.add(name)
+    else:
+        context = getattr(owner_agent, "_declared_config_context", None)
+        directory = tool_config_dir or getattr(context, "tools_dir", None)
+        ref = next(ref for ref in saved.tools if ref.name == name)
+        refs[name] = {
+            "tool_config_dir": None if directory is None else str(directory),
+            "params": dict(ref.params),
+        }
+        disabled.discard(name)
+    owner_agent._runtime_tools_changed = True
+    receipt["effective_from"] = "next_step"
+    logger.info(
+        "agent_tool_reference_updated owner=%s tool=%s action=%s effective_from=next_step",
+        saved.name,
+        name,
+        "unload" if unload else "bind",
+    )
+    return receipt
+
+
+def bind_tool(
+    owner_agent: Any,
+    name: str,
+    *,
+    tool_config_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Save the reference and expose it to the current Agent's next step."""
+
+    normalized = str(name or "").strip()
+    return _sync_tool_reference(
         owner_agent,
-        _update_owner_config(
+        normalized,
+        saved=_update_owner_config(
             owner_agent,
-            lambda registry, owner_name: registry.bind_tool_ref(owner_name, str(name or "").strip()),
+            lambda registry, owner_name: registry.bind_tool_ref(owner_name, normalized),
         ),
+        tool_config_dir=tool_config_dir,
     )
 
 
 def unload_tool(owner_agent: Any, name: str) -> dict[str, Any]:
-    """Remove a Tool reference without mutating a live Agent."""
+    """Remove the durable reference and hide it from subsequent steps."""
 
-    return _require_saved(
+    normalized = str(name or "").strip()
+    return _sync_tool_reference(
         owner_agent,
-        _update_owner_config(
+        normalized,
+        saved=_update_owner_config(
             owner_agent,
-            lambda registry, owner_name: registry.unload_tool_ref(owner_name, str(name or "").strip()),
+            lambda registry, owner_name: registry.unload_tool_ref(owner_name, normalized),
         ),
+        unload=True,
     )
 
 

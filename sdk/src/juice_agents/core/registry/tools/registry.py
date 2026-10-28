@@ -6,13 +6,13 @@ from __future__ import annotations
 
 import inspect
 import logging
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
 from juice_agents.core.agent.tools.runtime.base_tools import Tool
 from juice_agents.core.config.context import ConfigurationContext
 from juice_agents.core.config.model_catalog import DEFAULT_RUNTIME_MODEL_NAME, load_runtime_model_config
-from juice_agents.core.config.runtime_config import DEFAULT_RUNTIME_CONFIG_PATH
 from juice_agents.core.registry.tools.defaults import (
     get_builtin_tool_context_defaults,
     get_builtin_tool_context_requirements,
@@ -22,6 +22,8 @@ from juice_agents.core.registry.tools.store import ToolConfigStore
 from juice_agents.core.registry.tools.types import ToolConfig, ToolRef
 
 logger = logging.getLogger(__name__)
+
+FILE_TOOL_NAMES = frozenset({"read", "write", "edit", "glob", "grep"})
 
 
 def _safe_identifier(raw: str, *, fallback: str = "generated_tool") -> str:
@@ -180,7 +182,14 @@ class ToolRegistry:
                 defaults[param_name] = str(self.config_dir)
         return defaults
 
-    def _prepare_builtin_params(self, tool_name: str, params: dict[str, Any]) -> dict[str, Any]:
+    def _prepare_builtin_params(
+        self,
+        tool_name: str,
+        params: dict[str, Any],
+        *,
+        agent_name: str | None = None,
+        model_config_name: str = DEFAULT_RUNTIME_MODEL_NAME,
+    ) -> dict[str, Any]:
         """
         为已注册内置工具补齐 registry 能推导的上下文，并提前校验运行时上下文。
 
@@ -189,6 +198,45 @@ class ToolRegistry:
         """
         prepared = self._context_defaults_for(tool_name)
         prepared.update(params)
+        context = self.config_context
+        workspace = context.workspace_dir
+        if workspace is not None:
+            # Resolve relative constructor paths against the target project,
+            # never the framework process cwd. Explicit narrower roots remain
+            # supported; runtime paths are not written into declarations.
+            path_param = "root_dir" if tool_name in FILE_TOOL_NAMES else (
+                "default_workdir" if tool_name == "shell" else None
+            )
+            if path_param is not None:
+                raw_path = Path(prepared.get(path_param) or workspace).expanduser()
+                prepared[path_param] = str((workspace / raw_path).resolve())
+            if tool_name == "python":
+                prepared.setdefault("workspace_dir", workspace)
+        if tool_name in {"todos", "plan"} and agent_name:
+            folder = "todos" if tool_name == "todos" else "plans"
+            prepared.setdefault("file_path", str(context.juice_root / folder / f"{agent_name}.md"))
+        if tool_name in {"skills_list", "skill_view", "skill_manage"}:
+            prepared.setdefault("local_dir", str(context.juice_root / "skills"))
+            prepared.setdefault("config_path", str(context.project_config_path))
+            prepared.setdefault("config_context", context)
+        if tool_name == "api_web_search":
+            prepared.setdefault("config_context", context)
+        if tool_name == "generate_edit_image" and not str(prepared.get("api_key") or "").strip():
+            try:
+                model_cfg = load_runtime_model_config(
+                    model_name=model_config_name or DEFAULT_RUNTIME_MODEL_NAME,
+                    runtime_config_path=context.project_config_path,
+                    workspace_dir=context.workspace_dir,
+                    dotenv_path=context.dotenv_path,
+                    runtime_overrides=context.overrides,
+                )
+            except ValueError:
+                model_cfg = None
+            if model_cfg is not None:
+                for key in ("api_key", "api_base"):
+                    value = getattr(model_cfg, key, None)
+                    if value:
+                        prepared.setdefault(key, value)
         missing = [
             name
             for name in get_builtin_tool_context_requirements().get(tool_name, tuple())
@@ -250,6 +298,8 @@ class ToolRegistry:
         *,
         params: dict[str, Any] | None = None,
         extra_factories: dict[str, Callable[..., Tool]] | None = None,
+        agent_name: str | None = None,
+        model_config_name: str = DEFAULT_RUNTIME_MODEL_NAME,
         **runtime_kwargs: Any,
     ) -> Tool:
         """Build one fresh Tool from a validated static declaration."""
@@ -257,7 +307,8 @@ class ToolRegistry:
         # ``extra_factories`` is a construction-time class mapping only.  It
         # must not carry a live Tool, permission context, or Runner state.
         resolved = self.validate(raw, extra_factories=extra_factories)
-        final_params = dict(params or {})
+        final_params = dict(raw.params) if isinstance(raw, ToolRef) else {}
+        final_params.update(params or {})
         final_params.update(runtime_kwargs)
         if isinstance(resolved, str):
             tool_name = resolved.strip()
@@ -266,10 +317,17 @@ class ToolRegistry:
                 default_names = sorted(get_default_tool_factories().keys())
                 raise ValueError(f"未知工具: {tool_name}，可选内置工具: {default_names}")
             logger.info("实例化 fresh tool: name=%s source=builtin", tool_name)
-            return factory(**self._prepare_builtin_params(tool_name, final_params))
+            return factory(**self._prepare_builtin_params(
+                tool_name, final_params,
+                agent_name=agent_name, model_config_name=model_config_name,
+            ))
 
         defaults = dict(resolved.init_params)
         defaults.update(final_params)
+        # Generated Tool source can resolve project paths and credentials via
+        # the same context as built-ins, including tools saved mid-conversation.
+        defaults.setdefault("config_context", self.config_context)
+        defaults.setdefault("workspace_dir", self.config_context.workspace_dir)
         dynamic_cls = create_dynamic_tool_class(resolved)
         logger.info("实例化 fresh tool: name=%s source=config", resolved.name)
         return dynamic_cls(**defaults)
@@ -287,45 +345,19 @@ class ToolRegistry:
     ) -> list[Tool]:
         """批量实例化工具，并为需要工作区/runtime 配置的工具补齐参数。"""
         tools: list[Tool] = []
-        model_cfg: Any = None
-        resolved_juice_root = (
-            Path(juice_root).resolve()
-            if juice_root is not None
-            else self.config_context.juice_root
-        )
-        resolved_config_path = (
-            Path(runtime_config_path).resolve()
-            if runtime_config_path is not None
-            else self.config_context.project_config_path
-        )
-
+        registry = self
+        if runtime_config_path is not None:
+            # Keep workspace, credentials and transient startup overrides when
+            # selecting an explicit base config for this construction batch.
+            registry = ToolRegistry(config_dir=self.config_dir, config_context=replace(
+                self.config_context, project_config_path=Path(runtime_config_path).resolve(),
+            ))
         for item in tools_config:
             tool_name, params = _normalize_tool_spec(item)
-            if tool_name == "todos" and "file_path" not in params:
-                params["file_path"] = str(resolved_juice_root / "todos" / f"{agent_name}.md")
-            if tool_name == "plan" and "file_path" not in params:
-                params["file_path"] = str(resolved_juice_root / "plans" / f"{agent_name}.md")
-            if tool_name == "api_web_search" and "config_path" not in params:
-                params["config_path"] = str(self.config_context.project_config_path)
-            if tool_name in {"skills_list", "skill_view", "skill_manage"}:
-                params.setdefault("local_dir", str(resolved_juice_root / "skills"))
-                params.setdefault("config_path", str(resolved_config_path))
-            if tool_name == "generate_edit_image" and not str(params.get("api_key", "")).strip():
-                if model_cfg is None:
-                    try:
-                        model_cfg = load_runtime_model_config(
-                            model_name=model_config_name or DEFAULT_RUNTIME_MODEL_NAME,
-                            runtime_config_path=resolved_config_path,
-                            workspace_dir=self.config_context.workspace_dir,
-                        )
-                    except ValueError:
-                        model_cfg = None
-                if model_cfg is not None:
-                    if getattr(model_cfg, "api_key", None):
-                        params.setdefault("api_key", model_cfg.api_key)
-                    if getattr(model_cfg, "api_base", None):
-                        params.setdefault("api_base", model_cfg.api_base)
-            tools.append(self.instantiate(tool_name, params=params, extra_factories=extra_factories))
+            tools.append(registry.instantiate(
+                tool_name, params=params, agent_name=agent_name,
+                model_config_name=model_config_name, extra_factories=extra_factories,
+            ))
         return tools
 
     def list(self) -> list[str]:

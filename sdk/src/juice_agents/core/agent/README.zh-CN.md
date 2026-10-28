@@ -2,326 +2,203 @@
 
 # Agent
 
-`core/agent` 定义智能体协议并管理其运行时生命周期。智能体是使用 ReAct 或 CodeAct 策略执行任务的核心推理单元。
+## 项目工作区
 
-## 核心能力
+根 Agent、子 Agent 和恢复会话中的 Agent 复用 Runner 的 `ConfigurationContext`；
+通过 `tool_manage` 运行时新增的工具也使用同一上下文。文件工具以项目为根，Shell
+默认在项目运行，相对 `workdir` 相对项目解析。Skills 从项目 `.juice/skills`、
+项目 `.agents/skills` 和用户 `~/.agents/skills` 发现，自定义 Skills 存储不会改变项目根目录。
 
-| 功能 | 说明 |
-| --- | --- |
-| 🧠 **ReAct & CodeAct** | 思考-行动推理（ReAct）或 Python 代码执行（CodeAct） |
-| 💾 **会话持久化** | 进程重启后恢复对话和上下文 |
-| 🔄 **上下文压缩** | 自动上下文窗口管理，支持增量压缩 |
-| 🛠️ **丰富工具集** | 20+ 内置工具：Shell、文件系统、Web、浏览器、图像、MCP、Workflow 等 |
-| 📎 **附件注入** | 用户消息、任务通知和异步结果注入 |
-| 🎯 **委派协作** | 根智能体可生成和协调辅助智能体 |
-| 🔒 **受控执行** | 所有工具调用经过权限和审计边界 |
+```text
+ConfigurationContext → Agent / 运行时工具 → 项目文件与 .juice 状态
+```
 
-## 智能体类型
+CodeAct 和 `python` 工具把普通 `open`、具体 `pathlib.Path`、标准 `os` 文件调用和
+子进程工作目录绑定到 workspace，不修改 SDK 进程目录。第三方 API 请传入项目绝对路径，
+或通过 `shell` 运行项目脚本。机器相关路径只放在构造上下文中，不写入 Agent YAML。
 
-### ReAct Agent
+ReAct 和 CodeAct 实现单步协议；`AgentManager` 管理生命周期、上下文检查点和取消。
+工具统一经过 Runner 的权限边界执行。
 
-结构化推理和行动：
+## 内置声明
+
+`build_general_agent()` 构造名称为 `root` 的根 Agent；`general` 仅作为子 Agent。
+SDK 构建函数和 Runner 均由 AgentRegistry 按本地 YAML 优先、统一内置目录兜底解析。
+查看、校验与构造不保存默认声明。Agent list/view 工具对内置资源返回
+`source: builtin`、`path: null`，对本地声明返回 `source: local` 及实际路径。
+
+```text
+读取 / 校验 / 构造 → 本地覆盖 → 内置兜底
+成功编辑           → 校验 → 原子保存完整本地覆盖
+删除本地覆盖       → 恢复内置定义
+```
+
+运行路径、协议临时覆盖与模式限制仅作用于内存副本。首次成功编辑才生成
+`.juice/agents/<name>.yaml`；删除覆盖即恢复内置声明。Team 私有成员的自身编辑
+保留在私有目录，缺失时不回退到同名全局 Agent。
+
+## 动态发现子 Agent
+
+绑定 Runner 的 Agent 在调用时经 `RunnerContext` 查询当前可用子 Agent，与
+`agents_list`、Runner 调度复用同一 Registry 投影。root 动态发现符合条件的声明，
+普通子 Agent 仍限于显式托管关系；启动时的名单快照不作为调用授权依据。
+每次模型请求前比较可见名称和描述，变化时刷新系统提示词，不重建 Agent。
+
+```text
+agent_manage 保存 / Registry 编辑 → 当前可用性查询 → agent_tool
+                                             └──→ 下一步系统提示词
+```
+
+`allowed_modes`、Plan 策略、Team 成员范围和当前 Runner／模式的卸载状态继续生效。
+Team 查询还可展示待选共享 Agent，查看候选不代表加入 Team 前就可调度。
+目标配置在 fresh acquire 时生效，已有目标会话遵守原生命周期；未绑定 Runner 的
+SDK Agent 继续使用显式引用。
+
+## 协议
 
 ```xml
-<thought>我需要检查当前目录结构</thought>
-<actions>[{"name": "list_directory", "args": {"path": "."}}]</actions>
+<!-- ReAct：执行前完成整个 actions 列表的协议校验。 -->
+<thought>阅读项目说明。</thought>
+<actions>[{"name":"read_file","args":{"path":"README.md"}}]</actions>
 ```
-
-**适用场景：** 多步推理、调研、规划、复杂决策。
-
-### CodeAct Agent
-
-执行 Python 代码，包含思考和行动：
 
 ```xml
-<thought>我需要检查项目结构并读取 README</thought>
-<code>
-import os
-files = os.listdir('.')
-print(f"找到 {len(files)} 个文件")
-
-# 通过运行时使用工具
-result = tools.read_file('README.md')
-print(result)
-</code>
+<!-- CodeAct：只在选中后才将代码交给智能体的 Python 运行时。 -->
+<thought>计算结果。</thought>
+<code>submit_output(output=6 * 7)</code>
 ```
 
-**适用场景：** 数据处理、快速迭代、计算任务、算法工作流。
+`submit_output` 结束本轮；空 ReAct actions 写入观测并继续下一步；协议错误反馈给
+下一次模型调用修正。`max_steps` 控制执行预算，保留现有最后一次提交的兜底流程。
 
-## 架构
+## 工具创建契约
+
+`tool_manage` 的配置规范、完整 `save_args` 示例和验证要求，统一维护在它自身的
+`description`、`inputs`、`outputs` 中，由 ReAct 和 CodeAct 现有渲染流程共用。
+固定的工具规范放在工具定义中，不散落到公共系统段落或用户任务消息。
+
+新建工具必须提供配置对象，Python 源码定义 `def forward(self, ...)`，参数与返回值
+分别对应 `inputs` 和 `outputs`，可选参数提供默认值。完整字段和打印当前时间示例
+见运行时渲染的 `tool_manage` 说明。
 
 ```text
-AgentBinding → AgentRegistry.instantiate() → AgentManager.acquire()
-                                              → ManagedAgent
-                                                 • 会话恢复
-                                                 • 上下文绑定
-                                                 • 检查点
-                                                 • 取消处理
+保存声明 → 检查 runtime_refresh → 工具出现在可用列表 → 调用并核验
 ```
 
-**核心原则：** 智能体是无状态的步骤函数。`AgentManager` 管理其生命周期：
+`tool_manage save/unload` 通过 AgentRegistry 持久化工具引用，`root` 同样保存到
+`.juice/agents/root.yaml`。`scheduled` / `next_step` 表示当前 Agent 在下一次模型请求前，
+复用已有运行时引用表刷新工具提示词和 CodeAct 函数，不重建 Agent。恢复会话时读取
+最新声明并刷新快照中的旧提示词。只有声明可更新时返回 `fresh_acquire`；`unsupported`
+不代表已激活。保存报错时工具 YAML 可能已经写入，重试前应先检查声明。分别报告
+保存、登记和调用结果，临时执行 Python 不等于创建工具。测试直接执行渲染示例及
+两种 Agent 协议，无需模型请求。
 
-1. **实例化**：从 Registry 获取全新智能体对象
-2. **恢复**：从磁盘加载会话快照
-3. **绑定**：附加 `RunnerContext` 以进行受控工具执行
-4. **执行**：通过 ReAct/CodeAct 循环处理用户请求
-5. **检查点**：保存会话状态
-6. **释放**：持久化并释放（功能型）或保留（持久型）
+## 每步候选选择
 
-## 工具执行流程
+```python
+from juice_agents.core.agent.context.strategies import GreedyStrategy, TreeOfThoughtsStrategy
 
-智能体不直接拥有工具。所有操作通过 Runner 的权限边界：
+agent.set_exploration_strategy(TreeOfThoughtsStrategy(breadth=3, reward_model=scorer))
+# 恢复每步一次模型请求：
+agent.set_exploration_strategy(GreedyStrategy())
+```
+
+向 `GenerativeRewardModel`（GRM）传入原生 SDK client，生成 JSON 评分，无需配置文件：
+
+```python
+from openai import OpenAI
+
+from juice_agents.core.models.reward_models import GenerativeRewardModel
+
+# OpenAI 从环境变量读取 OPENAI_API_KEY。
+scorer = GenerativeRewardModel(model_name="your-model", client=OpenAI())
+agent.set_exploration_strategy(TreeOfThoughtsStrategy(breadth=3, reward_model=scorer))
+```
+
+[模型层](../models/README.zh-CN.md#奖励模型)提供完整直接构造示例，以及可选的
+`GenerativeRewardModel.from_config(...)` 目录解析入口，负责评分提示词、provider
+调用和分数解析。策略使用注入的评分器选择候选。无效评分和模型异常在执行候选前
+明确报错。
+
+自定义评分器继承普通基类 `BaseRewardModel`，覆盖同步 `evaluate_batch` 方法。
+与 `BaseChatModel` 一样，调用未实现的基类方法时抛出 `NotImplementedError`：
+
+```python
+from juice_agents.core.models.reward_models import BaseRewardModel
+
+class MyRewardModel(BaseRewardModel):
+    def evaluate_batch(self, *, context: list[dict], actions: list[dict]) -> dict:
+        # context 与生成候选时的消息一致；actions 仅包含协议有效的候选：
+        # {"role": "assistant", "content": raw_output}
+        # 本地规则无 SDK 请求；用户实现评分函数，高分更优。
+        return {"scores": score_candidates(context, actions), "usage": None, "usage_calls": []}
+```
 
 ```text
-Agent.step()
-  → RunnerContext.execute_tools(actions)
-     → Runner.tool_manager.execute_for_agent()
-        → 权限检查
-        → 工具绑定
-        → 执行
-        → 审计日志
-        → 返回观测
+当前选中叶子
+  ├─ 候选 0 [淘汰；原始输出 + usage + 评分]
+  ├─ 候选 1 [选中] → 工具/代码执行一次 → 下一步候选
+  └─ 候选 2 [淘汰；原始输出 + usage + 评分]
 ```
 
-这确保了：
-- 统一权限控制
-- 取消信号传播
-- 所有操作的审计追踪
-- 无智能体自有的工作池或执行器
-
-## 内置工具
-
-| 分类 | 工具 |
+| 配置或结果 | 行为 |
 | --- | --- |
-| **文件系统** | `read_file`, `write_file`, `edit_file`, `list_directory`, `search_files` |
-| **执行** | `shell`, `python_repl`, `python_script` |
-| **Web** | `web_search`, `web_fetch`, `browser_navigate`, `browser_screenshot` |
-| **记忆** | `memory_create`, `memory_update`, `memory_search`, `memory_list` |
-| **智能体** | `agent_spawn`, `agent_list`, `agent_message` |
-| **Workflow** | `workflow_call` |
-| **技能** | `skill_view`, `skills_list`, `skill_manage` |
-| **输出** | `submit_output`, `ask_user` |
-| **任务** | `task_create`, `task_update`, `task_list` |
-| **团队** | `team_finish`, `team_members`, `team_broadcast` |
+| 默认、`breadth=1` 或未配置评分器 | 每步一次生成，不评分 |
+| `breadth=N > 1` 且配置评分器 | 相同上下文生成 N 次，只执行一个输出 |
+| 无效协议候选 | 保留协议错误，不参与评分 |
+| 全部无效 | 选择首个候选，走现有协议恢复流程 |
+| 同分 | 选择先生成的有效候选 |
+| 评分失败、数量不符或非有限/非数值评分 | 执行前明确报错并结束本轮 |
 
-工具根据智能体能力和 Runner 策略动态可用。
+`breadth` 必须为正整数。策略不含深度、保留路径数或温度配置；采样仍由模型管理。
+本功能不执行多条路径、不隔离环境、不回溯。CLI 通过 `/strategy breadth=N` 控制
+候选数；`/rm` 打开模型选择页，标记当前奖励模型并提供清除选项；
+`/rm judge` 直接选择目录模型，`/rm reset` 清除奖励模型。选择和清除均保留候选数
+及生成模型。`/strategy reset` 将候选数恢复为 1 并保留奖励模型。
+配置仅在当前 CLI 进程内生效；未配置评分器时显示“线性执行”。
 
-## 上下文管理
+## 上下文与持久化
 
-### 上下文树
+`ContextTree` 保存任务、动作和摘要节点。Manager 在执行前插入全部候选，仅推进一个
+活跃叶子，然后原位更新选中节点的观测结果，不重复追加节点。ReAct 的流式事件和
+持久化观测共用同一次工具执行结果。
 
-智能体上下文以树结构（`ContextTree`）管理，追踪：
+普通 `steps` / `to_messages()` 沿活跃选中分支工作。淘汰节点保留在 `tree.nodes`
+及序列化快照中。Remain 只投影较早的观测；compact 创建摘要续写分支，同时保留
+原节点用于检查。多轮任务接在活跃分支后；`reset_session=True` 清空上下文树和历史。
 
-```text
-Root (TaskStep)
-  ├─ ActionStep 1 (思考 + 工具调用 + 观测)
-  ├─ ActionStep 2
-  │   ├─ 分支 A (探索路径)
-  │   └─ 分支 B (备选路径)
-  └─ ActionStep 3
-```
+Agent 收集生成、摘要及策略评分返回值或异常中的 `usage_calls`，显式转交
+`AgentManager` 持久化及汇总，写入 Runner 根下的
+`agents/model_usage.jsonl`。淘汰候选、空响应重试、评分失败及取消前已知用量均计入，
+批量评分只记一次；functional 或 ephemeral 调用即使不保存 session，也保存 token 元数据。
 
-**核心概念：**
+用量文件不包含 prompt 或 transcript，压缩与恢复均保留。`ContextTree` 只管理对话状态。
+`ActionStep.usage` 保留最后生成响应的用量，用于追踪与窗口校准，不能重复累计入账。
+通过 `runner.agent_manager.model_usage_records()` 查看明细，
+[`runner.token_usage()`](../runner/README.zh-CN.md#token-统计) 查看汇总。
 
-- **ContextNode**：对话中的单个步骤（TaskStep 或 ActionStep）
-- **ExplorationPath**：从根到叶的完整轨迹（用于 Best-of-N）
-- **AgentStep**：所有步骤类型的抽象基类
-
-### 智能体步骤
-
-**TaskStep** - 用户任务输入：
-```python
-TaskStep(
-    task="分析代码库",
-    task_images=[...],        # 可选图像
-    attachments=[...]         # 运行时附件
-)
-```
-
-**ActionStep** - 智能体推理和工具执行：
-```python
-ActionStep(
-    step_num=1,
-    thought="我需要先列出文件",
-    tool_calls=[{"name": "list_directory", "args": {"path": "."}}],
-    observations=["file1.py\nfile2.py\n..."],
-    code_action="",           # CodeAct 智能体使用
-    reasoning_content="",     # 扩展推理
-    round_outcome="continue"  # continue|submitted|failed；只有 submit_output 结束本轮，空 actions 继续下一步
-)
-```
-
-**SummaryStep** - 压缩历史：
-```python
-SummaryStep(
-    content="[前 10 步的压缩摘要...]"
-)
-```
-
-### 会话持久化
-
-会话在重启后完整恢复：
-
-```python
-# 首次运行
-agent = manager.acquire("root", binding, workspace)
-result = agent.step(user_input)
-manager.checkpoint(agent)  # 保存上下文树到磁盘
-
-# 重启后（甚至不同进程）
-agent = manager.acquire("root", binding, workspace)
-# 上下文树自动恢复：
-#   - 完整对话历史
-#   - 工具执行结果
-#   - 压缩部分（如有）
-#   - 节点结构和元数据
-result = agent.step(continuation_input)
-```
-
-**检查点包含：**
-- 包含所有节点的 `ContextTree`
-- 系统提示词（静态 + 动态）
-- 探索路径和选中路径
-- 压缩状态
-- 智能体特定配置
-
-**存储位置：** `.juice/runners/<runner_id>/agents/<agent_id>/session.json`
-
-### 消息序列化
-
-步骤转换为模型消息：
-
-```python
-# TaskStep → user 消息
-{"role": "user", "content": [{"type": "text", "text": "<task>...</task>"}]}
-
-# ActionStep → assistant + user 反馈
-{"role": "assistant", "content": [{"type": "text", "text": "<thought>...</thought>..."}]}
-{"role": "user", "content": [{"type": "text", "text": "<observations>...</observations>"}]}
-```
-
-树追踪当前活动路径并将其转换为发送给模型的消息序列。
-
-## 会话持久化
-
-会话在进程重启后完整恢复：
-
-```python
-# 首次运行
-agent = manager.acquire("root", binding, workspace)
-result = agent.step(user_input)
-manager.checkpoint(agent)  # 保存到磁盘
-
-# 重启后（甚至不同进程）
-agent = manager.acquire("root", binding, workspace)
-# 会话自动恢复
-result = agent.step(continuation_input)
-```
-
-**持久化内容：**
-- 完整的 ContextTree（所有节点和路径）
-- 系统提示词（静态 + 动态）
-- 压缩状态
-- 智能体配置
-
-**存储位置：** `.juice/runners/<runner_id>/agents/<agent_id>/session.json`
-
-**工作原理：**
-1. `manager.checkpoint()` 原子写入会话
-2. `acquire()` 时，manager 从磁盘加载快照
-3. 从 Registry 创建全新的 Agent 实例
-4. 将会话恢复到 Agent
-5. Agent 从中断处继续
-
-## 上下文压缩
-
-接近 token 限制时，Juice 自动压缩历史，同时保留关键信息。
-
-### 压缩策略
-
-**CompactCompressStrategy** - 激进压缩：
-```python
-# 将旧步骤压缩为单个 SummaryStep
-# 保留：当前任务、最近步骤、未完成操作
-# 结果：最大 token 节省
-```
-
-**RemainCompressStrategy** - 保留最近上下文：
-```python
-# 保持最近 N 步完整
-# 仅压缩更早的历史
-# 结果：更好的上下文质量，较少节省
-```
-
-**NoCompressStrategy** - 禁用：
-```python
-# 无压缩（达到限制时失败）
-```
-
-### 增量压缩
-
-压缩是增量的 - 仅处理自上次压缩以来的新内容：
-
-```text
-压缩前：
-  TaskStep → ActionStep1 → ... → ActionStep10
-
-首次压缩后（压缩步骤 1-7）：
-  TaskStep → SummaryStep(1-7) → ActionStep8 → ActionStep9 → ActionStep10
-
-更多步骤 + 第二次压缩后：
-  TaskStep → SummaryStep(1-7) → SummaryStep(8-12) → ActionStep13 → ActionStep14
-```
-
-**永不压缩：**
-- 当前 TaskStep
-- 上次压缩后的步骤
-- 活动观测
-- 未完成的工具调用
-
-**压缩触发：**
-- 接近上下文窗口限制（可配置阈值）
-- 通过压缩 API 手动触发
-
-**存储：** 压缩状态被检查点，因此恢复的会话不会重新压缩。
-
-## 附件
-
-运行时附件向智能体会话注入信息：
-
-```python
-# 用户消息
-attachment = UserMessageAttachment(content="额外上下文")
-agent.attach(attachment)
-
-# 任务通知
-attachment = TaskNotificationAttachment(
-    task_id="task_123",
-    status="completed",
-    result={"output": "..."}
-)
-agent.attach(attachment)
-```
-
-附件在智能体的下一步中作为系统消息出现。
-
-## 模块结构
-
-| 文件 | 用途 |
-| --- | --- |
-| `agents.py` | `MultiStepAgent`、`ReActAgent`、`CodeActAgent` 协议 |
-| `manager.py` | `AgentManager` - 生命周期、快照、检查点 |
-| `attachments.py` | 运行时附件协议 |
-| `tools/` | 工具声明、运行时绑定和适配器 |
-| `context/` | 上下文树、压缩、序列化 |
-| `prompts/` | 系统提示词和提示段 |
+快照保存在 `.juice/runners/<runner_id>/agents/<agent_id>/session.json`。
+恢复时创建全新的 Agent 并加载上下文。向 `AgentManager.acquire(session_state=...)`
+传入 `ContextTree` 或序列化映射，或通过 `deserialize_snapshot` 查看快照时，均生成
+独立上下文；嵌套输出、工具参数、附件、用量和元数据不会与调用方共享。评分器是
+运行时依赖，不进入快照；恢复后需重新注入才能启用多候选选择，否则保持线性执行。
 
 ## 开发约定
 
-- **全新实例**：`AgentManager.acquire()` 始终从 Registry 实例化全新智能体，然后恢复会话。活动智能体永不原地重建。
-- **无工具所有权**：智能体仅通过 `RunnerContext` 执行工具。不拥有 `ToolManager`、线程池或执行器实例。
-- **两种生命周期**：`persistent` 智能体保留其实例；`functional` 智能体在每次请求后检查点并释放。
-- **原子持久化**：检查点是原子写入。所有日志包含 Runner/Agent ID。
-- **计划模式**：规划是根智能体的能力，不是特殊的智能体类型。没有保留的 `plan` 智能体声明。
+| 模块 | 职责 |
+| --- | --- |
+| `agents.py` | 生成、解析、选择，然后执行 ReAct/CodeAct 输出 |
+| `context/strategies/` | 候选数量与评分选择，不修改树 |
+| `../models/reward_models.py` | BaseRewardModel 基类与 GRM 子类，不依赖策略或上下文树 |
+| `manager.py` | Agent 生命周期与候选检查点；持久化及汇总 Agent 转交的用量 |
+| `context/` | 上下文树、选中分支消息、压缩和序列化 |
+| `tools/`、`prompts/` | 工具声明/运行时绑定与固定协议提示词 |
 
-在 `tests/core/agent/` 添加生命周期测试，在 `tests/core/managers/` 添加工具路由测试。
+Persistent 智能体复用活跃实例；functional 智能体在请求结束后释放。禁止原地重建
+活跃 Agent 或创建 Agent 私有 ToolManager。用户提示词仅包含动态任务输入，固定
+流程放在系统提示词。功能测试放在 `tests/core/agent/`，日志注明 Runner/Agent ID。
+
+```bash
+conda activate juice-agents
+python -m pytest tests/core/agent -q
+```

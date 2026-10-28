@@ -32,16 +32,22 @@ python -m build --sdist --wheel --outdir sdk/dist sdk
 pip install sdk/dist/juice_agents-*.whl
 ```
 
-**Configuration:** Before using hosted models, configure `.juice/config.yaml` and provide API keys via environment:
+**Configuration:** SDK defaults work without copying the model catalog. Keep common settings and credentials in `~/.juice/`, and add only project overrides when needed:
 
 ```bash
-mkdir -p .juice
-cp sdk/src/juice_agents/_assets/config.example.yaml .juice/config.yaml
-cp .env.example .env
-# Edit .env with your API keys
+mkdir -p ~/.juice
+# Edit ~/.juice/config.yaml for common settings, ~/.juice/.env for API keys.
+# Optional project overrides: .juice/config.yaml and .env in the workspace.
 ```
 
-Model entries accept an optional `api_base_env`: when the named variable is set (process env > `.env`), it overrides the YAML `api_base`. Built-in Claude models use `ANTHROPIC_BASE_URL`, so switching to a proxy only needs a `.env` change.
+```text
+Configuration: SDK defaults / config_path → ~/.juice/config.yaml → workspace/.juice/config.yaml → startup overrides
+Credentials:   process environment > workspace/.env > ~/.juice/.env
+```
+
+`ConfigurationContext` is the shared read path for runners, models and tools. Credentials never mutate the process environment; config caches detect file creation, deletion, modification and atomic replacement. Missing credentials are reported when a model or keyed tool is used, so listing configuration remains available. Project config writes preserve only project overrides.
+
+Model entries accept an optional `api_base_env`: the named variable overrides YAML `api_base` using the credential precedence above. Built-in Claude models use `ANTHROPIC_BASE_URL`. See [configuration conventions](src/juice_agents/core/config/README.md).
 
 ## Quick Start
 
@@ -281,7 +287,7 @@ runner.stop()     # Cooperative cancellation
 The SDK wheel contains:
 - `juice_agents` package
 - Type stubs
-- Built-in resources (skills, prompts, configs)
+- Prompts and read-only defaults at `juice_agents/core/config/defaults.yaml`
 
 **Not included:**
 - `adapters/` (protocol gateways)
@@ -291,6 +297,8 @@ The SDK wheel contains:
 - `.juice/` runtime data
 
 Configuration and state are written to the caller's workspace.
+The SDK ships no demonstration Skills. Put writable Skills in `.juice/skills`,
+or load read-only sources from `.agents/skills` and configured external directories.
 
 ## Architecture
 

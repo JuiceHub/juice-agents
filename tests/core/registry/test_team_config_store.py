@@ -59,8 +59,9 @@ def test_shared_and_private_members_have_one_source_per_team(tmp_path: Path) -> 
     assert teams.member_config_path("review", "worker").exists()
     assert teams.load_member_config("review", "worker").max_steps == 4
     assert teams.load_member_config("audit", "worker").max_steps == 7
-    with pytest.raises(ValueError, match="review"):
-        agents.delete_config("developer")
+    agents.delete_config("developer")
+    assert agents.get_source("developer") == "builtin"
+    assert teams.load_member_config("review", "shared").allowed_modes == ("team",)
 
 
 def test_minimal_local_member_gets_team_defaults_and_invalid_fields_fail_early(tmp_path: Path) -> None:
@@ -70,7 +71,9 @@ def test_minimal_local_member_gets_team_defaults_and_invalid_fields_fail_early(t
     agents.save_config(_agent("short_lived", lifecycle="functional"))
     teams.create_empty("jokes")
 
-    assert teams.list_shared_member_candidates() == [{"name": "researcher", "description": "Research"}]
+    candidates = {item["name"]: item["description"] for item in teams.list_shared_member_candidates()}
+    assert set(candidates) == {"developer", "researcher"}
+    assert candidates["researcher"] == "Research"
     with pytest.raises(ValueError, match="agents_list"):
         teams.add_member("jokes", "missing", agent_name="default")
     member = teams.add_member("jokes", "dad_joker", config={
@@ -164,7 +167,7 @@ def test_registry_resolves_members_from_global_agent_registry(tmp_path: Path) ->
 
     assert created.member_names == ("researcher", "developer")
     assert resolved.to_dict() == created.to_dict()
-    assert teams.list() == ["review"]
+    assert teams.list() == ["default", "review"]
 
 
 def test_registry_rejects_missing_global_agent_before_writing_manifest(tmp_path: Path) -> None:
@@ -177,12 +180,12 @@ def test_registry_rejects_missing_global_agent_before_writing_manifest(tmp_path:
 
 def test_deleting_referenced_agent_is_rejected_with_team_names(tmp_path: Path) -> None:
     agents, teams = _registries(tmp_path)
-    agents.save_config(_agent("researcher"))
-    teams.create(TeamManifest(team_name="review", member_names=("researcher",)))
+    agents.save_config(_agent("custom_worker"))
+    teams.create(TeamManifest(team_name="review", member_names=("custom_worker",)))
 
     with pytest.raises(ValueError, match=r"review"):
-        agents.delete_config("researcher")
-    assert agents.load_config("researcher").name == "researcher"
+        agents.delete_config("custom_worker")
+    assert agents.load_config("custom_worker").name == "custom_worker"
 
 
 def test_deleting_team_never_deletes_shared_global_agents(tmp_path: Path) -> None:
@@ -199,7 +202,8 @@ def test_deleting_team_never_deletes_shared_global_agents(tmp_path: Path) -> Non
 def test_cold_team_list_does_not_create_workspace_files(tmp_path: Path) -> None:
     _, teams = _registries(tmp_path)
 
-    assert teams.list_manifests() == []
+    assert [manifest.team_name for manifest in teams.list_manifests()] == ["default"]
+    assert teams.get_source("default") == "builtin"
     assert not (tmp_path / ".juice").exists()
 
 
@@ -208,6 +212,96 @@ def test_stdio_team_list_is_cold_and_does_not_bootstrap_runner(tmp_path: Path) -
 
     handlers = RpcHandlers()
 
-    assert handlers.handle_list_team_configs({"base_dir": str(tmp_path)}) == {"teams": []}
+    result = handlers.handle_list_team_configs({"base_dir": str(tmp_path)})
+    assert [team["team_name"] for team in result["teams"]] == ["default"]
+    assert result["teams"][0]["source"] == "builtin"
+    assert result["teams"][0]["manifest_path"] is None
     assert handlers._runtime is None
+    assert not (tmp_path / ".juice").exists()
+
+
+@pytest.mark.parametrize("private", [False, True])
+def test_default_team_first_member_creates_only_required_declarations(tmp_path: Path, private: bool) -> None:
+    agents, teams = _registries(tmp_path)
+    assert teams.validate("default").member_names == ()
+    assert not (tmp_path / ".juice").exists()
+
+    source = {"config": {"instructions": "Review the patch."}} if private else {"agent_name": "developer"}
+    teams.add_member("default", "reviewer", **source)
+
+    assert teams.get_source("default") == "local"
+    assert teams.validate("default").member_names == ("reviewer",)
+    assert teams.member_config_path("default", "reviewer").exists() == private
+    assert not agents.config_dir.exists()
+    assert _registries(tmp_path)[1].load_member_config("default", "reviewer").lifecycle == "persistent"
+    teams.delete("default")
+    assert teams.get_source("default") == "builtin"
+    assert teams.get_manifest("default").member_names == ()
+
+
+def test_builtin_team_and_agent_deletion_is_read_only(tmp_path: Path) -> None:
+    agents, teams = _registries(tmp_path)
+    with pytest.raises(ValueError, match="内置 Agent"):
+        agents.delete_config("developer")
+    with pytest.raises(ValueError, match="内置 Team"):
+        teams.delete("default")
+    assert not (tmp_path / ".juice").exists()
+
+
+def test_default_team_failed_first_member_rolls_back_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _, teams = _registries(tmp_path)
+
+    def deny_commit(_manifest: TeamManifest) -> None:
+        raise PermissionError("manifest write denied")
+
+    monkeypatch.setattr(teams._store, "save_manifest", deny_commit)
+    with pytest.raises(PermissionError, match="denied"):
+        teams.add_member("default", "reviewer", config={"instructions": "Review."})
+
+    assert teams.get_source("default") == "builtin"
+    assert teams.get_manifest("default").member_names == ()
+    assert not list(tmp_path.rglob("*.yaml"))
+    assert not list(tmp_path.rglob("*.tmp"))
+
+
+def test_private_member_never_falls_back_to_builtin_agent(tmp_path: Path) -> None:
+    _, teams = _registries(tmp_path)
+    teams.add_member("default", "developer", config={"instructions": "Private developer."})
+    teams.member_config_path("default", "developer").unlink()
+
+    with pytest.raises(FileNotFoundError):
+        teams.load_member_config("default", "developer")
+    with pytest.raises(ValueError, match="专属成员配置"):
+        teams.validate("default")
+
+
+@pytest.mark.parametrize("name", ["general", "general_worker"])
+def test_agent_override_delete_checks_fallback_team_eligibility(tmp_path: Path, name: str) -> None:
+    agents, teams = _registries(tmp_path)
+    agents.save_config(_agent(name, allowed_modes=["team"]))
+    teams.create(TeamManifest(team_name="review", member_names=(name,)))
+
+    with pytest.raises(ValueError, match="review"):
+        agents.delete_config(name)
+    assert agents.get_source(name) == "local"
+    assert teams.validate("review").member_names == (name,)
+
+
+def test_referenced_agent_edit_preserves_member_lifecycle(tmp_path: Path) -> None:
+    agents, teams = _registries(tmp_path)
+    teams.add_member("default", "dev", agent_name="developer")
+    with pytest.raises(ValueError, match="persistent lifecycle.*default"):
+        agents.save_config(agents.load_config("developer").copy_with(lifecycle="functional"))
+    assert agents.get_source("developer") == "builtin"
+    assert not agents.config_dir.exists()
+
+
+def test_invalid_first_team_edit_leaves_no_declarations(tmp_path: Path) -> None:
+    _, teams = _registries(tmp_path)
+    with pytest.raises(ValueError, match="Shared Agent"):
+        teams.add_member("default", "worker", agent_name="missing")
+    with pytest.raises(ValueError):
+        teams.add_member("default", "worker", config={"tools": ["unknown_tool"]})
+    with pytest.raises(FileNotFoundError):
+        teams.add_member("missing", "worker", agent_name="developer")
     assert not (tmp_path / ".juice").exists()

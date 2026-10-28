@@ -18,7 +18,8 @@ from ..workflows.workflows_tools import WorkflowToolBase
 logger = logging.getLogger(__name__)
 
 # 工具说明即模型写脚本时唯一能看到的 API 文档，所以把最小模板与约束写全。
-_DESCRIPTION = """创建或更新 .juice/workflows/<name>.py；删除请使用通用文件工具。
+_DESCRIPTION = """创建或更新 .juice/workflows/<name>.py；edit 可编辑已有内置 workflow，校验成功后保存同名本地覆盖。
+查看和运行内置 workflow 不复制文件；删除本地覆盖后恢复内置定义。删除请使用通用文件工具。
 
 脚本模板：
 WORKFLOW_METADATA = {

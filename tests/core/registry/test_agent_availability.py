@@ -8,7 +8,6 @@ from pathlib import Path
 import pytest
 
 from juice_agents.core.config.context import ConfigurationContext
-from juice_agents.core.agent.builtin.configs import get_explore_config, get_general_subagent_config
 from juice_agents.core.group.builtin.configs import build_default_group_worker_configs
 from juice_agents.core.registry.agents.availability import is_agent_available
 from juice_agents.core.registry.agents.registry import AgentRegistry
@@ -92,15 +91,18 @@ def test_registry_instantiates_a_fresh_agent_from_an_agentconfig(tmp_path: Path)
     assert first._declared_agent_config is not declaration
 
 
-def test_root_config_can_be_resolved_in_memory_but_never_saved_as_a_declaration(tmp_path: Path) -> None:
+def test_root_is_persisted_but_remains_unavailable_for_child_dispatch(tmp_path: Path) -> None:
+    """Root uses normal declaration storage while retaining its Runner identity."""
+
     registry = _registry(tmp_path)
     root = _config("root", allowed_modes=["agent", "plan"])
 
     assert registry.resolve(root).name == "root"
-    with pytest.raises(ValueError, match="root 是 Runner"):
-        registry.save_config(root)
-    with pytest.raises(ValueError, match="root 是 Runner"):
-        registry.seed_config(root)
+    assert registry.save_config(root) == root
+    assert registry.load_config("root") == root
+    assert _registry(tmp_path).load_config("root") == root
+    assert (tmp_path / ".juice" / "agents" / "root.yaml").is_file()
+    assert "root" in registry.list_configs()
     assert registry.list_available_agents(name="root", mode_id="agent") == {
         "mode_id": "agent",
         "agents": [],
@@ -152,26 +154,26 @@ def test_shared_predicate_enforces_managed_references_for_non_root_dispatch() ->
 def test_cold_availability_query_never_materializes_defaults_or_runtime_state(tmp_path: Path) -> None:
     registry = _registry(tmp_path)
 
-    assert registry.list_available_agents(mode_id="agent") == {"mode_id": "agent", "agents": []}
+    result = registry.list_available_agents(mode_id="agent")
+    assert {entry["name"] for entry in result["agents"]} == {"general", "explore"}
+    assert {entry["source"] for entry in result["agents"]} == {"builtin"}
     assert not (tmp_path / ".juice").exists()
 
 
-def test_available_agent_fallbacks_are_read_only_and_workspace_declarations_win(tmp_path: Path) -> None:
+def test_available_agents_merge_builtins_and_local_declarations(tmp_path: Path) -> None:
     """A transport can preview defaults without shadowing an Agent YAML edit."""
 
     registry = _registry(tmp_path)
     registry.save_config(_config("general", allowed_modes=["agent"]))
 
-    result = registry.list_available_agents(
-        mode_id="agent",
-        fallback_configs=(get_general_subagent_config(), get_explore_config()),
-    )
+    result = registry.list_available_agents(mode_id="agent")
 
     entries = {entry["name"]: entry for entry in result["agents"]}
-    assert entries["general"]["source"] == "workspace"
+    assert entries["general"]["source"] == "local"
     assert entries["general"]["description"] == "general description"
     assert entries["explore"]["source"] == "builtin"
-    assert registry.list_configs() == ["general"]
+    assert "general" in registry.list_configs()
+    assert sorted(path.stem for path in registry.config_dir.glob("*.yaml")) == ["general"]
 
 
 def test_default_group_workers_are_limited_to_group_mode() -> None:

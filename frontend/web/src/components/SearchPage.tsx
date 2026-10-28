@@ -1,12 +1,12 @@
 import React, { useMemo, useState } from "react";
 import { GitBranch, MessageSquareText, Search, Workflow } from "lucide-react";
-import type { ActorSessionsReport, SessionSummary } from "@juice-agents/shared/gateway/types";
+import type { ActiveAgentsReport, SessionSummary } from "@juice-agents/shared/gateway/types";
 import type { MessageBlock } from "@juice-agents/shared/presenter/stream";
 import { buildWorkspaceSearchResults } from "../lib/search.js";
 
 export function SearchPage(props: {
   sessions: SessionSummary[];
-  actorSessionsReport: ActorSessionsReport | null;
+  actorSessionsReport: ActiveAgentsReport | null;
   messages: MessageBlock[];
   onResumeRunner: (runnerId: string) => void;
   onSelectSubactor: (actorName: string) => void;

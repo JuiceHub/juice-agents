@@ -125,3 +125,9 @@ function makePlugin(overrides: Partial<PluginInfo>): PluginInfo {
     ...overrides,
   };
 }
+
+
+test("retired /resources is absent from Web completion", () => {
+  assert.deepEqual(getWebCommandCandidates({ input: "/reso" }), []);
+  assert.deepEqual(getWebCommandCandidates({ input: "/resources " }), []);
+});

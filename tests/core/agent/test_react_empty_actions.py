@@ -12,7 +12,6 @@ from typing import Any, Iterator
 
 import pytest
 
-from juice_agents.core.prebuilt.factory import seed_prebuilt_declarations
 from juice_agents.core.registry.agents import registry as agent_registry_module
 from juice_agents.core.runner import Runner
 
@@ -45,7 +44,6 @@ class _ScriptedModel:
 def harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[Runner, _ScriptedModel]]:
     model = _ScriptedModel()
     monkeypatch.setattr(agent_registry_module, "resolve_runtime_model", lambda **_kwargs: model)
-    seed_prebuilt_declarations(base_dir=tmp_path, runner_config="agent")
     runner = Runner.create(runner_config="agent", base_dir=tmp_path)
     try:
         yield runner, model

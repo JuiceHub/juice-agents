@@ -48,9 +48,4 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 juice_agents = ["py.typed"]
-"juice_agents._assets" = [
-    "config.example.yaml",
-    "skills/*/SKILL.md",
-    "skills/*/data/*.json",
-    "skills/*/scripts/*.py",
-]
+"juice_agents.core.config" = ["defaults.yaml"]

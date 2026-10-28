@@ -4,22 +4,23 @@ ConfigurationContext 封装所有配置源和路径解析逻辑，替代到处�
 runtime_config_path / config_dir / tool_config_dir 的模式。
 
 配置层级（高优先级 → 低优先级）：
-  Runtime Override > Workspace (.juice/config.yaml) > SDK bundled defaults
+  Runtime Override > Workspace > ~/.juice/config.yaml > SDK bundled defaults
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .runtime_config import (
-    DEFAULT_DOTENV_PATH,
     DEFAULT_RUNTIME_CONFIG_PATH,
-    _deep_merge,
-    _read_yaml_object,
-    resolve_runtime_config_path,
-    read_workspace_config,
+    read_credential_values,
+    read_runtime_config,
+    resolve_env_value,
+    user_config_path,
+    user_dotenv_path,
 )
 
 
@@ -36,6 +37,15 @@ class ConfigurationContext:
     project_config_path: Path
     workspace_dir: Path | None
     dotenv_path: Path
+    overrides: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def global_config_path(self) -> Path:
+        return user_config_path()
+
+    @property
+    def global_dotenv_path(self) -> Path:
+        return user_dotenv_path()
 
     @property
     def workspace_config_path(self) -> Path | None:
@@ -62,14 +72,17 @@ class ConfigurationContext:
         return Path.cwd().resolve() / ".juice"
 
     def read_merged_config(self) -> dict[str, Any]:
-        """读取合并后的配置（project + workspace override）。"""
-        resolved_path = resolve_runtime_config_path(self.project_config_path)
-        if not resolved_path.exists():
-            raise FileNotFoundError(f"运行时配置文件不存在: {resolved_path}")
-        payload = _read_yaml_object(resolved_path)
-        if self.workspace_dir is None:
-            return payload
-        return _deep_merge(payload, read_workspace_config(self.workspace_dir))
+        """复用唯一的分层读取入口，保持 Runner、工具与前端口径一致。"""
+        return read_runtime_config(
+            self.project_config_path, workspace_dir=self.workspace_dir, overrides=self.overrides,
+        )
+
+    def read_env_values(self) -> dict[str, str]:
+        """合并用户和项目凭据文件，不改写进程环境。"""
+        return read_credential_values(workspace_dir=self.workspace_dir, dotenv_path=self.dotenv_path)
+
+    def resolve_env(self, name: str) -> str:
+        return resolve_env_value(name, dotenv_values=self.read_env_values())
 
     def get_mapping(self, mapping_name: str) -> dict[str, Any]:
         """从合并配置中提取指定顶层映射。"""
@@ -94,6 +107,7 @@ class ConfigurationContext:
             workspace_dir=self.workspace_dir,
             dotenv_path=self.dotenv_path,
             model_effort=model_effort,
+            runtime_overrides=self.overrides,
         )
 
     @classmethod
@@ -103,6 +117,7 @@ class ConfigurationContext:
         *,
         project_config_path: str | Path | None = None,
         dotenv_path: str | Path | None = None,
+        overrides: dict[str, Any] | None = None,
     ) -> "ConfigurationContext":
         """从 workspace 目录构建配置上下文。"""
         resolved_workspace = (
@@ -110,16 +125,17 @@ class ConfigurationContext:
         )
         return cls(
             project_config_path=(
-                Path(project_config_path).resolve()
+                Path(project_config_path).expanduser().resolve()
                 if project_config_path is not None
                 else DEFAULT_RUNTIME_CONFIG_PATH
             ),
             workspace_dir=resolved_workspace,
             dotenv_path=(
-                Path(dotenv_path).resolve()
+                Path(dotenv_path).expanduser().resolve()
                 if dotenv_path is not None
                 else (resolved_workspace or Path.cwd().resolve()) / ".env"
             ),
+            overrides=deepcopy(overrides or {}),
         )
 
 

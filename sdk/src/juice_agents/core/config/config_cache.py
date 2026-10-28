@@ -2,10 +2,10 @@
 配置文件智能缓存模块（参考 Claude Code 实现）
 
 核心特性：
-- 基于文件 mtime 的自动失效机制
+- 基于每个来源文件 stat 指纹的自动失效机制（包含新增、删除与原子替换）
 - 支持 watchdog 文件监听（可选依赖）
 - 重入保护防止递归加载
-- 多级缓存：内存 + mtime 检查
+- 内存缓存配合逐来源文件指纹检查
 
 使用方式：
     @cached_config_loader(
@@ -21,19 +21,21 @@ from __future__ import annotations
 
 import logging
 import time
+from copy import deepcopy
 from functools import wraps
 from pathlib import Path
-from threading import Lock
+from threading import Lock, local
 from typing import Any, Callable, TypeVar
 
 logger = logging.getLogger(__name__)
 
 # 重入保护：防止 config → logger → config 死循环
-_inside_config_load = False
-_config_load_lock = Lock()
+_loading = local()
 
-# 配置缓存结构：{cache_key: (mtime, data)}
-_config_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+# 每个来源各自保留指纹。取所有文件 mtime 的最大值会漏掉较旧文件的
+# 修改，以及删除/带旧时间戳的原子替换，不能表达分层配置是否发生变化。
+FileFingerprint = tuple[str, tuple[int, ...] | None]
+_config_cache: dict[str, tuple[tuple[FileFingerprint, ...], dict[str, Any]]] = {}
 _cache_lock = Lock()
 
 # 可选的文件监听（需要 watchdog 库）
@@ -53,8 +55,8 @@ try:
             self.cache_key = cache_key
             super().__init__()
 
-        def on_modified(self, event):
-            if not event.is_directory:
+        def on_any_event(self, event):
+            if not event.is_directory and event.event_type in {"modified", "created", "deleted", "moved"}:
                 logger.debug(f"配置文件已变化，失效缓存: {event.src_path}")
                 invalidate_cache(self.cache_key)
 
@@ -62,32 +64,20 @@ try:
 except ImportError:
     Observer = None  # type: ignore
     ConfigFileChangeHandler = None  # type: ignore
-    logger.debug("watchdog 未安装，配置缓存将使用 mtime 检查模式")
+    logger.debug("watchdog 未安装，配置缓存将使用文件指纹检查模式")
 
 
-def _get_file_mtime(path: Path) -> float:
-    """获取文件修改时间，文件不存在返回 0"""
+def _file_fingerprints(file_paths: list[Path]) -> tuple[FileFingerprint, ...]:
+    """Keep absence as a real state; inode/ctime detect atomic replacement."""
+    return tuple(_file_fingerprint(path) for path in file_paths)
+
+
+def _file_fingerprint(path: Path) -> FileFingerprint:
     try:
-        return path.stat().st_mtime if path.exists() else 0.0
-    except Exception:
-        return 0.0
-
-
-def _is_cache_fresh(cache_key: str, file_paths: list[Path]) -> bool:
-    """检查缓存是否新鲜（所有文件 mtime 未变化）"""
-    if cache_key not in _config_cache:
-        return False
-
-    cached_mtime, _ = _config_cache[cache_key]
-
-    # 检查所有相关文件的 mtime
-    for path in file_paths:
-        current_mtime = _get_file_mtime(path)
-        if current_mtime > cached_mtime:
-            logger.debug(f"文件 {path} 已变化，缓存过期 (cached: {cached_mtime}, current: {current_mtime})")
-            return False
-
-    return True
+        stat = path.stat()
+    except FileNotFoundError:
+        return str(path), None
+    return str(path), (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
 
 
 def invalidate_cache(cache_key: str | None = None):
@@ -106,7 +96,7 @@ def setup_file_watcher(cache_key: str, file_path: Path):
     """
     设置文件监听（可选，需要 watchdog）
 
-    优先级：watchdog 监听 > mtime 轮询
+    watchdog 仅提前失效缓存；读取时仍检查完整文件指纹。
     """
     if not _watchdog_available or cache_key in _file_watchers:
         return
@@ -120,7 +110,7 @@ def setup_file_watcher(cache_key: str, file_path: Path):
         _file_watchers[cache_key] = observer
         logger.debug(f"已启动配置文件监听: {file_path}")
     except Exception as e:
-        logger.warning(f"无法启动文件监听，回退到 mtime 模式: {e}")
+        logger.warning(f"无法启动文件监听，继续使用文件指纹检查: {e}")
 
 
 FuncType = TypeVar("FuncType", bound=Callable[..., dict[str, Any]])
@@ -137,7 +127,7 @@ def cached_config_loader(
     参数：
         cache_key_fn: 从函数参数生成缓存 key 的函数
         file_paths_fn: 从函数参数获取需要监听的文件路径列表
-        enable_file_watch: 是否启用文件监听（默认使用 mtime）
+        enable_file_watch: 是否额外启用文件监听（始终检查文件指纹）
 
     示例：
         @cached_config_loader(
@@ -154,27 +144,24 @@ def cached_config_loader(
     def decorator(func: FuncType) -> FuncType:
         @wraps(func)
         def wrapper(*args, **kwargs):
-            global _inside_config_load
-
-            # 重入保护：防止递归加载
-            with _config_load_lock:
-                if _inside_config_load:
-                    logger.warning(f"检测到配置加载重入，跳过缓存: {func.__name__}")
-                    return func(*args, **kwargs)
-
-                _inside_config_load = True
-
+            # 日志初始化可能间接读配置。保护仅限当前线程，不把其他
+            # workspace 的并行读取误判成递归，也不在持锁时调用加载器。
+            if getattr(_loading, "active", False):
+                return func(*args, **kwargs)
+            _loading.active = True
             try:
                 # 生成缓存 key 和文件路径列表
                 cache_key = cache_key_fn(*args, **kwargs)
                 file_paths = file_paths_fn(*args, **kwargs)
+                fingerprints = _file_fingerprints(file_paths)
 
                 # 检查缓存是否新鲜
                 with _cache_lock:
-                    if _is_cache_fresh(cache_key, file_paths):
-                        _, cached_data = _config_cache[cache_key]
+                    cached = _config_cache.get(cache_key)
+                    if cached is not None and cached[0] == fingerprints:
+                        _, cached_data = cached
                         logger.debug(f"配置缓存命中: {cache_key}")
-                        return cached_data
+                        return deepcopy(cached_data)
 
                 # 缓存未命中或已过期，重新加载
                 logger.debug(f"配置缓存未命中，加载: {cache_key}")
@@ -183,9 +170,11 @@ def cached_config_loader(
                 load_time = (time.time() - start_time) * 1000
 
                 # 更新缓存
-                current_mtime = max(_get_file_mtime(p) for p in file_paths) if file_paths else time.time()
-                with _cache_lock:
-                    _config_cache[cache_key] = (current_mtime, data)
+                # A file edited during parsing must be re-read next time; never
+                # attach a new fingerprint to data read from an older file.
+                if _file_fingerprints(file_paths) == fingerprints:
+                    with _cache_lock:
+                        _config_cache[cache_key] = (fingerprints, deepcopy(data))
 
                 logger.debug(f"配置加载完成: {cache_key} ({load_time:.1f}ms)")
 
@@ -196,8 +185,7 @@ def cached_config_loader(
                 return data
 
             finally:
-                with _config_load_lock:
-                    _inside_config_load = False
+                _loading.active = False
 
         return wrapper  # type: ignore[return-value]
 

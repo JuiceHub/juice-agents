@@ -15,6 +15,7 @@ import difflib
 import inspect
 import logging
 import math
+import os
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Generator, Mapping
@@ -22,6 +23,7 @@ from dataclasses import dataclass
 from functools import wraps
 from importlib import import_module
 from importlib.util import find_spec
+from pathlib import Path
 from types import BuiltinFunctionType, FunctionType, ModuleType
 from typing import Any
 
@@ -705,6 +707,102 @@ def set_value(
         setattr(obj, target.attr, value)
 
 
+def _resolve_workspace_call(
+    func: Callable,
+    args: list[Any],
+    kwargs: dict[str, Any],
+    state: dict[str, Any],
+) -> tuple[Callable, list[Any], dict[str, Any]]:
+    """Bind standard Python filesystem calls without changing process cwd.
+
+    The AST interpreter is shared by concurrent Agents, so ``os.chdir`` around
+    execution would race with other tools and sessions. Translate path inputs
+    at the invocation boundary instead. Constructed concrete ``Path`` objects
+    are absolute, so their subsequent methods keep the correct project root.
+    Third-party APIs should receive an absolute Path or use the Shell tool.
+    """
+    workspace = state.get("__workspace_dir__")
+    if workspace is None:
+        return func, args, kwargs
+    root = Path(workspace)
+    module = str(getattr(func, "__module__", "") or "")
+    name = str(getattr(func, "__name__", "") or "")
+
+    def path(value: Any) -> Any:
+        if not isinstance(value, (str, bytes, os.PathLike)):
+            return value  # open/stat also accept integer file descriptors.
+        if isinstance(value, bytes):
+            return os.path.join(os.fsencode(root), value)
+        return str(root / Path(value))
+
+    def replace_path(index: int, keyword: str, *, default: Any = None) -> None:
+        if len(args) > index:
+            args[index] = path(args[index])
+        elif keyword in kwargs:
+            kwargs[keyword] = path(kwargs[keyword])
+        elif default is not None:
+            kwargs[keyword] = path(default)
+
+    if isinstance(func, type) and issubclass(func, Path):
+        constructed = func(*args, **kwargs)
+        return (lambda: root / constructed), [], {}
+    if (module == "pathlib" or module.startswith("pathlib.")) and name == "cwd":
+        return (lambda: root), [], {}
+    if module in {"os", "posix", "nt"}:
+        if name in {"getcwd", "getcwdb"}:
+            value = os.fsencode(root) if name == "getcwdb" else str(root)
+            return (lambda: value), [], {}
+        if name == "chdir":
+            destination = Path(path(args[0] if args else kwargs["path"]))
+            if not destination.is_dir():
+                raise InterpreterError(f"Python working directory does not exist: {destination}")
+            state["__workspace_dir__"] = destination.resolve()
+            return (lambda: None), [], {}
+        if name in {"listdir", "scandir"}:
+            replace_path(0, "path", default=".")
+        elif name in {"stat", "lstat", "mkdir", "makedirs", "remove", "unlink", "rmdir", "removedirs", "access", "chmod", "utime", "walk", "readlink"}:
+            replace_path(0, "top" if name == "walk" else "name" if name == "makedirs" else "path")
+        elif name in {"rename", "replace", "renames"}:
+            replace_path(0, "src")
+            replace_path(1, "dst")
+    elif module in {"posixpath", "ntpath", "genericpath"} and name in {
+        "abspath", "realpath", "exists", "lexists", "isfile", "isdir", "islink",
+        "getsize", "getmtime", "getatime", "getctime", "ismount",
+    }:
+        if args:
+            args[0] = path(args[0])
+        else:
+            for keyword in {"path", "filename", "s"} & kwargs.keys():
+                kwargs[keyword] = path(kwargs[keyword])
+    elif func is builtins.open or (module in {"io", "_io"} and name == "open"):
+        replace_path(0, "file")
+    elif module == "glob" and name in {"glob", "iglob"}:
+        kwargs["root_dir"] = path(kwargs.get("root_dir") or ".")
+    elif module == "shutil" and name in {"copy", "copy2", "copyfile", "copytree", "move"}:
+        replace_path(0, "src")
+        replace_path(1, "dst")
+    elif module == "shutil" and name == "rmtree":
+        replace_path(0, "path")
+    elif module == "subprocess" and name in {"Popen", "run", "call", "check_call", "check_output"}:
+        if len(args) > 9:
+            args[9] = path(args[9] or ".")
+        else:
+            kwargs["cwd"] = path(kwargs.get("cwd") or ".")
+    elif module == "subprocess" and name in {"getoutput", "getstatusoutput"}:
+        import subprocess
+
+        def output_in_workspace() -> Any:
+            command = args[0] if args else kwargs["cmd"]
+            result = subprocess.run(command, shell=True, cwd=root, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True,
+                                    encoding=kwargs.get("encoding"), errors=kwargs.get("errors"))
+            output = result.stdout.removesuffix("\n")
+            return (result.returncode, output) if name == "getstatusoutput" else output
+
+        return output_in_workspace, [], {}
+    return func, args, kwargs
+
+
 def evaluate_call(
     call: ast.Call,
     state: dict[str, Any],
@@ -814,6 +912,7 @@ def evaluate_call(
                 kwargs=kwargs,
                 blocked_shell_patterns=_get_blocked_shell_patterns(state),
             )
+        func, args, kwargs = _resolve_workspace_call(func, args, kwargs, state)
         result = func(*args, **kwargs)
         if func_name == "add_image" and result is not None:
             try:
@@ -1489,9 +1588,12 @@ class LocalPythonExecutor(PythonExecutor):
         blocked_imports: list[str] | None = None,
         blocked_call_prefixes: list[str] | None = None,
         blocked_shell_patterns: list[Any] | None = None,
+        workspace_dir: str | Path | None = None,
     ):
         self.custom_tools: dict[str, Callable] = {}
         self.state: dict[str, Any] = {"__name__": "__main__"}
+        if workspace_dir is not None:
+            self.state["__workspace_dir__"] = Path(workspace_dir).expanduser().resolve()
         self.additional_authorized_imports = additional_authorized_imports
         self.allow_all_imports = bool(allow_all_imports)
         self.authorized_imports = (

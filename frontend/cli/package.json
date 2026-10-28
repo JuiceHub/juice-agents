@@ -8,7 +8,7 @@
     "dev": "tsx watch src/entry.tsx",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test src/*.test.ts src/**/*.test.ts"
+    "test": "tsx --test src/*.test.ts src/**/*.test.ts ../../tests/frontend/*.ts"
   },
   "dependencies": {
     "@juice-agents/shared": "file:../shared",

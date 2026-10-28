@@ -4,8 +4,6 @@
 
 `Runner` is the unified entry point for one conversation request. It does not retain live Agent, Tool, Workflow, or background-task instances; Managers own those mutable objects. Registry resolves and freshly constructs static declarations.
 
-> [Chinese](README.zh-CN.md)
-
 ```text
 Agent / Tool / Workflow declarations
               │ resolve · validate · instantiate
@@ -32,9 +30,14 @@ concurrency and policies. `plan` adds planning capability and a read-only tool
 policy. A custom mode is registered with a `RunnerConfig`; it cannot install a
 dynamic factory or callback that changes execution flow.
 
-The runtime root is always the in-memory `AgentConfig(name="root")`; no mode
-resolves a root YAML. Mode changes retain the Runner ID and root session
-snapshot, then refresh the effective root configuration at an idle boundary.
+Runner resolves `root` and members through AgentRegistry: local declarations
+win, with built-in definitions as fallback. Creating or restoring a Runner
+does not save default Agent YAML or the default Team manifest. The first
+successful edit saves a full local override; deleting that override restores
+the built-in definition. Plan and Team configuration is applied to an
+in-memory copy; root remains excluded from
+child-Agent discovery and dispatch. Mode changes retain the Runner ID and root
+session snapshot, then refresh the effective configuration at an idle boundary.
 Plan Mode is root-owned: `plans/root.md` is the only formal plan artifact and
 only a Manager-verified root may write it or request approval. Team Mode uses
 `TeamManager` for the selected Team's current task board, messages, members and
@@ -62,6 +65,30 @@ calls `AgentManager.acquire_root()`.
 
 ## Agent and tool call path
 
+The workspace is `base_dir`, never the framework checkout or `.juice` itself.
+`ConfigurationContext` supplies all project paths, merged configuration and
+credentials; `runtime_config_path` selects the base layer and `runtime_overrides`
+adds transient launch values. `reconfigure(runtime_overrides=...)` reacquires
+Agents at an idle boundary while keeping sessions, Runner ID and the Team board.
+Registry binds workspace defaults when tools are instantiated, including tools
+added at runtime; portable Agent declarations never store injected machine paths.
+
+```text
+~/.juice/AGENTS[.override].md
+             ↓
+Git root → intermediate directories → base_dir
+             ↓
+root / child / Team / Workflow system prompts
+```
+
+`project_rules.py` prefers a nonempty override at each level and reads only
+`base_dir` for non-Git projects. Combined UTF-8 text, including source/scope
+labels, is limited to 32 KiB; omitted sources produce a warning. Custom role
+prompts are retained. Create/resume takes a fresh rule snapshot, then replaces
+the system prompt after transcript restoration. Agents read deeper directory
+rules before modifying their files; no recursive scanning or tool interception
+is performed. Linked Git worktrees use their own project root.
+
 An Agent does not own an executor or a `ToolManager`. During acquisition,
 `AgentManager` gives it a narrow `RunnerContext`; each action goes back through
 that context to the Runner-owned ToolManager.
@@ -78,6 +105,13 @@ Runner's permission and cancellation boundary. Manager-private helpers may
 execute work, but they do not own persisted state or expose a second executor
 API.
 
+`RunnerContext.list_available_agents()` uses the current Registry availability
+projection for root and intersects it with explicit relationships for children.
+`agent_tool` queries this view at invocation time; root's startup name snapshot
+does not restrict newly saved Agents. Agent refreshes changed child names and
+descriptions before its next model request. Listing, prompt and dispatch share
+mode policy, Team membership and Runner/mode-local unload restrictions.
+
 ## Lifecycle and persistence
 
 `AgentManager.acquire()` is the only initialization path: it loads or creates
@@ -87,14 +121,55 @@ restores its session, binds the runtime context, then checkpoints it.
 - `persistent` Agents retain their live instance and session until released.
 - `functional` Agents are checkpointed and released after their request.
 - `stop()` cooperatively cancels Managers; `close()` releases their resources.
-- `resume()` accepts only the current Runner manifest schema. Historical
-  `.juice/runners/` data is not migrated or resumed.
+- `resume()` accepts only the current Runner manifest schema; historical Runner
+  manifest schemas are not migrated or resumed.
 
 Runner state is rooted at `.juice/runners/<runner_id>/`. The manifest stores
 the serialized `RunnerConfig`, selected Team and mode-local disabled Agents;
 Agent runtime snapshots live under `agents/`. The formal plan artifact is
 always `plans/root.md`.
 Managers own their corresponding task, workflow and tool runtime records.
+
+## Token usage
+
+```python
+usage = runner.token_usage()
+print(usage["generation"])
+print(usage["reward"])
+print(usage["total"])
+records = runner.agent_manager.model_usage_records()
+```
+
+Each group contains:
+
+| Field | Meaning |
+| --- | --- |
+| `requests` | Recorded observable SDK calls |
+| `input_tokens`, `output_tokens`, `total_tokens` | Sums of reported, known counts |
+| `missing_usage_requests` | Calls with missing or incomplete usage |
+
+`Runner.token_usage()` delegates to `AgentManager`, the sole owner of usage
+collection, persistence, and aggregation. Agent and strategy code explicitly
+report model results or exceptions; records live in
+`.juice/runners/<runner_id>/agents/model_usage.jsonl`, without prompts or
+transcripts. Each record contains `kind`, `backend`, `model_name`, `agent_id`,
+`agent_name`, `usage`, and `request_id`.
+
+Use one active Manager per Runner; concurrent workers share that Manager.
+Cold restoration reloads its usage records when the Manager is initialized.
+
+Rejected candidates, empty-response retries, failed scoring, and usage known
+before cancellation count; batch scoring counts once. Summary generation and
+functional/ephemeral calls retain token metadata even without a saved session.
+Compression and resume preserve the file. `ContextTree` does not own accounting;
+`ActionStep.usage` is for tracing and window calibration and is not counted again.
+
+Missing counts are unknown, not zero usage or a zero bill. Totals include known
+counts alongside the missing-call count; they do not estimate tokens or costs.
+SDK-internal transparent network retries and server usage that was never reported
+cannot be reconstructed accurately. Direct model callers inspect the per-call
+[`usage_calls` return field](../models/README.md#return-contract), also attached
+to failures; Models do not maintain totals.
 
 ## Module map
 

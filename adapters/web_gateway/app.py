@@ -135,10 +135,18 @@ def create_app() -> FastAPI:
         return {
             "base_dir": str(runtime.base_dir),
             "workspace_config": read_workspace_config(runtime.base_dir),
+            "effective_config": runtime.effective_config(),
             "sessions": [_serialize_session(summary) for summary in _list_web_sessions(runtime.base_dir)],
             "models": runtime.list_models(),
             "memory": runtime.memory_status(),
         }
+
+    @app.get("/api/effective-config")
+    async def load_effective_config(base_dir: str = ".", runtime_config_path: str | None = None) -> dict[str, Any]:
+        """Expose merged configuration without persisting the inherited values."""
+        return ConfigurationContext.from_workspace(
+            base_dir, project_config_path=runtime_config_path
+        ).read_merged_config()
 
     @app.put("/api/workspace-config")
     async def save_workspace_config(payload: dict[str, Any]) -> dict[str, bool]:
@@ -171,7 +179,8 @@ def create_app() -> FastAPI:
     @app.get("/api/teams/configs/{team_name}")
     async def get_team_config(team_name: str, base_dir: str = ".") -> dict[str, Any]:
         try:
-            return _team_registry_for(base_dir).get_manifest(team_name).to_dict()
+            registry = _team_registry_for(base_dir)
+            return _serialize_team_manifest(registry, registry.get_manifest(team_name))
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -568,7 +577,8 @@ class WebSocketRuntimeConnection:
             team_name = str(payload.get("team_name") or "").strip()
             if not team_name:
                 raise ValueError("team_name 不能为空")
-            return _team_registry_for(payload.get("base_dir") or ".").get_manifest(team_name).to_dict()
+            registry = _team_registry_for(payload.get("base_dir") or ".")
+            return _serialize_team_manifest(registry, registry.get_manifest(team_name))
 
         runtime = self._ensure_runtime(payload)
         if command_type == "switch_permission_mode":
@@ -607,10 +617,6 @@ class WebSocketRuntimeConnection:
         if command_type == "list_available_agents":
             return runtime.list_available_agents(
                 name=None if payload.get("name") is None else str(payload.get("name")),
-                mode_id=None if payload.get("mode_id") is None else str(payload.get("mode_id")),
-            )
-        if command_type == "list_mode_resources":
-            return runtime.list_mode_resources(
                 mode_id=None if payload.get("mode_id") is None else str(payload.get("mode_id")),
             )
         if command_type == "view_skill":
@@ -768,12 +774,12 @@ class WebSocketRuntimeConnection:
     def _new_runtime(self, payload: dict[str, Any]) -> DirectRunnerRuntime:
         return DirectRunnerRuntime(
             base_dir=payload.get("base_dir", "."),
-            permission_mode=payload.get("permission_mode", "default"),
-            agent_mode=payload.get("agent_mode", "agent"),
-            agent_type=payload.get("agent_type", "react"),
+            permission_mode=payload.get("permission_mode"),
+            agent_mode=payload.get("agent_mode"),
+            agent_type=payload.get("agent_type"),
             runtime_config_path=payload.get("runtime_config_path"),
-            model_name=payload.get("model_name", "doubao_lite"),
-            model_effort=payload.get("model_effort", "disabled"),
+            model_name=payload.get("model_name"),
+            model_effort=payload.get("model_effort"),
             ask_handler=self._handle_ask_request,
         )
 
@@ -889,6 +895,17 @@ def _team_registry_for(base_dir: str | Path) -> TeamRegistry:
     return TeamRegistry(config_context=ConfigurationContext.from_workspace(base_dir))
 
 
+def _serialize_team_manifest(registry: TeamRegistry, manifest: TeamManifest) -> dict[str, Any]:
+    """Expose the effective declaration and only paths that exist on disk."""
+
+    source = registry.get_source(manifest.team_name)
+    return {
+        **manifest.to_dict(),
+        "source": source,
+        "manifest_path": str(registry.manifest_path(manifest.team_name)) if source == "local" else None,
+    }
+
+
 def _serialize_team_list(registry: TeamRegistry) -> dict[str, Any]:
     """Return the one Team-list payload shared by HTTP and WebSocket queries."""
 
@@ -898,7 +915,12 @@ def _serialize_team_list(registry: TeamRegistry) -> dict[str, Any]:
                 "team_name": manifest.team_name,
                 "description": manifest.description,
                 "member_names": list(manifest.member_names),
-                "manifest_path": str(registry.manifest_path(manifest.team_name)),
+                "source": registry.get_source(manifest.team_name),
+                "manifest_path": (
+                    str(registry.manifest_path(manifest.team_name))
+                    if registry.get_source(manifest.team_name) == "local"
+                    else None
+                ),
             }
             for manifest in registry.list_manifests()
         ]

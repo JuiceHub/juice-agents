@@ -12,10 +12,11 @@ import logging
 import math
 import re
 from abc import ABC, abstractmethod
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from juice_agents.core.agent.attachments import RuntimeAttachment
 from juice_agents.core.runner.types.identity import new_root_agent_id
@@ -34,8 +35,9 @@ except Exception:  # pragma: no cover - 运行时缺失 jsonschema
     jsonschema_validate = None  # type: ignore
 
 from juice_agents.core.agent.agent_type import DEFAULT_OBSERVATION_IMAGE_CACHE_DIR, ObservationImage
+from juice_agents.core.config.context import ConfigurationContext
 from .local_python_executor import BASE_BUILTIN_MODULES, LocalPythonExecutor
-from juice_agents.core.models import _EmptyModelResponseError
+from juice_agents.core.models.chat_models import _EmptyModelResponseError
 from .prompts import (
     DEFAULT_CODEACT_SYSTEM_PROMPT,
     DEFAULT_REACT_SYSTEM_PROMPT,
@@ -200,12 +202,21 @@ class _RegistryLazyTool(Tool):
     def bind_owner_agent(self, agent: Any) -> None:
         self.owner_agent = agent
 
+    def _instantiate(self) -> Tool:
+        """Use the owner's context for tools added after Agent construction."""
+        from juice_agents.core.registry import ToolRegistry
+        from .tools.runtime.owner_context import resolve_owner_context
+
+        context = resolve_owner_context(self.owner_agent)
+        return ToolRegistry(self.tool_config_dir, config_context=context).instantiate(
+            self.name, params=self.params,
+            agent_name=getattr(self.owner_agent, "name", None),
+        )
+
     def execution_policy(self, args: dict[str, Any], context: Any) -> Any:
         """Resolve the configured Tool's policy without allowing model control."""
 
-        from juice_agents.core.registry import ToolRegistry
-
-        tool = ToolRegistry(self.tool_config_dir).instantiate(self.name, params=self.params)
+        tool = self._instantiate()
         policy_fn = getattr(tool, "execution_policy", None)
         if callable(policy_fn):
             return policy_fn(dict(args), context)
@@ -214,9 +225,7 @@ class _RegistryLazyTool(Tool):
         return ToolExecutionPolicy(mode=ToolExecutionMode.SERIAL)
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
-        from juice_agents.core.registry import ToolRegistry
-
-        tool = ToolRegistry(self.tool_config_dir).instantiate(self.name, params=self.params)
+        tool = self._instantiate()
         if self.owner_agent is not None:
             tool.bind_owner_agent(self.owner_agent)
         with tool.observation_limit(self.current_max_observation_chars):
@@ -606,13 +615,23 @@ class MultiStepAgent(ABC):
         attachments_hook: Callable[[int, "MultiStepAgent"], list[RuntimeAttachment]] | None = None,
         agent_id: str | None = None,
         exploration_strategy: ExplorationStrategy | None = None,
+        config_context: ConfigurationContext | None = None,
     ):
         self.tools = {tool.name: tool for tool in tools}
+        self._declared_config_context = config_context
         self._runtime_tool_refs: dict[str, dict[str, Any]] = {}
         self._runtime_managed_agent_refs: dict[str, dict[str, Any]] = {}
         self._runtime_disabled_tool_names: set[str] = set()
+        # Registry writes persist tool references; this flag schedules one
+        # prompt/executor refresh at the next step without rebuilding Agent.
+        self._runtime_tools_changed = False
         self._runtime_disabled_managed_agent_names: set[str] = set()
+        # This snapshot only detects prompt changes; it never authorizes calls.
+        # Dispatch always queries the current Runner/Registry availability.
+        self._managed_agents_prompt_snapshot: dict[str, ManagedAgentDescriptor] = {}
         self.model = model
+        # 只接收 Manager 显式绑定的结果处理器；Agent 不持有累计用量状态。
+        self.model_usage_handler: Callable[..., None] | None = None
         self.system_prompt_template = system_prompt
         self.prompt_language = normalize_prompt_language(prompt_language)
         # 子智能体关系不再保存为对象列表；运行时只保留 registry 名称引用。
@@ -649,6 +668,7 @@ class MultiStepAgent(ABC):
             allow_names=skill_names or None,
             deny_names=disabled_skill_names or None,
             available_tools=list(self.tools.keys()),
+            config_context=config_context,
         )
         self.skills_enabled = bool(skills_enabled) and self.skill_registry.enabled
         if not self.skills_enabled:
@@ -752,8 +772,20 @@ class MultiStepAgent(ABC):
     def managed_agents_map(self) -> dict[str, ManagedAgentDescriptor]:
         """当前可调度 registry agent 的 prompt 描述视图。"""
 
+        context = getattr(self, "runner_context", None)
+        available = getattr(context, "list_available_agents", None)
+        if callable(available):
+            return {
+                entry["name"]: ManagedAgentDescriptor(
+                    name=entry["name"], description=entry["description"],
+                )
+                for entry in available()["agents"]
+            }
+
         from juice_agents.core.registry import AgentRegistry
 
+        # Detached SDK Agents have no Runner scope; retain their explicit
+        # declaration references until a Manager binds a live context.
         refs = dict(getattr(self, "_runtime_managed_agent_refs", {}) or {})
         disabled = set(getattr(self, "_runtime_disabled_managed_agent_names", set()) or set())
         descriptors: dict[str, ManagedAgentDescriptor] = {}
@@ -789,9 +821,7 @@ class MultiStepAgent(ABC):
     @property
     def available_managed_agent_names(self) -> list[str]:
         """当前 agent_tool 可调度的 registry agent 名称。"""
-        names = set(str(name) for name in dict(getattr(self, "_runtime_managed_agent_refs", {}) or {}))
-        names.difference_update(set(getattr(self, "_runtime_disabled_managed_agent_names", set()) or set()))
-        return sorted(name for name in names if str(name).strip())
+        return sorted(self.managed_agents_map)
 
     @property
     def available_tool_names(self) -> list[str]:
@@ -987,7 +1017,17 @@ class MultiStepAgent(ABC):
         **extra_context: Any,
     ) -> str:
         template = self.system_prompt_template or default_template
-        return _render_system_prompt(template, self._build_prompt_context(**extra_context))
+        rendered = _render_system_prompt(template, self._build_prompt_context(**extra_context))
+        return self._with_workspace_rules(rendered)
+
+    def _with_workspace_rules(self, rendered: str) -> str:
+        """Append source-labelled rules to the system role after Jinja rendering.
+
+        Rules are plain text and may contain literal template expressions.
+        Keeping them out of the template also preserves custom role prompts.
+        """
+        rules = str(getattr(self, "workspace_rules", "") or "")
+        return "\n\n".join(part for part in (rendered, rules) if part.strip())
 
     def _render_segments_with_context(
         self,
@@ -1002,10 +1042,10 @@ class MultiStepAgent(ABC):
         """
         context = self._build_prompt_context(**extra_context)
         if self.system_prompt_template:
-            return _render_system_prompt(self.system_prompt_template, context), ""
+            return self._with_workspace_rules(_render_system_prompt(self.system_prompt_template, context)), ""
         static_text = _render_system_prompt(static_template, context) if static_template else ""
         dynamic_text = _render_system_prompt(dynamic_template, context) if dynamic_template else ""
-        return static_text, dynamic_text
+        return self._with_workspace_rules(static_text), dynamic_text
 
     def _compose_full_system_prompt(self) -> str:
         """把 static / dynamic 两段拼回完整 system prompt 字符串。"""
@@ -1061,12 +1101,18 @@ class MultiStepAgent(ABC):
         return normalized_content
 
     def _prepare_step_execution(self) -> None:
-        """Prepare a step without rebuilding this managed Agent in place.
+        """Refresh derived views while keeping the managed instance stable."""
 
-        Declaration changes are applied only by a later fresh acquire through
-        AgentManager.  Keeping the live instance stable prevents a model step
-        from bypassing Manager lifecycle ownership.
-        """
+        # Dynamic discovery also catches external Registry edits and removals,
+        # not only writes made by this Agent's own agent_manage tool. Compare
+        # descriptions as well as names so editing an existing child is visible.
+        managed_agents = self.model_visible_managed_agents_map
+        if self._runtime_tools_changed or managed_agents != self._managed_agents_prompt_snapshot:
+            self.refresh_system_prompt()
+            self._managed_agents_prompt_snapshot = managed_agents
+        if self._runtime_tools_changed:
+            self.refresh_executor_tools()
+            self._runtime_tools_changed = False
 
     def _normalize_failed_action_step(self, step: ActionStep, exc: Exception) -> ActionStep:
         """
@@ -1161,8 +1207,8 @@ class MultiStepAgent(ABC):
             strategy: 新的探索策略实例
 
         示例:
-            from juice_agents.core.agent.context.strategies import best_of_n_strategy
-            agent.set_exploration_strategy(best_of_n_strategy(n=5))
+            from juice_agents.core.agent.context.strategies import TreeOfThoughtsStrategy
+            agent.set_exploration_strategy(TreeOfThoughtsStrategy(breadth=3, reward_model=scorer))
         """
         self.exploration_strategy = strategy
         logger.info("探索策略已切换: %s", strategy.__class__.__name__)
@@ -1262,7 +1308,9 @@ class MultiStepAgent(ABC):
         # 压缩策略处理
         if self.context_compression_strategy is not None:
             if self.context_compression_strategy.should_compress(self.context):
-                self.context = self.context_compression_strategy.compress(self.context)
+                self.context = self.context_compression_strategy.compress(
+                    self.context, on_model_usage=self._report_model_usage,
+                )
             messages = self.context.to_messages()
             self._pending_request_bytes = self._messages_utf8_bytes(messages)
             return messages
@@ -1282,7 +1330,7 @@ class MultiStepAgent(ABC):
                 preserve_recent_actions=int(compact_config["preserve_recent_actions"]),
             )
             try:
-                self.context = strategy.compress(self.context)
+                self.context = strategy.compress(self.context, on_model_usage=self._report_model_usage)
                 logger.info(
                     "会话 compact 成功: agent=%s estimated_tokens=%s trigger_tokens=%s",
                     self.name,
@@ -1409,9 +1457,94 @@ class MultiStepAgent(ABC):
         cancel_event = self._runner_cancel_event()
         if cancel_event is not None and self._generate_accepts_cancel_event(generate):
             kwargs["cancel_event"] = cancel_event
-        response = generate(messages, **kwargs)
+        try:
+            response = generate(messages, **kwargs)
+        except Exception as exc:
+            self._report_model_usage(kind="generation", model=self.model, error=exc)
+            raise
+        self._report_model_usage(kind="generation", model=self.model, response=response)
         self._check_cancelled()
         return response
+
+    def _report_model_usage(self, **result: Any) -> None:
+        """显式转交调用结果；账本和持久化均由 Manager 的运行时绑定负责。"""
+        handler = getattr(self, "model_usage_handler", None)
+        if handler is not None:
+            handler(**result)
+
+    def _parse_candidate(self, step: ActionStep) -> Any:
+        """复用各 Agent 的协议解析，只校验并返回执行参数，不执行任何动作。"""
+        raise NotImplementedError
+
+    def _select_step_candidate(
+        self, step: ActionStep, messages: list[dict[str, Any]]
+    ) -> Iterator[Any]:
+        """从同一消息快照生成候选；选中后才允许调用方进入执行阶段。
+
+        candidates 是内部事件，由 Manager 在恢复此生成器前统一落树和持久化。
+        选中项替换为调用方传入的 step，使执行结果能原位更新同一个节点；
+        淘汰项保留原始输出、usage 和协议错误，始终不会进入执行逻辑。
+        """
+        from .context.steps import ActionEvent
+
+        strategy = self.exploration_strategy
+        count = strategy.candidate_count
+        candidates: list[ActionStep] = []
+        parsed: list[Any] = []
+        for _ in range(count):
+            candidate = ActionStep(step_num=step.step_num, model_output="")
+            try:
+                # 多候选各自持有消息副本，防止自定义模型修改传入列表后影响后续采样。
+                # 线性路径沿用原调用，不添加请求或改动模型采样接口。
+                response = self._generate_model(deepcopy(messages) if count > 1 else messages)
+            except _EmptyModelResponseError as exc:
+                # 模型层已耗尽空响应重试。将其作为无效候选，允许其他有效候选胜出；
+                # 若最终仍选到空输出，各协议解析会生成原来的可恢复错误。
+                # 异常已通过 _generate_model 上报 Manager；这里仅保留末次响应的
+                # usage 供步骤追踪和上下文校准，不重复汇总重试请求。
+                calls = getattr(exc, "usage_calls", [])
+                response = {"content": "", "usage": calls[-1].get("usage") if calls else None}
+            candidate.reasoning_content = str(response.get("reasoning_content", "") or "")
+            self._record_request_metrics(candidate, response)
+            content = self._record_model_output(candidate, response.get("content", ""))
+            candidate.thought = _extract_block(content, "thought")
+            try:
+                parsed.append(self._parse_candidate(candidate))
+            except AgentError as exc:
+                candidate.error = exc
+                parsed.append(None)
+            candidates.append(candidate)
+
+        selection_error: Exception | None = None
+        try:
+            selected, scores = strategy.select(
+                context=deepcopy(messages), candidates=candidates,
+                on_model_usage=self._report_model_usage,
+            )
+        except Exception as exc:
+            # 评分失败仍保留本步所有已生成输出，但在落树后立即报错，绝不执行。
+            selected, scores, selection_error = 0, [None] * count, exc
+        step.__dict__.update(candidates[selected].__dict__)
+        candidates[selected] = step
+        if count > 1:
+            yield ActionEvent(
+                step_num=step.step_num,
+                event_type="candidates",
+                data={
+                    "steps": candidates,
+                    "scores": scores,
+                    "selected_index": selected,
+                    "strategy": type(strategy).__name__,
+                    "breadth": count,
+                },
+            )
+        # Scoring and Manager checkpoint callbacks can outlive the last model
+        # request and observe cancellation themselves.  Check their boundary
+        # before returning any tool/code parameters to the execution phase.
+        self._check_cancelled()
+        if selection_error is not None:
+            raise selection_error
+        return parsed[selected]
 
     def _reset_tool_runtime_state(self) -> None:
         """
@@ -1484,6 +1617,7 @@ class ReActAgent(MultiStepAgent):
         enable_skill_tools: bool = True,
         enable_workflow_tools: bool = True,
         enable_self_evolution: bool = True,
+        config_context: ConfigurationContext | None = None,
     ):
         if isinstance(tool_executor_max_workers, bool) or not isinstance(tool_executor_max_workers, int) or tool_executor_max_workers <= 0:
             raise ValueError("tool_executor_max_workers 必须为正整数")
@@ -1499,13 +1633,14 @@ class ReActAgent(MultiStepAgent):
                 "local_dir": local_skills_path,
                 "builtin_dir": skills_base_path,
                 "config_path": skills_config_path,
+                "config_context": config_context,
                 "allow_names": skill_names or [],
                 "deny_names": disabled_skill_names or [],
             },
             plugin_tool_params={
                 "workspace_dir": (
-                    Path(local_skills_path).resolve().parent.parent
-                    if local_skills_path is not None
+                    config_context.workspace_dir if config_context is not None else
+                    Path(local_skills_path).resolve().parent.parent if local_skills_path is not None
                     else None
                 ),
                 "config_path": skills_config_path,
@@ -1537,6 +1672,7 @@ class ReActAgent(MultiStepAgent):
             log_file_path=log_file_path,
             prompt_language=prompt_language,
             skills_enabled=enable_skill_tools,
+            config_context=config_context,
         )
 
     def init_system_prompt(self) -> str:
@@ -1822,10 +1958,6 @@ class ReActAgent(MultiStepAgent):
         """Execute resolved actions through the Runner-owned ToolManager."""
         if not action_specs:
             return [], [], [], _NO_SUBMIT_OUTPUT
-        observations: list[str] = []
-        images: list[ObservationImage] = []
-        execution_records: list[dict[str, Any]] = []
-        terminal_output: Any = _NO_SUBMIT_OUTPUT
         resolved = [
             ResolvedToolAction(
                 tool=spec["target"],
@@ -1837,6 +1969,16 @@ class ReActAgent(MultiStepAgent):
         ]
         context = self._tool_execution_context()
         results = self._execute_tools(resolved, context=context)
+        return self._collect_action_results(action_specs, results)
+
+    def _collect_action_results(
+        self, action_specs: list[dict[str, Any]], results: list[ToolExecutionResult]
+    ) -> tuple[list[str], list[ObservationImage], list[dict[str, Any]], Any]:
+        """流式事件与持久化共用同一批工具返回值，聚合时不再次执行工具。"""
+        observations: list[str] = []
+        images: list[ObservationImage] = []
+        execution_records: list[dict[str, Any]] = []
+        terminal_output: Any = _NO_SUBMIT_OUTPUT
         self._current_execution_records = list(results)
         for spec, result in zip(action_specs, results):
             texts, imgs = self._split_result(result.observation)
@@ -1869,6 +2011,17 @@ class ReActAgent(MultiStepAgent):
                     "max_observation_chars": spec["max_observation_chars"],
                 }
             )
+            if result.succeeded and spec["is_terminal"]:
+                target = spec["target"]
+                should_terminal = not hasattr(target, "should_terminal") or bool(target.should_terminal(result.observation))
+                if should_terminal:
+                    terminal_output = spec.get("validated_terminal_output", result.observation)
+                    if spec["name"] == "submit_output":
+                        # Normalize the same execution value before either
+                        # streaming or persistence consumes it.  Structured
+                        # outputs must use JSON here, rather than Python repr
+                        # in tool_end followed by different saved text.
+                        texts = [_serialize_submit_output(terminal_output)]
             block_lines = list(texts)
             for img in imgs:
                 placeholder = f'ObservationImage(image_url="{img.image_url}", description="{img.description}") # 图片内容参考下方observation_image'
@@ -1879,30 +2032,23 @@ class ReActAgent(MultiStepAgent):
             execution_records.append(record)
             if block:
                 observations.append(block)
-            if result.succeeded and spec["is_terminal"]:
-                target = spec["target"]
-                should_terminal = not hasattr(target, "should_terminal") or bool(target.should_terminal(result.observation))
-                if should_terminal:
-                    terminal_output = spec.get("validated_terminal_output", result.observation)
-
         return observations, images, execution_records, terminal_output
 
     def process_actions_streaming(
         self, action_specs: List[dict[str, Any]], step_num: int
     ) -> Iterator[Any]:
-        """
-        逐个执行工具并 yield 流式事件，最终返回聚合结果。
-
-        注意：这个方法会 yield 事件，最后必须通过其他方式获取完整结果。
-        实际使用中，调用者需要收集这些事件并调用 process_actions 获取完整数据。
-        """
+        """逐个执行一次工具，yield 事件，再通过生成器返回同一批结果的聚合值。"""
         from .context.steps import ActionEvent
         import time
 
         if not action_specs:
-            return
+            return [], [], [], _NO_SUBMIT_OUTPUT
 
-        context = self._tool_execution_context()
+        results: list[ToolExecutionResult] = []
+        observations: list[str] = []
+        images: list[ObservationImage] = []
+        records: list[dict[str, Any]] = []
+        terminal_output: Any = _NO_SUBMIT_OUTPUT
 
         for idx, spec in enumerate(action_specs):
             # Yield 工具开始事件
@@ -1927,23 +2073,18 @@ class ReActAgent(MultiStepAgent):
 
             try:
                 result = self._execute_tool_action(resolved_action, order=idx)
+                results.append(result)
                 execution_time = time.time() - start_time
-
-                # 构建 observation 文本
-                texts, imgs = self._split_result(result.observation)
-                if result.status not in {"completed", "background"} and result.error:
-                    if result.status == "denied" and not _policy_allows_tool(self, spec["target"]):
-                        texts = [_policy_denial_message(spec["name"])]
-                    elif result.status == "failed":
-                        detail = str(result.error)
-                        if ": " in detail:
-                            detail = detail.split(": ", 1)[1]
-                        texts = [f"工具 {spec['name']} 执行失败: {detail}"]
-                    else:
-                        texts = [str(result.error)]
-                if not texts and not imgs:
-                    texts = ["执行完成，工具无返回值"] if result.status in {"completed", "background"} else []
-
+                # 只投影已有返回值；持久化随后仍使用这里的 result。
+                texts, result_images, result_records, output = self._collect_action_results([spec], [result])
+                for record in result_records:
+                    if record["observation_index"] is not None:
+                        record["observation_index"] += len(observations)
+                observations.extend(texts)
+                images.extend(result_images)
+                records.extend(result_records)
+                if output is not _NO_SUBMIT_OUTPUT:
+                    terminal_output = output
                 observation_text = "\n".join(texts)
                 error_text = str(result.error) if result.error else None
 
@@ -1973,6 +2114,11 @@ class ReActAgent(MultiStepAgent):
                         "execution_time": execution_time,
                     },
                 )
+                # 基础设施异常不能静默吞掉；否则缺失的结果会错配到后续工具。
+                raise
+
+        self._current_execution_records = results
+        return observations, images, records, terminal_output
 
     @staticmethod
     def _tool_call_records_for_display(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1997,6 +2143,13 @@ class ReActAgent(MultiStepAgent):
             )
         return tool_calls
 
+    def _parse_candidate(self, step: ActionStep) -> list[dict[str, Any]]:
+        if not step.model_output.strip():
+            raise _build_react_empty_output_protocol_error()
+        action_specs = self._resolve_action_targets(self.parse_actions(step.model_output))
+        self._validate_actions_protocol(action_specs)
+        return action_specs
+
     def step(self, step: ActionStep) -> Iterator[Any]:
         """
         执行单步推理，yield 流式事件。
@@ -2008,25 +2161,12 @@ class ReActAgent(MultiStepAgent):
 
         self._prepare_step_execution()
         messages = self.build_messages()
-        try:
-            # 不下发 stop_sequence：让模型自己吐完闭合标签，输出即完整协议报文。
-            # 多吐的尾部内容由 _validate_react_protocol 显式报错、交模型下一轮修复，
-            # 而不是在此静默补齐或截断。
-            response = self._generate_model(messages)
-        except _EmptyModelResponseError as exc:
-            # BaseChatModel 已经在同一次 generate() 内做过空响应重试；
-            # 只有重试耗尽时才回到 agent 协议层，把它翻译成下一轮可修复的 <error>。
-            raise _build_react_empty_output_protocol_error() from exc
-        content = str(response.get("content", "") or "")
-        self._record_request_metrics(step, response)
-        step.reasoning_content = str(response.get("reasoning_content", "") or "")
-        self._record_model_output(step, content)
-        step.thought = _extract_block(content, "thought")
+        action_specs = yield from self._select_step_candidate(step, messages)
 
         # 对未继承 BaseChatModel 的自定义裸 generate(...) 模型，仍保留旧兜底，
         # 这样不要求所有外部模型立刻实现同样的空响应重试协议。
-        if not content.strip():
-            raise _build_react_empty_output_protocol_error()
+        if not step.model_output.strip():
+            raise step.error or _build_react_empty_output_protocol_error()
 
         # → Yield 思考事件（模型生成完成，工具尚未执行）
         yield ActionEvent(
@@ -2039,20 +2179,12 @@ class ReActAgent(MultiStepAgent):
             },
         )
 
-        # 外层协议校验（actions 恰好 1 个 + 尾部无残留）在 parse_actions 内完成
-        actions = self.parse_actions(content)
-        action_specs = self._resolve_action_targets(actions)
-        # 先完成协议级校验，再执行工具，避免"前几个工具已经生效，后面才发现
-        # submit_output/未知工具 不合法"的半成功状态。
-        self._validate_actions_protocol(action_specs)
+        if step.error is not None:
+            raise step.error
 
         # → Yield 工具执行的流式事件
-        for tool_event in self.process_actions_streaming(action_specs, step.step_num):
-            yield tool_event
-
-        # 批量执行工具获取完整结果（用于持久化）
-        observations, observation_images, execution_records, terminal_output = self.process_actions(
-            action_specs
+        observations, observation_images, execution_records, terminal_output = yield from (
+            self.process_actions_streaming(action_specs, step.step_num)
         )
         if not action_specs:
             # 空 actions 与普通步一致：给出 observation 后进入下一步，由 max_steps 兜底。
@@ -2077,13 +2209,9 @@ class ReActAgent(MultiStepAgent):
         else:
             step.round_outcome = "submitted"
             step.output = terminal_output
-            # 终止步的最终值由 runtime 单独维护；当当前 observation 为空，或
-            # submit_output 需要稳定 JSON 文本时，再回填一份纯文本结果供日志
-            # / session / 展示复用，避免把协议 tag 或 Python repr 泄漏出去。
-            if (
-                not step.observations
-                or (action_specs and action_specs[0]["name"] == "submit_output")
-            ):
+            # Normal terminal observations already came from the shared
+            # result projection.  Only an absent observation needs fallback.
+            if not step.observations:
                 step.observations = [_serialize_submit_output(terminal_output)]
 
         # → Yield 完整步骤事件（用于持久化到 Context）
@@ -2129,6 +2257,7 @@ class CodeActAgent(MultiStepAgent):
         enable_skill_tools: bool = True,
         enable_workflow_tools: bool = True,
         enable_self_evolution: bool = True,
+        config_context: ConfigurationContext | None = None,
     ):
         prompt_language = normalize_prompt_language(prompt_language)
         if isinstance(tool_executor_max_workers, bool) or not isinstance(tool_executor_max_workers, int) or tool_executor_max_workers <= 0:
@@ -2141,13 +2270,14 @@ class CodeActAgent(MultiStepAgent):
                 "local_dir": local_skills_path,
                 "builtin_dir": skills_base_path,
                 "config_path": skills_config_path,
+                "config_context": config_context,
                 "allow_names": skill_names or [],
                 "deny_names": disabled_skill_names or [],
             },
             plugin_tool_params={
                 "workspace_dir": (
-                    Path(local_skills_path).resolve().parent.parent
-                    if local_skills_path is not None
+                    config_context.workspace_dir if config_context is not None else
+                    Path(local_skills_path).resolve().parent.parent if local_skills_path is not None
                     else None
                 ),
                 "config_path": skills_config_path,
@@ -2184,16 +2314,30 @@ class CodeActAgent(MultiStepAgent):
             log_file_path=log_file_path,
             prompt_language=prompt_language,
             skills_enabled=enable_skill_tools,
+            config_context=config_context,
         )
         self.executor = LocalPythonExecutor(
             additional_authorized_imports=additional_authorized_imports,
             additional_functions=None,
+            workspace_dir=self.skill_registry.workspace_dir,
         )
         self.executor.send_tools(self._build_executor_tool_registry())
         self.executor.send_variables({"ObservationImage": ObservationImage})
 
     def parse_code(self, model_output: str) -> str:
         return _extract_block(model_output, "code")
+
+    def _parse_candidate(self, step: ActionStep) -> str:
+        if not step.model_output.strip():
+            raise _build_codeact_empty_output_protocol_error()
+        code = self.parse_code(step.model_output)
+        if not code:
+            raise ModelOutputProtocolError(
+                "模型输出格式错误: Invalid output format. Required:\n"
+                "<thought>...</thought>\n<code>...</code>"
+            )
+        step.code_action = code
+        return code
 
     def _wrap_images(self, images: list[Any]) -> list[Any]:
         wrapped: list[Any] = []
@@ -2223,19 +2367,12 @@ class CodeActAgent(MultiStepAgent):
 
         self._prepare_step_execution()
         messages = self.build_messages()
-        try:
-            response = self._generate_model(messages)
-        except _EmptyModelResponseError as exc:
-            raise _build_codeact_empty_output_protocol_error() from exc
-        step.reasoning_content = str(response.get("reasoning_content", "") or "")
-        self._record_request_metrics(step, response)
-        content = self._record_model_output(step, response.get("content", ""))
-        step.thought = _extract_block(content, "thought")
+        code_block = yield from self._select_step_candidate(step, messages)
 
         # 自定义裸 generate(...) 模型仍走这里的旧兜底；
         # 只有 BaseChatModel 体系才会在模型层先做空响应重试。
-        if not str(content or "").strip():
-            raise _build_codeact_empty_output_protocol_error()
+        if not step.model_output.strip():
+            raise step.error or _build_codeact_empty_output_protocol_error()
 
         # → Yield 思考事件
         yield ActionEvent(
@@ -2248,14 +2385,8 @@ class CodeActAgent(MultiStepAgent):
             },
         )
 
-        code_block = self.parse_code(content)
-        if not code_block:
-            raise ModelOutputProtocolError(
-                "模型输出格式错误: Invalid output format. Required:\n"
-                "<thought>...</thought>\n"
-                "<code>...</code>"
-            )
-        step.code_action = code_block
+        if step.error is not None:
+            raise step.error
 
         # → Yield 代码执行开始事件
         yield ActionEvent(

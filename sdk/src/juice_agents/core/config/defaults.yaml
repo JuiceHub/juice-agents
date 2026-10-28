@@ -1,3 +1,4 @@
+# SDK 只读默认配置。项目设置请写入 <workspace>/.juice/config.yaml。
 models:
   doubao_lite:
     backend: doubao

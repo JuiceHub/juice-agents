@@ -2,7 +2,7 @@
 统一运行时配置中的模型目录加载与模型解析。
 
 该模块服务于 runner / prebuilt / TUI：
-- 从 `config/config.yaml` 的 `models` 顶层读取逻辑模型目录；
+- 从合并运行时配置的 `models` 顶层读取逻辑模型目录；
 - 从 `.env` / 环境变量解析密钥；
 - 根据 `backend=openai|doubao|anthropic|composite` 选择具体模型实现。
 
@@ -14,21 +14,21 @@
 from __future__ import annotations
 
 import logging
-import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 from weakref import WeakValueDictionary
 
-from juice_agents.core.models import AnthropicModel, DoubaoModel, OpenAIModel
-from juice_agents.core.utils import load_env_file
+from juice_agents.core.models.chat_models import ChatModel
 
 from .runtime_config import (
     DEFAULT_DOTENV_PATH,
-    DEFAULT_RUNTIME_CONFIG_EXAMPLE_PATH,
     DEFAULT_RUNTIME_CONFIG_PATH,
     get_evaluator_config,
     get_runtime_mapping,
+    credential_paths,
+    read_credential_values,
+    resolve_env_value,
     resolve_runtime_config_path,
 )
 
@@ -69,13 +69,14 @@ class RuntimeModelConfig:
     api_base: str = ""
     api_key_env: str = ""
     provider_model_name: str = ""
-    api_key: str = ""
+    api_key: str = field(default="", repr=False)
 
 
 def _load_catalog_payload(
     runtime_config_path: str | Path | None,
     *,
     workspace_dir: str | Path | None = None,
+    runtime_overrides: dict[str, Any] | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     resolved_path = resolve_runtime_config_path(runtime_config_path)
     if not resolved_path.exists():
@@ -84,6 +85,7 @@ def _load_catalog_payload(
         "models",
         config_path=resolved_path,
         workspace_dir=workspace_dir,
+        overrides=runtime_overrides,
     )
 
 
@@ -100,29 +102,41 @@ def _normalize_backend(model_name: str, raw: dict[str, Any]) -> RuntimeBackend:
     return backend  # type: ignore[return-value]
 
 
-def _read_env_value(name: str, *, dotenv_path: str | Path | None) -> str:
-    """读取变量值：进程环境变量优先，其次 .env 文件；未配置返回空串。"""
-    env_values = load_env_file(dotenv_path or DEFAULT_DOTENV_PATH)
-    return str(os.environ.get(name) or env_values.get(name) or "").strip()
+def _read_env_value(
+    name: str, *, dotenv_path: str | Path | None, workspace_dir: str | Path | None = None,
+) -> str:
+    """所有模型入口使用统一凭据来源，显式 .env 仍作为项目级来源。"""
+    return resolve_env_value(
+        name, dotenv_values=read_credential_values(workspace_dir=workspace_dir, dotenv_path=dotenv_path),
+    )
 
 
-def _resolve_api_key(*, api_key_env: str, dotenv_path: str | Path | None) -> str:
-    value = _read_env_value(api_key_env, dotenv_path=dotenv_path)
+def _resolve_api_key(
+    *, api_key_env: str, dotenv_path: str | Path | None, workspace_dir: str | Path | None = None,
+) -> str:
+    value = _read_env_value(api_key_env, dotenv_path=dotenv_path, workspace_dir=workspace_dir)
     if not value:
-        raise ValueError(f"模型密钥环境变量未配置: {api_key_env}")
+        locations = ", ".join(str(path) for path in credential_paths(
+            workspace_dir=workspace_dir, dotenv_path=dotenv_path,
+        ))
+        raise ValueError(f"模型密钥环境变量未配置: {api_key_env}；请设置进程环境变量，或写入 {locations}")
     return value
 
 
-def _resolve_api_base(*, api_base: str, api_base_env: str, dotenv_path: str | Path | None) -> str:
+def _resolve_api_base(
+    *, api_base: str, api_base_env: str, dotenv_path: str | Path | None,
+    workspace_dir: str | Path | None = None,
+) -> str:
     """
     解析 API base URL，优先级：api_base_env 指向的变量 > YAML 中的 api_base。
 
     便于在 .env 中切换官方地址与代理/中转地址，而无需修改模型目录 YAML。
     """
     if api_base_env:
-        env_value = _read_env_value(api_base_env, dotenv_path=dotenv_path)
+        env_value = _read_env_value(api_base_env, dotenv_path=dotenv_path, workspace_dir=workspace_dir)
         if env_value:
-            logger.info("api_base 由环境变量 %s 覆盖: %s", api_base_env, env_value)
+            # URLs may embed credentials; only log the source variable name.
+            logger.info("api_base 由环境变量 %s 覆盖", api_base_env)
             return env_value
     return api_base
 
@@ -239,9 +253,12 @@ def validate_runtime_model_effort(
     model_effort: str | None,
     runtime_config_path: str | Path | None = None,
     workspace_dir: str | Path | None = None,
+    runtime_overrides: dict[str, Any] | None = None,
 ) -> RuntimeModelEffort:
     normalized = normalize_runtime_model_effort(model_effort)
-    _, models = _load_catalog_payload(runtime_config_path, workspace_dir=workspace_dir)
+    _, models = _load_catalog_payload(
+        runtime_config_path, workspace_dir=workspace_dir, runtime_overrides=runtime_overrides,
+    )
     raw_model = models.get(str(model_name or "").strip())
     if not isinstance(raw_model, dict):
         raise ValueError(f"模型目录中不存在模型: {model_name}")
@@ -286,12 +303,15 @@ def load_runtime_model_config(
     runtime_config_path: str | Path | None = None,
     workspace_dir: str | Path | None = None,
     dotenv_path: str | Path | None = None,
+    runtime_overrides: dict[str, Any] | None = None,
 ) -> RuntimeModelConfig:
     normalized_model_name = str(model_name or "").strip()
     if not normalized_model_name:
         raise ValueError("model_name 不能为空")
 
-    _, models = _load_catalog_payload(runtime_config_path, workspace_dir=workspace_dir)
+    _, models = _load_catalog_payload(
+        runtime_config_path, workspace_dir=workspace_dir, runtime_overrides=runtime_overrides,
+    )
     raw_model = models.get(normalized_model_name)
     if not isinstance(raw_model, dict):
         raise ValueError(f"模型目录中不存在模型: {normalized_model_name}")
@@ -312,8 +332,11 @@ def load_runtime_model_config(
         api_base=str(raw_model.get("api_base") or "").strip(),
         api_base_env=str(raw_model.get("api_base_env") or "").strip(),
         dotenv_path=dotenv_path,
+        workspace_dir=workspace_dir,
     )
-    api_key = _resolve_api_key(api_key_env=api_key_env, dotenv_path=dotenv_path)
+    api_key = _resolve_api_key(
+        api_key_env=api_key_env, dotenv_path=dotenv_path, workspace_dir=workspace_dir,
+    )
 
     return RuntimeModelConfig(
         model_name=normalized_model_name,
@@ -329,8 +352,11 @@ def list_runtime_models(
     *,
     runtime_config_path: str | Path | None = None,
     workspace_dir: str | Path | None = None,
+    runtime_overrides: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    _, models = _load_catalog_payload(runtime_config_path, workspace_dir=workspace_dir)
+    _, models = _load_catalog_payload(
+        runtime_config_path, workspace_dir=workspace_dir, runtime_overrides=runtime_overrides,
+    )
     items: list[dict[str, Any]] = []
     for model_name in sorted(models.keys()):
         raw = dict(models.get(model_name) or {})
@@ -362,6 +388,7 @@ def resolve_runtime_model(
     workspace_dir: str | Path | None = None,
     dotenv_path: str | Path | None = None,
     model_effort: str | None = None,
+    runtime_overrides: dict[str, Any] | None = None,
     _resolution_stack: tuple[str, ...] = (),
     _enable_cache: bool = True,
 ) -> Any:
@@ -371,21 +398,6 @@ def resolve_runtime_model(
     性能优化：使用实例池复用已创建的模型对象，避免重复初始化 SDK 客户端。
     """
     normalized_model_name = str(model_name or "").strip()
-
-    # 生成缓存 key
-    cache_key = (
-        f"{normalized_model_name}:"
-        f"{model_effort or 'default'}:"
-        f"{runtime_config_path or 'default'}:"
-        f"{workspace_dir or 'default'}"
-    )
-
-    # 尝试从缓存获取
-    if _enable_cache:
-        with _pool_lock:
-            if cache_key in _MODEL_INSTANCE_POOL:
-                logger.debug(f"模型实例缓存命中: {normalized_model_name}")
-                return _MODEL_INSTANCE_POOL[cache_key]
 
     # 循环引用检测（移除 composite 后不再需要，但保留以备未来使用）
     if normalized_model_name in _resolution_stack:
@@ -397,13 +409,26 @@ def resolve_runtime_model(
         runtime_config_path=runtime_config_path,
         workspace_dir=workspace_dir,
         dotenv_path=dotenv_path,
+        runtime_overrides=runtime_overrides,
     )
     normalized_effort = validate_runtime_model_effort(
         model_name=config.model_name,
         model_effort=model_effort,
         runtime_config_path=runtime_config_path,
         workspace_dir=workspace_dir,
+        runtime_overrides=runtime_overrides,
     )
+
+    # Resolve files and credentials before consulting the pool. A cached client
+    # must never hide a changed/deleted config or reuse another project's key.
+    # RuntimeModelConfig masks api_key in repr; cache diagnostics log names only.
+    cache_key = (config, normalized_effort, str(Path(workspace_dir or Path.cwd()).resolve()))
+    if _enable_cache:
+        with _pool_lock:
+            cached = _MODEL_INSTANCE_POOL.get(cache_key)
+            if cached is not None:
+                logger.debug("模型实例缓存命中: %s", normalized_model_name)
+                return cached
 
     logger.info(
         "解析运行时模型: model_name=%s backend=%s provider_model_name=%s",
@@ -411,33 +436,25 @@ def resolve_runtime_model(
         config.backend,
         config.provider_model_name,
     )
-    # Anthropic 使用 output_config.effort + adaptive thinking（官方推荐）
+    # 模型类型保持统一；仅在此将目录中的 effort 转为各 provider 的原生配置。
+    kwargs = {
+        "backend": config.backend,
+        "api_base": config.api_base,
+        "api_key": config.api_key,
+        "model_name": config.provider_model_name,
+    }
     if config.backend == "anthropic":
-        model = AnthropicModel(
-            api_base=config.api_base,
-            api_key=config.api_key,
-            model_name=config.provider_model_name,
-            thinking=build_anthropic_thinking_config(normalized_effort),
-            effort_config=build_anthropic_effort_config(normalized_effort),
-        )
+        kwargs["thinking"] = build_anthropic_thinking_config(normalized_effort)
+        kwargs["effort_config"] = build_anthropic_effort_config(normalized_effort)
     else:
-        # Doubao/OpenAI 继续使用 thinking.effort 方式
-        kwargs = {
-            "api_base": config.api_base,
-            "api_key": config.api_key,
-            "model_name": config.provider_model_name,
-            "thinking": build_thinking_override(normalized_effort),
-        }
-        if config.backend == "doubao":
-            model = DoubaoModel(**kwargs)
-        else:
-            model = OpenAIModel(**kwargs)
+        kwargs["thinking"] = build_thinking_override(normalized_effort)
+    model = ChatModel(**kwargs)
 
     # 加入缓存
     if _enable_cache:
         with _pool_lock:
             _MODEL_INSTANCE_POOL[cache_key] = model
-            logger.debug(f"模型实例已缓存: {cache_key}")
+            logger.debug("模型实例已缓存: %s", normalized_model_name)
 
     return model
 
@@ -447,22 +464,25 @@ def resolve_evaluator_model(
     runtime_config_path: str | Path | None = None,
     workspace_dir: str | Path | None = None,
     dotenv_path: str | Path | None = None,
+    runtime_overrides: dict[str, Any] | None = None,
 ) -> Any:
     """Resolve an independent lightweight model for goal evaluation."""
 
-    evaluator_config = get_evaluator_config(runtime_config_path, workspace_dir=workspace_dir)
+    evaluator_config = get_evaluator_config(
+        runtime_config_path, workspace_dir=workspace_dir, overrides=runtime_overrides,
+    )
     return resolve_runtime_model(
         model_name=evaluator_config["model"],
         runtime_config_path=runtime_config_path,
         workspace_dir=workspace_dir,
         dotenv_path=dotenv_path,
         model_effort=evaluator_config["model_effort"],
+        runtime_overrides=runtime_overrides,
     )
 
 
 __all__ = [
     "DEFAULT_DOTENV_PATH",
-    "DEFAULT_RUNTIME_CONFIG_EXAMPLE_PATH",
     "DEFAULT_RUNTIME_CONFIG_PATH",
     "DEFAULT_RUNTIME_MODEL_NAME",
     "RuntimeModelConfig",

@@ -5,6 +5,7 @@ Agent registry：统一管理 Agent 配置与运行时 Agent 实例创建。
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 import logging
 from pathlib import Path
 from collections.abc import Iterable
@@ -18,6 +19,8 @@ from juice_agents.core.config.model_catalog import (
     resolve_runtime_model,
 )
 from juice_agents.core.registry.agents.store import AgentConfigStore
+from juice_agents.core.registry.agents.defaults import build_builtin_agent_configs
+from juice_agents.core.registry.common.store import as_config_path, normalize_name
 from juice_agents.core.registry.agents.availability import (
     ROOT_AGENT_NAME,
     filter_available_agent_configs,
@@ -102,6 +105,13 @@ class AgentRegistry:
         else:
             self.tool_config_dir = self.config_context.tools_dir
         self._store = AgentConfigStore(self.config_dir)
+        # Private Team/explicit configuration directories are closed scopes:
+        # a missing private member must never resolve to a global built-in.
+        self._builtin_configs = (
+            {config.name: config for config in build_builtin_agent_configs()}
+            if self.config_dir.resolve() == self.config_context.agents_dir.resolve()
+            else {}
+        )
         from juice_agents.core.registry.tools.registry import ToolRegistry
 
         self._tool_registry = ToolRegistry(
@@ -119,21 +129,31 @@ class AgentRegistry:
         return cls(config_dir=config_dir, tool_config_dir=tool_config_dir)
 
     def load_config(self, name: str) -> AgentConfig:
-        """Load a detached declaration copy from the workspace Registry."""
+        """Resolve local YAML first, then a detached built-in declaration.
 
-        return AgentConfig.from_dict(self._store.load(name))
-
-    @staticmethod
-    def _reject_root_declaration(config: AgentConfig) -> None:
-        """Keep ``root`` exclusively owned by the Runner runtime.
-
-        A root still uses :class:`AgentConfig` in memory.  This guard applies
-        only to Registry writes so prompt construction can reuse the same type
-        without materialising a mutable ``.juice/agents/root.yaml``.
+        Only absence permits fallback; invalid or unreadable local YAML must
+        remain visible as an error instead of silently discarding user edits.
         """
 
-        if config.name == ROOT_AGENT_NAME:
-            raise ValueError("root 是 Runner 运行时身份，不能保存为 Agent Registry 声明")
+        normalized = normalize_name(name)
+        if as_config_path(normalized, self.config_dir).exists():
+            return AgentConfig.from_dict(self._store.load(normalized))
+        if normalized in self._builtin_configs:
+            return AgentConfig.from_dict(self._builtin_configs[normalized])
+        raise FileNotFoundError(f"Agent 配置不存在: {normalized}")
+
+    def get_source(self, name: str) -> str | None:
+        """Return the effective declaration source without creating files."""
+
+        normalized = normalize_name(name)
+        if as_config_path(normalized, self.config_dir).exists():
+            return "local"
+        return "builtin" if normalized in self._builtin_configs else None
+
+    def config_path(self, name: str) -> Path | None:
+        """A built-in declaration has no local path until its first edit."""
+
+        return as_config_path(name, self.config_dir) if self.get_source(name) == "local" else None
 
     def save_config(
         self,
@@ -142,31 +162,14 @@ class AgentRegistry:
         name: str | None = None,
     ) -> AgentConfig:
         """Validate and write one workspace Agent YAML directly."""
-        candidate = AgentConfig.from_dict(config, config_name=name)
-        self._reject_root_declaration(candidate)
+        candidate = self.validate(AgentConfig.from_dict(config, config_name=name))
         self._ensure_team_references_remain_valid(candidate)
-        return self._store.save(candidate, name=candidate.name)
-
-    def seed_config(
-        self,
-        config: dict[str, Any] | AgentConfig,
-        *,
-        name: str | None = None,
-    ) -> AgentConfig:
-        """仅在配置缺失时写入默认值，已有 workspace 副本永远优先。"""
-
-        candidate = AgentConfig.from_dict(config, config_name=name)
-        self._reject_root_declaration(candidate)
-        resolved_name = candidate.name
-        if not resolved_name:
-            raise ValueError("agent name 不能为空")
-        try:
-            return self.load_config(resolved_name)
-        except FileNotFoundError:
-            return self.save_config(candidate, name=resolved_name)
+        saved = self._store.save(candidate, name=candidate.name)
+        logger.info("已保存 Agent 本地声明: name=%s", saved.name)
+        return saved
 
     def list_configs(self) -> list[str]:
-        return self._store.list()
+        return sorted(set(self._store.list()) | self._builtin_configs.keys())
 
     @staticmethod
     def _runner_constraints(
@@ -250,19 +253,12 @@ class AgentRegistry:
         name: str | None = None,
         mode_id: str,
         runner: Any | None = None,
-        fallback_configs: Iterable[AgentConfig | Mapping[str, Any]] = (),
     ) -> dict[str, Any]:
         """List Registry declarations available to a mode without writes.
 
-        This is the only Registry listing API for user-facing Agent discovery.
-        It applies the same mode/policy/disable predicates supplied to actual
-        dispatch, excludes the runtime-only root identity, and never seeds
-        defaults or creates a Runner/Agent instance for a cold query.
-
-        ``fallback_configs`` lets a read-only caller project in-memory
-        defaults that would be seeded only when it later creates a Runner.
-        A workspace declaration with the same name always wins, so this does
-        not create a second configuration source or overwrite user edits.
+        It shares effective declarations with construction and dispatch and
+        excludes root from child discovery. Cold queries never create runtime
+        objects, directories, or declaration files.
         """
 
         normalized_mode = str(mode_id or "").strip()
@@ -272,53 +268,25 @@ class AgentRegistry:
         if requested_name == "":
             raise ValueError("agent name 不能为空")
 
-        # Root is intentionally absent even when a stale historical YAML is
-        # still present. The cleanup subsystem decides whether that file can
-        # be removed; a read-only query must neither load nor expose it.
-        if requested_name == ROOT_AGENT_NAME:
-            names: list[str] = []
-        else:
-            names = [requested_name] if requested_name is not None else self.list_configs()
-        fallback_by_name = {
-            config.name: config
-            for raw_config in fallback_configs
-            if (config := AgentConfig.from_dict(raw_config)).name != ROOT_AGENT_NAME
-        }
-        if requested_name == ROOT_AGENT_NAME:
-            declarations_with_source: list[tuple[AgentConfig, str]] = []
-        elif requested_name is not None:
+        names = [requested_name] if requested_name is not None else self.list_configs()
+        declarations: list[AgentConfig] = []
+        for agent_name in names:
+            if agent_name == ROOT_AGENT_NAME:
+                continue
             try:
-                workspace_declarations = [self.load_config(requested_name)]
+                declarations.append(self.load_config(agent_name))
             except FileNotFoundError:
-                # `/agents <builtin-name>` must work before Runner creation.
-                # An unknown name is simply unavailable, matching a
-                # mode-filtered declaration rather than turning a read query
-                # into a transport error.
-                workspace_declarations = []
-            declarations_with_source: list[tuple[AgentConfig, str]] = [
-                (config, "workspace") for config in workspace_declarations
-            ]
-            if not declarations_with_source and requested_name in fallback_by_name:
-                declarations_with_source.append((fallback_by_name[requested_name], "builtin"))
-        else:
-            workspace_declarations = [self.load_config(agent_name) for agent_name in names]
-            declarations_with_source = [
-                (config, "workspace") for config in workspace_declarations
-            ]
-            declared_names = {config.name for config in workspace_declarations}
-            for config in fallback_by_name.values():
-                if config.name not in declared_names:
-                    declarations_with_source.append((config, "builtin"))
-                    declared_names.add(config.name)
+                if requested_name is None:
+                    raise
+                # A named query for an unknown Agent is an empty result.
 
         allowed, disabled = self._runner_constraints(runner, mode_id=normalized_mode)
         available = filter_available_agent_configs(
-            (config for config, _source in declarations_with_source),
+            declarations,
             mode_id=normalized_mode,
             allowed_agent_names=allowed,
             disabled_agent_names=disabled,
         )
-        sources = {config.name: source for config, source in declarations_with_source}
         return {
             "mode_id": normalized_mode,
             "agents": [
@@ -328,7 +296,7 @@ class AgentRegistry:
                     "allowed_modes": (
                         None if config.allowed_modes is None else list(config.allowed_modes)
                     ),
-                    "source": sources[config.name],
+                    "source": self.get_source(config.name),
                     "config": config.to_dict(),
                 }
                 for config in available
@@ -336,37 +304,52 @@ class AgentRegistry:
         }
 
     def delete_config(self, name: str) -> None:
-        # A Team stores only global Agent names. Deleting a referenced
-        # declaration would leave a manifest that cannot be dispatched, so
-        # reject with the exact Team names the user needs to update first.
-        config = self.load_config(name)
-        from juice_agents.core.registry.teams.registry import TeamRegistry
+        """Delete a local declaration, validating its effective replacement.
 
-        references = TeamRegistry(config_context=self.config_context).referencing_teams(config.name)
-        if references:
-            raise ValueError(
-                f"Agent {config.name!r} 被 Team 引用，不能删除: {', '.join(references)}"
-            )
-        self._store.delete(config.name)
-
-    def _ensure_team_references_remain_valid(self, candidate: AgentConfig) -> None:
-        """Reject a Team member update that removes its Team eligibility.
-
-        Agent names are immutable at the Store boundary, therefore eligibility
-        is the only Agent edit that can invalidate an existing global Team
-        reference. ``allowed_modes`` is optional so this code also stays safe
-        while loading declarations created before that field was introduced.
+        Built-ins remain immutable: deleting an override restores defaults,
+        while deleting a pure built-in is rejected without a tombstone.
         """
 
-        allowed_modes = getattr(candidate, "allowed_modes", None)
-        if allowed_modes is None or "team" in allowed_modes:
-            return
+        normalized = normalize_name(name)
+        source = self.get_source(normalized)
+        if source == "builtin":
+            raise ValueError(f"内置 Agent 只读，不能删除: {normalized}")
+        if source is None:
+            raise FileNotFoundError(f"Agent 配置不存在: {normalized}")
+        references = self._referencing_teams(normalized)
+        if references:
+            fallback = self._builtin_configs.get(normalized)
+            if fallback is None:
+                raise ValueError(
+                    f"Agent {normalized!r} 被 Team 引用，不能删除: {', '.join(references)}"
+                )
+            self._ensure_team_references_remain_valid(self.validate(fallback))
+        self._store.delete(normalized)
+        logger.info(
+            "已删除 Agent 本地声明: name=%s fallback=%s", normalized,
+            "builtin" if normalized in self._builtin_configs else "none",
+        )
+
+    def _referencing_teams(self, name: str) -> tuple[str, ...]:
+        # Private declarations cannot invalidate a same-name global reference.
+        if self.config_dir.resolve() != self.config_context.agents_dir.resolve():
+            return ()
         from juice_agents.core.registry.teams.registry import TeamRegistry
 
-        references = TeamRegistry(config_context=self.config_context).referencing_teams(candidate.name)
+        return TeamRegistry(config_context=self.config_context).referencing_teams(name)
+
+    def _ensure_team_references_remain_valid(self, candidate: AgentConfig) -> None:
+        """Keep referenced shared Agents eligible and persistent after edits."""
+
+        if (
+            (candidate.allowed_modes is None or "team" in candidate.allowed_modes)
+            and candidate.lifecycle == "persistent"
+        ):
+            return
+        references = self._referencing_teams(candidate.name)
         if references:
             raise ValueError(
-                f"Agent {candidate.name!r} 被 Team 引用，不能移除 team mode: "
+                f"Agent {candidate.name!r} 被 Team 引用，必须保留 team mode 和 persistent lifecycle: "
                 f"{', '.join(references)}"
             )
 
@@ -493,7 +476,7 @@ class AgentRegistry:
         raw: AgentRef | AgentConfig | Mapping[str, Any] | str,
         *,
         model: Any | None = None,
-        runtime_config_path: str | Path = DEFAULT_RUNTIME_CONFIG_PATH,
+        runtime_config_path: str | Path | None = None,
         model_name: str | None = None,
         model_effort: str | None = None,
         juice_root: str | Path | None = None,
@@ -519,13 +502,7 @@ class AgentRegistry:
 
     def _skills_enabled(self, runtime_config_path: str | Path | None = None) -> bool:
         try:
-            context = self.config_context
-            if runtime_config_path is not None:
-                context = ConfigurationContext.from_workspace(
-                    self.config_context.workspace_dir,
-                    project_config_path=runtime_config_path,
-                    dotenv_path=self.config_context.dotenv_path,
-                )
+            context = self._config_context_for_runtime(runtime_config_path)
             raw_skills = context.read_merged_config().get("skills", {})
         except Exception:
             return True
@@ -552,11 +529,7 @@ class AgentRegistry:
     def _config_context_for_runtime(self, runtime_config_path: str | Path | None) -> ConfigurationContext:
         if runtime_config_path is None:
             return self.config_context
-        return ConfigurationContext.from_workspace(
-            self.config_context.workspace_dir,
-            project_config_path=runtime_config_path,
-            dotenv_path=self.config_context.dotenv_path,
-        )
+        return replace(self.config_context, project_config_path=Path(runtime_config_path).expanduser().resolve())
 
     def _workspace_runtime_defaults(self, runtime_config_path: str | Path | None) -> dict[str, str]:
         try:
@@ -577,7 +550,7 @@ class AgentRegistry:
         self,
         config: AgentConfig | Mapping[str, Any] | str,
         *,
-        runtime_config_path: str | Path | None = DEFAULT_RUNTIME_CONFIG_PATH,
+        runtime_config_path: str | Path | None = None,
     ) -> str:
         """Resolve one declaration to the concrete protocol used by a fresh instance.
 
@@ -627,7 +600,7 @@ class AgentRegistry:
         config: AgentConfig,
         *,
         model: Any | None = None,
-        runtime_config_path: str | Path = DEFAULT_RUNTIME_CONFIG_PATH,
+        runtime_config_path: str | Path | None = None,
         model_name: str | None = None,
         model_effort: str | None = None,
         juice_root: str | Path | None = None,
@@ -652,6 +625,7 @@ class AgentRegistry:
                 runtime_config_path=runtime_config_path or self.config_context.project_config_path,
                 workspace_dir=self.config_context.workspace_dir,
                 dotenv_path=self.config_context.dotenv_path,
+                runtime_overrides=self.config_context.overrides,
                 model_effort=resolved_model_effort,
             )
         compression_model = model
@@ -664,6 +638,7 @@ class AgentRegistry:
                 runtime_config_path=runtime_config_path or self.config_context.project_config_path,
                 workspace_dir=self.config_context.workspace_dir,
                 dotenv_path=self.config_context.dotenv_path,
+                runtime_overrides=self.config_context.overrides,
                 model_effort=resolved_model_effort,
             )
 
@@ -694,6 +669,7 @@ class AgentRegistry:
 
         common_kwargs: dict[str, Any] = {
             "tools": tools,
+            "config_context": self._config_context_for_runtime(runtime_config_path),
             "model": model,
             "system_prompt": config.system_prompt,
             "max_steps": config.max_steps,
@@ -724,7 +700,7 @@ class AgentRegistry:
             return _attach_declared_agent_metadata(
                 agent,
                 config,
-                config_context=self.config_context,
+                config_context=self._config_context_for_runtime(runtime_config_path),
                 agent_config_dir=self.config_dir,
                 resolved_agent_type=resolved_agent_type,
             )
@@ -732,7 +708,7 @@ class AgentRegistry:
         return _attach_declared_agent_metadata(
             agent,
             config,
-            config_context=self.config_context,
+            config_context=self._config_context_for_runtime(runtime_config_path),
             agent_config_dir=self.config_dir,
             resolved_agent_type=resolved_agent_type,
         )

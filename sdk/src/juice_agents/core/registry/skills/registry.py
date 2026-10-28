@@ -9,11 +9,9 @@ import os
 import re
 import shutil
 import time
-from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
-from juice_agents.core.config.runtime_config import DEFAULT_RUNTIME_CONFIG_PATH, read_runtime_config
 from juice_agents.core.config.context import ConfigurationContext
 from juice_agents.core.registry.common.store import atomic_write_text
 
@@ -39,12 +37,6 @@ _DANGEROUS_PATTERNS = (
 )
 
 
-def default_builtin_skills_dir() -> Path:
-    """Return the immutable Skill resources bundled in the SDK wheel."""
-
-    return Path(str(files("juice_agents._assets").joinpath("skills"))).resolve()
-
-
 def default_local_skills_dir() -> Path:
     return Path.cwd().resolve() / ".juice" / "skills"
 
@@ -60,7 +52,11 @@ def _workspace_dir_from_local_dir(local_dir: Path) -> Path | None:
     return None
 
 
-def default_project_external_skills_dir(local_dir: str | Path | None = None) -> Path:
+def default_project_external_skills_dir(
+    local_dir: str | Path | None = None,
+    *,
+    workspace_dir: str | Path | None = None,
+) -> Path:
     """
     解析当前 workspace 的项目级 skills 目录。
 
@@ -70,7 +66,10 @@ def default_project_external_skills_dir(local_dir: str | Path | None = None) -> 
     """
 
     resolved_local_dir = _expand_path(local_dir) if local_dir is not None else default_local_skills_dir()
-    workspace_root = resolved_local_dir.parent.parent
+    workspace_root = (
+        _expand_path(workspace_dir) if workspace_dir is not None
+        else _workspace_dir_from_local_dir(resolved_local_dir) or Path.cwd().resolve()
+    )
     return workspace_root / ".agents" / "skills"
 
 
@@ -80,8 +79,9 @@ def default_user_external_skills_dir() -> Path:
     return Path.home().expanduser().resolve() / ".agents" / "skills"
 
 
-def _expand_path(raw: str | Path) -> Path:
-    return Path(os.path.expandvars(str(raw))).expanduser().resolve()
+def _expand_path(raw: str | Path, *, base_dir: Path | None = None) -> Path:
+    path = Path(os.path.expandvars(str(raw))).expanduser()
+    return ((base_dir or Path.cwd()) / path).resolve()
 
 
 def _normalize_name(value: str, *, field_name: str) -> str:
@@ -187,16 +187,23 @@ class SkillRegistry:
         allow_names: list[str] | tuple[str, ...] | None = None,
         deny_names: list[str] | tuple[str, ...] | None = None,
         available_tools: list[str] | tuple[str, ...] | set[str] | None = None,
+        config_context: ConfigurationContext | None = None,
     ) -> None:
-        self.config_path = Path(config_path) if config_path is not None else DEFAULT_RUNTIME_CONFIG_PATH
-        self.platform = str(platform or "cli").strip() or "cli"
-        self.local_dir = _expand_path(local_dir) if local_dir is not None else default_local_skills_dir()
-        self.builtin_dir = _expand_path(builtin_dir) if builtin_dir is not None else default_builtin_skills_dir()
-        self.workspace_dir = (
-            _expand_path(workspace_dir)
-            if workspace_dir is not None
-            else _workspace_dir_from_local_dir(self.local_dir)
+        resolved_workspace = (
+            config_context.workspace_dir if config_context is not None
+            else _expand_path(workspace_dir) if workspace_dir is not None
+            else _workspace_dir_from_local_dir(_expand_path(local_dir)) if local_dir is not None
+            else Path.cwd().resolve()
         )
+        self.config_context = config_context or ConfigurationContext.from_workspace(
+            resolved_workspace, project_config_path=config_path,
+        )
+        self.config_path = self.config_context.project_config_path
+        self.platform = str(platform or "cli").strip() or "cli"
+        self.local_dir = _expand_path(local_dir) if local_dir is not None else self.config_context.juice_root / "skills"
+        # SDK 不再捆绑演示技能；调用方仍可显式提供自己的只读 builtin 来源。
+        self.builtin_dir = _expand_path(builtin_dir) if builtin_dir is not None else None
+        self.workspace_dir = resolved_workspace
         self._explicit_external_dirs = list(external_dirs or [])
         self.allow_names = {
             str(item).strip().lower()
@@ -222,7 +229,7 @@ class SkillRegistry:
 
     def _load_config(self) -> dict[str, Any]:
         try:
-            payload = read_runtime_config(self.config_path, workspace_dir=self.workspace_dir)
+            payload = self.config_context.read_merged_config()
         except FileNotFoundError:
             return {}
         except Exception as exc:
@@ -259,10 +266,7 @@ class SkillRegistry:
         # 1. 当前项目下只读的 `.agents/skills`
         # 2. 用户 home 下可复用的 `~/.agents/skills`
         # 额外配置项只是在这两个默认来源后继续追加。
-        plugin_context = ConfigurationContext.from_workspace(
-            self.workspace_dir,
-            project_config_path=self.config_path,
-        )
+        plugin_context = self.config_context
         from juice_agents.core.registry.plugins.registry import PluginRegistry
 
         plugin_skill_roots = PluginRegistry(
@@ -272,14 +276,14 @@ class SkillRegistry:
         ).skill_roots()
         ordered: list[Path] = [
             *plugin_skill_roots,
-            default_project_external_skills_dir(self.local_dir),
+            default_project_external_skills_dir(self.local_dir, workspace_dir=self.workspace_dir),
             default_user_external_skills_dir(),
         ]
         seen = {path.resolve() for path in ordered}
         for item in raw_dirs:
             if not str(item).strip():
                 continue
-            resolved = _expand_path(item)
+            resolved = _expand_path(item, base_dir=self.workspace_dir)
             if resolved in seen:
                 continue
             ordered.append(resolved)
@@ -404,7 +408,7 @@ class SkillRegistry:
             return False
 
         # 检查所有 skills 目录的 mtime
-        for skills_dir in self._all_skills_dirs():
+        for skills_dir, _ in self._skill_sources():
             if not skills_dir.exists():
                 continue
 
@@ -421,13 +425,16 @@ class SkillRegistry:
 
         return True
 
-    def _all_skills_dirs(self) -> list[Path]:
-        """获取所有需要扫描的 skills 目录"""
-        return [
-            self.local_dir,
-            self.builtin_dir,
-            *self.external_dirs,
-        ]
+    def _skill_sources(self) -> list[tuple[Path, SkillSource]]:
+        """统一来源顺序，确保发现、读取及写时复制使用相同的优先级。
+
+        builtin 是可选的调用方资源，无配置时直接跳过，避免构造占位目录。
+        """
+        sources: list[tuple[Path, SkillSource]] = [(self.local_dir, "local")]
+        if self.builtin_dir is not None:
+            sources.append((self.builtin_dir, "builtin"))
+        sources.extend((path, "external") for path in self.external_dirs)
+        return sources
 
     def _refresh_index(self):
         """重新扫描并构建 skills 索引"""
@@ -439,11 +446,7 @@ class SkillRegistry:
         # 记录当前目录的 mtime
         self._dir_mtimes.clear()
 
-        for root, source in (
-            (self.local_dir, "local"),
-            (self.builtin_dir, "builtin"),
-            *[(path, "external") for path in self.external_dirs],
-        ):
+        for root, source in self._skill_sources():
             # 记录目录 mtime
             if root.exists():
                 try:
@@ -451,7 +454,7 @@ class SkillRegistry:
                 except Exception:
                     pass
 
-            for meta in self._scan_source(root, source=source):  # type: ignore[arg-type]
+            for meta in self._scan_source(root, source=source):
                 keys = {meta.name, meta.qualified_name.lower()}
                 if keys & disabled:
                     continue
@@ -477,12 +480,8 @@ class SkillRegistry:
         if include_disabled or not self._index_cache:
             disabled = self._disabled_names()
             selected: dict[str, SkillMetadata] = {}
-            for root, source in (
-                (self.local_dir, "local"),
-                (self.builtin_dir, "builtin"),
-                *[(path, "external") for path in self.external_dirs],
-            ):
-                for meta in self._scan_source(root, source=source):  # type: ignore[arg-type]
+            for root, source in self._skill_sources():
+                for meta in self._scan_source(root, source=source):
                     keys = {meta.name, meta.qualified_name.lower()}
                     if not include_disabled and keys & disabled:
                         continue
@@ -536,16 +535,12 @@ class SkillRegistry:
         # A caller-provided SkillMetadata must still correspond to a discovered
         # source.  This prevents an arbitrary filesystem path from bypassing
         # Registry source precedence and path-safety checks.
-        for root, source in (
-            (self.local_dir, "local"),
-            (self.builtin_dir, "builtin"),
-            *[(path, "external") for path in self.external_dirs],
-        ):
+        for root, source in self._skill_sources():
             try:
                 candidate.skill_file.relative_to(root)
             except ValueError:
                 continue
-            reparsed = self._parse_metadata(root, candidate.skill_file, source=source)  # type: ignore[arg-type]
+            reparsed = self._parse_metadata(root, candidate.skill_file, source=source)
             if reparsed is not None:
                 return self._copy_metadata(reparsed)
         raise FileNotFoundError(f"skill 不存在或未被 Registry 发现: {candidate.qualified_name}")
@@ -567,7 +562,7 @@ class SkillRegistry:
         if not self.enabled:
             return {}
         descriptions: dict[str, str] = {}
-        for root in [self.local_dir, self.builtin_dir, *self.external_dirs]:
+        for root, _ in self._skill_sources():
             if not root.exists():
                 continue
             for path in sorted(root.rglob("DESCRIPTION.md")):
@@ -590,18 +585,11 @@ class SkillRegistry:
             raise ValueError("skill name 不能为空")
         path = _expand_path(raw)
         if path.exists() and path.name == "SKILL.md":
-            root_candidates = [self.local_dir, self.builtin_dir, *self.external_dirs]
-            for root in root_candidates:
+            for root, source in self._skill_sources():
                 try:
                     path.relative_to(root)
                 except ValueError:
                     continue
-                if root == self.local_dir:
-                    source: SkillSource = "local"
-                elif root == self.builtin_dir:
-                    source = "builtin"
-                else:
-                    source = "external"
                 meta = self._parse_metadata(root, path, source=source)
                 if meta is not None:
                     return meta
@@ -762,7 +750,9 @@ class SkillRegistry:
             return self.get(meta.name)
 
         source_root: Path | None = None
-        for root in [self.builtin_dir, *self.external_dirs]:
+        for root, source in self._skill_sources():
+            if source == "local":
+                continue
             try:
                 meta.skill_dir.relative_to(root)
             except ValueError:
@@ -982,4 +972,4 @@ class SkillRegistry:
             )
             return {"success": False, "action": normalized, "error": str(exc)}
 
-__all__ = ["SkillRegistry", "default_builtin_skills_dir", "default_local_skills_dir"]
+__all__ = ["SkillRegistry", "default_local_skills_dir"]

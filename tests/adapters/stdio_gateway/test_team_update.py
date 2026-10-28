@@ -35,7 +35,7 @@ def test_team_update_serializes_snapshot_into_shared_wire_envelope() -> None:
     )
 
     assert event["agent_mode"] == "team"
-    assert event["actor_name"] == "root"
+    assert event["agent_name"] == "root"
     assert event["team_event"] == {
         "team_name": "alpha",
         "actor": "root",
@@ -75,7 +75,7 @@ def test_stdio_team_config_defaults_to_empty_members() -> None:
 def test_stdio_team_config_preserves_shared_member_source() -> None:
     with TemporaryDirectory() as workspace:
         AgentRegistry(config_context=ConfigurationContext.from_workspace(workspace)).save_config(
-            {"name": "reviewer", "agent_type": "react", "max_steps": 3, "tools": []}
+            {"name": "reviewer", "agent_type": "react", "max_steps": 3, "tools": [], "lifecycle": "persistent", "allowed_modes": ["team"]}
         )
         handlers = RpcHandlers()
         handlers.handle_create_team_config({"base_dir": workspace, "team_name": "review", "member_names": ["reviewer"]})

@@ -15,7 +15,6 @@ from typing import Any
 import pytest
 
 from juice_agents.core.config.runtime_config import update_workspace_config
-from juice_agents.core.prebuilt.factory import seed_prebuilt_declarations
 from juice_agents.core.registry.agents import registry as agent_registry_module
 from juice_agents.core.registry.agents.types import AgentConfig
 from juice_agents.core.runner import Runner
@@ -66,8 +65,7 @@ def _write_workflow(tmp_path: Path, name: str, body: str, *, metadata: dict[str,
 
 
 def _runner(tmp_path: Path) -> Runner:
-    # 与真实启动一致：先落地内置 agent 声明（general / explore），再创建 Runner。
-    seed_prebuilt_declarations(base_dir=tmp_path, runner_config="agent")
+    # 与真实启动一致：Registry 按需解析内置声明，创建 Runner 不复制资源文件。
     runner = Runner.create(runner_config="agent", base_dir=tmp_path)
     runner._root()  # 内部 agent 继承 root 的模型与协议
     return runner
@@ -86,13 +84,13 @@ def test_inline_agent_config_runs_through_invoke_agent_without_persisting(tmp_pa
     )
     runner = _runner(tmp_path)
     agents_dir = runner.layout.agents_dir
-    before = sorted(p.name for p in agents_dir.iterdir()) if agents_dir.exists() else []
+    before = sorted(p.name for p in agents_dir.iterdir() if p.is_dir()) if agents_dir.exists() else []
 
     called = runner.workflow_manager.call("ask_one", {"q": "life?"}, owner_agent_name="root")
 
     assert called["result"] == {"answer": "42"}
-    # ephemeral：没有新增 snapshot / 日志目录，也没有残留的 live agent。
-    after = sorted(p.name for p in agents_dir.iterdir()) if agents_dir.exists() else []
+    # ephemeral 不新增 snapshot / 日志目录；独立用量账本仍需保留请求元数据。
+    after = sorted(p.name for p in agents_dir.iterdir() if p.is_dir()) if agents_dir.exists() else []
     assert after == before
     assert [m.agent_name for m in runner.agent_manager.live_agents.values()] == ["root"]
 

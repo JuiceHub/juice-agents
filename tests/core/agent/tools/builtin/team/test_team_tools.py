@@ -102,12 +102,16 @@ def test_root_can_discover_shared_member_sources_before_adding_members(tmp_path)
     agents.save_config({"name": "agent_worker", "lifecycle": "persistent", "allowed_modes": ["agent"]})
 
     listed = _bound(AgentsListTool, root).forward()["agents"]
-    assert [item["name"] for item in listed] == ["team_worker"]
+    assert {item["name"] for item in listed} == {"root", "developer", "researcher", "team_worker"}
+    by_name = {item["name"]: item for item in listed}
+    assert by_name["researcher"]["source"] == "builtin"
+    assert by_name["researcher"]["path"] is None
+    assert by_name["team_worker"]["source"] == "local"
     assert _bound(AgentViewTool, root).forward("team_worker")["agent"]["config"]["name"] == "team_worker"
     # Read-only discovery must not expand the root's Agent write authority.
     with pytest.raises(PermissionError, match="直属管理作用域"):
         _bound(AgentManageTool, root)._resolve_target("team_worker", "authorized")
-    assert _bound(AgentsListTool, member).forward()["agents"] == []
+    assert [item["name"] for item in _bound(AgentsListTool, member).forward()["agents"]] == ["developer"]
 
 
 def test_only_root_can_create_or_update_tasks(tmp_path):

@@ -50,6 +50,8 @@ def run(ctx: WorkflowContext, args: dict[str, Any]) -> dict[str, Any]:
 
 Workspace workflows live at `.juice/workflows/<name>.py` and override a built-in with the same name. Local workflows cannot access files, shells, networks, or dangerous imports directly; external actions must use permission-controlled Agents via `ctx.agent()`.
 
+Discovery, validation, and execution read built-ins directly without creating workspace files. `workflow_manage(action="edit", name="deep_research", content=source)` validates the complete replacement as local source, then atomically saves the first override. Unknown names and invalid source fail before writing. Removing a local override restores the built-in definition; packaged scripts remain read-only.
+
 ## Deep Research
 
 `deep_research` is a multi-phase research workflow using temporary inner agents:

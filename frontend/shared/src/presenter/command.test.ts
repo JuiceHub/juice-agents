@@ -33,7 +33,7 @@ test("list-style command presenters return table display and text fallback", () 
       runner_id: "runner-1",
       permission_mode: "default",
       agent_mode: "agent",
-      root_actor_name: "root",
+      root_agent_name: "root",
       updated_at: "2026-05-20T00:00:00Z",
       root_dir: "/tmp/work/.juice/runners/runner-1",
       first_user_request_preview: "Implement readable runner titles",
@@ -90,7 +90,8 @@ test("list-style command presenters return table display and text fallback", () 
       team_name: "default",
       description: "Default delivery Team",
       member_names: ["researcher", "developer"],
-      manifest_path: "/tmp/work/.juice/teams/default/manifest.yaml",
+      source: "builtin",
+      manifest_path: null,
     }],
   });
 
@@ -104,6 +105,8 @@ test("list-style command presenters return table display and text fallback", () 
 test("Team detail presents only global member-name references", () => {
   const team = presentTeamManifest({
     schema_version: 2,
+    source: "builtin",
+    manifest_path: null,
     team_name: "default",
     description: "Default delivery Team",
     member_names: ["researcher", "developer"],
@@ -119,7 +122,7 @@ test("status-style command presenters return key-value display", () => {
     runner_id: "runner-123",
     permission_mode: "default",
     agent_mode: "agent",
-    root_actor_name: "root",
+    root_agent_name: "root",
     base_dir: "/tmp/work",
     started: true,
     resumed: false,
@@ -166,4 +169,22 @@ test("empty command lists keep plain empty-state text", () => {
   assert.equal(models.text, "No models found.");
   assert.equal(skills.display, undefined);
   assert.equal(skills.text, "No skills found.");
+});
+
+
+test("Team discovery displays provenance and keeps built-in paths empty", () => {
+  const team = {
+    schema_version: 2,
+    team_name: "default",
+    description: "Built-in Team",
+    member_names: [],
+    source: "builtin" as const,
+    manifest_path: null,
+  };
+  const list = presentTeams({ teams: [team] });
+  const detail = presentTeamManifest(team);
+  assert.match(list.text, /SOURCE/);
+  assert.match(list.text, /builtin/);
+  assert.match(detail.text, /source: builtin/);
+  assert.doesNotMatch(detail.text, /\.juice|manifest_path: null/);
 });

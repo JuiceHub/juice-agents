@@ -1,21 +1,19 @@
-"""In-memory configuration for the one Runner-owned root identity.
+"""Portable root declaration and detached Runner mode configuration.
 
-``root`` is intentionally a runtime identity, never an AgentRegistry entry.
-The Registry continues to own reusable worker declarations, while this module
-creates a detached :class:`AgentConfig` for every Runner mode.  Keeping the
-configuration in the same type as workers means prompt rendering and tool
-construction still use the normal AgentRegistry path without ever creating a
-``.juice/agents/root.yaml`` declaration.
+AgentRegistry resolves ``root`` from local overrides or the built-in catalog.
+Runner-specific paths, planning restrictions and Team coordination apply to a copy,
+so opening a Runner in another mode never rewrites the shared declaration.
 """
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 from juice_agents.core.registry.agents.types import AgentConfig
 from juice_agents.core.registry.tools.types import ToolRef
 
-from .builtin.configs import GENERAL_ROOT_TOOLS, ROOT_GENERAL_INSTRUCTIONS
+from .builtin.configs import get_general_config
 
 
 _PLAN_ROOT_INSTRUCTIONS = (
@@ -86,11 +84,22 @@ _TEAM_ROOT_TOOLS = (
 )
 
 
+def build_root_declaration() -> AgentConfig:
+    """Return the portable mode-independent built-in root declaration.
+
+    In particular, this value must never contain a Runner plan path or the
+    fixed Plan/Team workflow. Existing workspace declarations always win.
+    """
+
+    return AgentConfig.from_dict(get_general_config())
+
+
 def build_root_config(
     *,
     mode_id: str,
     plan_file: str | Path,
     managed_agent_names: tuple[str, ...] | list[str] | None = None,
+    declaration: AgentConfig | None = None,
 ) -> AgentConfig:
     """Build the effective root configuration for one Runner mode.
 
@@ -98,9 +107,14 @@ def build_root_config(
     paths and permissions from contaminating reusable Registry declarations.
     """
 
+    # Detach nested tool parameters and schemas as well as the frozen value;
+    # consumers may construct tools from them without touching Registry data.
+    declared = AgentConfig.from_dict(declaration or build_root_declaration())
+    if declared.name != "root":
+        raise ValueError("root declaration 的 name 必须为 root")
     normalized_mode = str(mode_id or "agent").strip() or "agent"
-    base_tools = tuple(GENERAL_ROOT_TOOLS)
-    instructions = ROOT_GENERAL_INSTRUCTIONS
+    base_tools = declared.tools
+    instructions = declared.instructions
     if normalized_mode == "plan":
         base_tools = tuple(
             ref
@@ -134,22 +148,21 @@ def build_root_config(
         # Plan-specific references intentionally replace any default ref with
         # the same name (notably agent_tool's read_only_only setting).
         tools_by_name[ref.name] = ref
-    return AgentConfig(
-        name="root",
-        agent_type="default",
-        description="Runner-owned root agent.",
+    return replace(
+        declared,
         instructions=instructions,
-        prompt_language="en",
-        max_steps=20,
         tools=tuple(tools_by_name.values()),
         # This is only a declaration relationship.  Availability is narrowed
         # again by the mode policy and by the root's persisted Runner state.
         # The Runner resolves this list from the same availability predicate
-        # used for listing and dispatch.  ``None`` retains the small built-in
-        # bootstrap set for a standalone root configuration.
-        managed_agent_names=("general", "explore") if managed_agent_names is None else tuple(managed_agent_names),
-        lifecycle="persistent",
+        # used for listing and dispatch. ``None`` retains the declaration's
+        # relationships for a standalone root configuration.
+        managed_agent_names=(
+            declared.managed_agent_names
+            if managed_agent_names is None
+            else tuple(managed_agent_names)
+        ),
     )
 
 
-__all__ = ["build_root_config"]
+__all__ = ["build_root_config", "build_root_declaration"]

@@ -50,6 +50,8 @@ def run(ctx: WorkflowContext, args: dict[str, Any]) -> dict[str, Any]:
 
 Workspace workflow 放在 `.juice/workflows/<name>.py`，同名时覆盖 builtin。Local workflow 禁止直接访问文件、shell、网络和危险 import；外部动作必须通过 `ctx.agent()` 调用受权限控制的 Agent。
 
+发现、校验和执行直接读取内置定义，不创建 workspace 文件。`workflow_manage(action="edit", name="deep_research", content=source)` 将完整替换源码按 local 规则校验，成功后原子保存首份本地覆盖；未知名称或非法源码在写入前失败。删除本地覆盖后恢复内置定义，包内脚本始终只读。
+
 ## Deep Research
 
 `deep_research` 是使用临时内部 agent 的多阶段研究 workflow：

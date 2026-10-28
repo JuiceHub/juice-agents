@@ -97,7 +97,7 @@ def text_block(text: str) -> dict[str, Any]:
 
 
 # 框架内部字段：标记此 content block 之后是一个 prompt 缓存边界。
-# 模型层（如 AnthropicModel）据此翻译成各 provider 的缓存协议；
+# 模型层 ChatModel 据此翻译成各 provider 的缓存协议；
 # 出站前必须由模型层剥离，避免污染 OpenAI/Ark 等不识别该字段的接口。
 CACHE_BOUNDARY_KEY = "_cache_boundary"
 

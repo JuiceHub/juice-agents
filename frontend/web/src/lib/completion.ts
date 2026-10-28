@@ -12,7 +12,6 @@ export const WEB_SLASH_COMMANDS: CompletionCandidate[] = [
   { label: "/help", description: "Show web commands" },
   { label: "/status", description: "Show current runner status" },
   { label: "/mode", description: "Switch agent mode" },
-  { label: "/resources", description: "List mode resources" },
   { label: "/team", description: "Run one task with team mode" },
   { label: "/group", description: "Run one task with group mode" },
   { label: "/agent-type", description: "Save the default Agent type" },

@@ -27,7 +27,14 @@ changes emit `team_update` events; `team_finish` releases member sessions.
 `team_member_stop_request` sends a structured request to root. A plain message
 does not stop the member, and root decides whether to close it.
 
-`/teams [name]` reads declarations without starting a Runner.
+`/teams [name]` reads declarations without starting a Runner or creating `.juice`.
+Local manifests override the built-in empty `default` Team, whose `manifest_path`
+is `null`. Its first successful edit saves the full manifest; deleting the local
+Team restores the built-in. Pure built-in Teams cannot be deleted.
+Shared members resolve local Agent declarations first, then built-ins; private
+members read only `.juice/teams/<name>/members/`. First-member failures remove
+staged private files. Referenced Agent overrides can be deleted only if their
+effective fallback still satisfies Team mode and persistent lifecycle constraints.
 
 ## Development conventions
 

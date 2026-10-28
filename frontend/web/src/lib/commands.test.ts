@@ -105,7 +105,8 @@ test("web /teams lists and views Team manifests", async () => {
           team_name: "default",
           description: "Default delivery Team",
           member_names: ["researcher", "developer"],
-          manifest_path: "/tmp/work/.juice/teams/default/manifest.yaml",
+          source: "builtin",
+          manifest_path: null,
         }],
       };
     },
@@ -113,6 +114,8 @@ test("web /teams lists and views Team manifests", async () => {
       calls.push(["getTeam", params]);
       return {
         schema_version: 2,
+        source: "builtin",
+        manifest_path: null,
         team_name: params.team_name,
         description: "Default delivery Team",
         member_names: ["researcher", "developer"],
@@ -149,7 +152,7 @@ test("web /agent-type only saves the future default and keeps active status unch
       runner_id: "runner-1",
       permission_mode: "default",
       agent_mode: "team",
-      root_actor_name: "teamlead",
+      root_agent_name: "teamlead",
       base_dir: "/tmp/work",
       started: true,
       resumed: false,
@@ -247,4 +250,15 @@ test("web /permissions uses permission gateway helper", async () => {
   const permissions = await executeWebCommand("/permissions", client, context);
 
   assert.match(permissions.blocks[0]?.text || "", /default/);
+});
+
+
+test("retired /resources is absent from Web help and command dispatch", async () => {
+  const context = { baseDir: "/tmp/work", status: null, sessions: [], models: [] };
+  const client = {} as WebGatewayClient;
+  const help = await executeWebCommand("/help", client, context);
+  assert.doesNotMatch(help.blocks[0]?.text || "", /\/resources/);
+  const result = await executeWebCommand("/resources group", client, context);
+  assert.match(result.blocks[0]?.text || "", /Unknown command/);
+  assert.equal(result.forwardMessage, undefined);
 });

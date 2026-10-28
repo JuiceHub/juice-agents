@@ -24,6 +24,7 @@ import os
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -44,6 +45,7 @@ from juice_agents.core.agent.context import (
     serialize_context_tree,
 )
 from juice_agents.core.utils import sanitize_path_component
+from .model_usage import ModelUsageLedger, model_usage_calls
 
 if TYPE_CHECKING:  # pragma: no cover - imports would create an avoidable runtime cycle
     from juice_agents.core.agent.agents import MultiStepAgent
@@ -258,7 +260,7 @@ class ManagedAgent:
     status: AgentStatus = AgentStatus.READY
     is_root: bool = False
     # ephemeral agent（workflow 内部调用）只在内存中存在：不写 snapshot、不触发
-    # after_step 回调、不写文件日志，release 后不留任何磁盘痕迹。
+    # after_step 回调、不写文件日志；只保留不含正文的模型用量记录。
     ephemeral: bool = False
     # 非空时覆盖 Runner 的审批模式（workflow 内部 agent 固定为 accept）。
     permission_mode: str = ""
@@ -384,6 +386,15 @@ class AgentManager:
             root = self._resolve_state_dir(state_dir=state_dir, layout=layout)
             self.snapshot_store = JsonAgentSnapshotStore(root)
 
+        usage_root = (
+            self._resolve_state_dir(state_dir=state_dir, layout=layout)
+            if state_dir is not None or layout is not None
+            else getattr(self.snapshot_store, "root_dir", None)
+        )
+        self._model_usage = ModelUsageLedger(
+            Path(usage_root) / "model_usage.jsonl" if usage_root is not None else None
+        )
+
     @staticmethod
     def _resolve_state_dir(*, state_dir: str | Path | None, layout: Any | None) -> Path:
         """Use the new layout's ``agents_dir`` without depending on its class."""
@@ -441,7 +452,7 @@ class AgentManager:
         if self.runtime_config_path is not None:
             kwargs.setdefault("runtime_config_path", self.runtime_config_path)
         if self.workspace_dir is not None:
-            kwargs.setdefault("juice_root", self.workspace_dir)
+            kwargs.setdefault("juice_root", self.workspace_dir / ".juice")
         instance = instantiate(_binding_ref(binding), **kwargs)
         if not hasattr(instance, "context") or not hasattr(instance, "step"):
             raise TypeError("AgentRegistry.instantiate() 必须返回具备 context 与 step() 的 MultiStepAgent")
@@ -467,10 +478,15 @@ class AgentManager:
         if session_state is None:
             return None
         if isinstance(session_state, ContextTree):
-            return session_state.clone()
-        if not isinstance(session_state, Mapping):
+            payload = serialize_context_tree(session_state)
+        elif isinstance(session_state, Mapping):
+            payload = dict(session_state)
+        else:
             raise TypeError("session_state 必须是 ContextTree 或可序列化 object")
-        return deserialize_context_tree(dict(session_state))
+        # Serialization normalizes the schema but retains nested payloads such
+        # as output, tool arguments and metadata. Detach once at the Manager's
+        # ownership boundary so callers and inherited sessions evolve freely.
+        return deserialize_context_tree(deepcopy(payload))
 
     def acquire(
         self,
@@ -570,6 +586,15 @@ class AgentManager:
             try:
                 if self.callbacks.bind_runtime is not None:
                     self.callbacks.bind_runtime(managed, managed.cancel_event)
+                if restored_session is not None:
+                    # The transcript is restored, but its old system prompt
+                    # must not override the freshly resolved tool declaration
+                    # or the current mode's permissions. Reuse Agent's public
+                    # refresh hooks after binding the effective Runner context.
+                    for method in ("refresh_system_prompt", "refresh_executor_tools"):
+                        refresh = getattr(instance, method, None)
+                        if callable(refresh):
+                            refresh()
                 self.persist(managed)
             except Exception:
                 self._managed_by_id.pop(resolved_id, None)
@@ -636,7 +661,9 @@ class AgentManager:
         """Decode a validated snapshot session for read-only recovery tooling."""
 
         normalized = JsonAgentSnapshotStore._validate(snapshot)
-        return deserialize_context_tree(dict(normalized["session"]))
+        session = AgentManager._session_from_state(normalized["session"])
+        assert session is not None  # Snapshot validation always supplies a session mapping.
+        return session
 
     def persist(self, managed: ManagedAgent | str) -> AgentSnapshot:
         """Checkpoint a session and lifecycle state without retaining Runner state."""
@@ -721,10 +748,22 @@ class AgentManager:
             raise RuntimeError(f"agent 已释放，不能执行: {managed.agent_id}")
         self._raise_if_interrupted(managed)
         step = ActionStep(step_num=step_index, model_output="")
+
+        # 运行时回调属于 AgentManager；模型只返回 usage，不接收记录器。
+        instance.model_usage_handler = lambda **kwargs: self._record_model_result(managed, **kwargs)
         try:
             # Agent.step() 现在是一个生成器，yield 多个事件
             step_generator = instance.step(step)
+            if isinstance(step_generator, ActionStep):
+                yield ActionEvent(step_num=step_index, event_type="step_complete", data={"step": step_generator})
+                return step_generator
             for event in step_generator:
+                if isinstance(event, ActionEvent) and event.event_type == "candidates":
+                    # This internal boundary runs before the generator resumes
+                    # into tool/code execution.  Persist every proposal first;
+                    # subsequent errors must update the selected step itself.
+                    step = self._record_candidates(managed, event.data)
+                    continue
                 # 透传所有 ActionEvent
                 yield event
                 # 最后一个事件应该是 step_complete
@@ -754,6 +793,78 @@ class AgentManager:
             )
             return failed_step
 
+    def _record_model_result(
+        self, managed: ManagedAgent, *, kind: str, model: Any,
+        response: Any = None, error: Exception | None = None,
+    ) -> None:
+        """接收 Agent/Strategy 显式上报，异常结果也保留已返回的用量。"""
+        for call in model_usage_calls(model, response, error):
+            self._model_usage.append(
+                agent_id=managed.agent_id, agent_name=managed.agent_name, kind=kind, call=call,
+            )
+        logger.debug("模型用量已记录: agent=%s kind=%s", managed.agent_name, kind)
+
+    def model_usage_records(self) -> list[dict[str, Any]]:
+        """返回独立账本快照；不从 ContextTree 重复累计步骤 usage。"""
+        return self._model_usage.records()
+
+    def token_usage(self) -> dict[str, Any]:
+        """读取本 Manager 所属 Runner 的账本，无需实例化或恢复 Agent。"""
+        return self._model_usage.summary()
+
+    def _record_candidates(self, managed: ManagedAgent, data: Mapping[str, Any]) -> ActionStep:
+        """Save sibling proposals while advancing only the selected branch.
+
+        Agent generation stays side-effect free.  Manager owns the transition
+        from generated outputs to durable nodes and checkpoints it before the
+        selected proposal is allowed to execute.
+        """
+        instance = managed.instance
+        if instance is None:
+            raise RuntimeError(f"agent 已释放，不能保存候选: {managed.agent_id}")
+        steps = list(data["steps"])
+        scores = list(data["scores"])
+        selected_index = data["selected_index"]
+        if (
+            not steps
+            or not all(isinstance(candidate, ActionStep) for candidate in steps)
+            or len(scores) != len(steps)
+            or isinstance(selected_index, bool)
+            or not isinstance(selected_index, int)
+            or not 0 <= selected_index < len(steps)
+        ):
+            raise ValueError("候选事件缺少有效的 steps、scores 或 selected_index")
+
+        tree = instance.context
+        parent_id = tree.active_leaf_ids[0] if tree.active_leaf_ids else tree.root_id or None
+        if parent_id is None:
+            raise ValueError("保存候选前必须先创建任务根节点")
+        selected_node_id = ""
+        for index, (candidate, score) in enumerate(zip(steps, scores)):
+            node_id = f"node_{uuid4().hex[:12]}"
+            tree.add_node(
+                ContextNode(
+                    node_id=node_id,
+                    step=candidate,
+                    status=NodeStatus.ACTIVE if index == selected_index else NodeStatus.REJECTED,
+                    score=score,
+                    generation_strategy=str(data.get("strategy") or ""),
+                    generation_params={"breadth": int(data.get("breadth") or len(steps)), "candidate_index": index},
+                    annotations={"selected": index == selected_index},
+                ),
+                parent_id=parent_id,
+            )
+            if index == selected_index:
+                selected_node_id = node_id
+        tree.active_leaf_ids = [selected_node_id]
+        managed.context = tree
+        self.persist(managed)
+        logger.info(
+            "agent_candidates_selected runner_id=%s agent_id=%s candidates=%s selected=%s",
+            self.runner_id, managed.agent_id, len(steps), selected_index,
+        )
+        return steps[selected_index]
+
     def _finish_step(self, managed: ManagedAgent, step: ActionStep, step_index: int) -> ActionStep:
         instance = managed.instance
         if instance is None:
@@ -764,27 +875,15 @@ class AgentManager:
             else []
         )
         step.attachments = attachments
-        # 添加步骤到 ContextTree
-        if instance.context.active_leaf_ids:
-            parent_id = instance.context.active_leaf_ids[0]
-        else:
-            parent_id = instance.context.root_id if instance.context.root_id else None
-
-        node_id = f"node_{len(instance.context.nodes)}"
-        node = ContextNode(
-            node_id=node_id,
-            step=step,
-            depth=instance.context.nodes[parent_id].depth + 1 if parent_id else 0,
-            status=NodeStatus.ACTIVE
-        )
-
-        if parent_id:
-            instance.context.add_node(node, parent_id=parent_id)
-        else:
-            instance.context.add_node(node)
-            instance.context.root_id = node_id
-
-        instance.context.active_leaf_ids = [node_id]
+        tree = instance.context
+        # Candidate selection already inserted this very ActionStep before
+        # execution.  Keep its node/score/metadata and save the mutated result
+        # in place; only a linear step needs a fresh node.
+        selected_node = next((node for node in tree.get_active_leaves() if node.step is step), None)
+        if selected_node is None:
+            tree.append_step(step)
+        elif step.round_outcome == "failed":
+            selected_node.status = NodeStatus.FAILED
         managed.context = instance.context
         # A session checkpoint is the durability boundary for every action;
         # callbacks may publish events, but cannot make the transcript vanish.
@@ -835,6 +934,8 @@ class AgentManager:
                         instance.context.all_paths.clear()
                         instance.context.active_leaf_ids.clear()
                         instance.context.root_id = ""
+                        instance.context.selected_path_id = None
+                        instance.context.stats.clear()
 
                     # 只有在树为空时才创建根节点
                     if not instance.context.nodes:

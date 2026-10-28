@@ -85,8 +85,8 @@ _LEAK_PROBES = (".juice", "MagicMock")
 
 # SDK 包内目录属于只读包数据（wheel 安装后位于 site-packages）。任何运行时状态
 # 写到这里都是 bug：曾出现过 workspace_dir 为空时回退到 runtime_config_path 的父
-# 目录，把 team 配置写进 `_assets/.juice/`。仓库根探针覆盖不到这一层，故单列。
-_READ_ONLY_PACKAGE_DIRS = (SDK_SRC_ROOT / "juice_agents" / "_assets",)
+# 目录，把 team 配置写进包数据目录的 `.juice/`。仓库根探针覆盖不到这一层，故单列。
+_READ_ONLY_PACKAGE_DIRS = (SDK_SRC_ROOT / "juice_agents" / "core" / "config",)
 
 
 def _snapshot_repo_leaks() -> set[str]:

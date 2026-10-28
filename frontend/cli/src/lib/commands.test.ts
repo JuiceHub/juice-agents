@@ -146,7 +146,8 @@ function createClient() {
           team_name: "default",
           description: "Default delivery Team",
           member_names: ["researcher", "developer"],
-          manifest_path: "/tmp/workspace/.juice/teams/default/manifest.yaml",
+          source: "builtin",
+          manifest_path: null,
         }],
       };
     },
@@ -154,26 +155,13 @@ function createClient() {
       calls.push(["getTeam", { team_name, base_dir }]);
       return {
         schema_version: 2,
+        source: "builtin",
+        manifest_path: null,
         team_name,
         description: "Default delivery Team",
         member_names: ["researcher", "developer"],
       };
     },
-    listModeResources: async ({ mode_id }: { mode_id?: string } = {}) => ({
-      mode_ids: ["agent", "team", "group"],
-      resources: [
-        {
-          mode_id: mode_id || "group",
-          role: "worker",
-          name: "research_worker",
-          source: "builtin",
-          path: ".juice/agents/group/workers/research_worker.yaml",
-          description: "Research worker",
-          status: "available",
-        },
-      ],
-      count: 1,
-    }),
     workflowsConfigStatus: async () => ({ success: true, enabled: true }),
     permissionStatus: async () => ({ permission_mode: "default", workspace_rules: [], session_rules: [] }),
     viewSkill: async ({ name, file_path }: { name: string; file_path?: string }) => ({
@@ -440,10 +428,10 @@ test("/tasks opens the async tasks panel", async () => {
   assert.equal(result.interactiveAction, "tasks-panel");
 });
 
-test("/actors opens the actor selector", async () => {
+test("/active opens the actor selector", async () => {
   const client = createClient();
-  const result = await executeCommand("/actors", client, "/tmp/workspace");
-  assert.equal(result.interactiveAction, "actor-selector");
+  const result = await executeCommand("/active", client, "/tmp/workspace");
+  assert.equal(result.interactiveAction, "active-selector");
 });
 
 test("/config still opens in cold start without forcing a runner", async () => {
@@ -471,7 +459,7 @@ test("/help lists the config command", async () => {
   assert.match(result.blocks[0]?.text || "", /\/teams \[name\]/);
   assert.match(result.blocks[0]?.text || "", /\/mode \[agent\|plan\|team\|group\]/);
   assert.match(result.blocks[0]?.text || "", /\/mode \[agent\|plan\|team\|group\]/);
-  assert.match(result.blocks[0]?.text || "", /\/resources \[agent\|team\|group\]/);
+  assert.doesNotMatch(result.blocks[0]?.text || "", /\/resources/);
   assert.match(result.blocks[0]?.text || "", /\/worktree \[enter\|exit\|list\|status\] \[name\]/);
 });
 
@@ -484,14 +472,14 @@ test("/model without arguments opens the model selector", async () => {
   assert.equal(result.interactiveAction, "model-selector");
 });
 
-test("/resources lists mode-scoped resources", async () => {
+test("retired /resources command is unknown", async () => {
   const client = createClient();
 
   const result = await executeCommand("/resources group", client, "/tmp/workspace");
 
   assert.equal(result.blocks.length, 1);
-  assert.match(result.blocks[0]?.text || "", /research_worker/);
-  assert.match(result.blocks[0]?.text || "", /\.juice\/agents\/group\/workers/);
+  assert.match(result.blocks[0]?.text || "", /Unknown command/);
+  assert.deepEqual(client.calls, []);
 });
 
 test("/model <name> switches the current runtime model", async () => {

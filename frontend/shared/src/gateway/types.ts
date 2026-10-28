@@ -30,6 +30,31 @@ export interface PendingSessionRuntime {
   model_effort: string;
 }
 
+/** Per-step candidates; reward model selection is configured independently. */
+export interface StrategyConfiguration {
+  breadth?: number;
+  reset?: boolean;
+}
+
+/** Reward model state returned by configure_reward_model, including effective execution. */
+export interface RewardModelConfiguration {
+  model_name: string | null;
+  scorer_configured: boolean;
+  breadth: number;
+  execution: "linear" | "candidate_selection";
+}
+
+export interface StrategySwitchResult {
+  status: "pending" | "applied";
+  strategy: {
+    type: "greedy" | "exploration";
+    params: { breadth?: number };
+    execution: "linear" | "candidate_selection";
+    scorer_configured: boolean;
+  };
+  message: string;
+}
+
 export interface WorktreeStatus {
   name: string;
   slug: string;
@@ -328,6 +353,10 @@ export interface JsonRpcNotification {
   params: any;
 }
 
+/** Layered read results and sparse project patches share the same YAML shape.
+ * load_effective_config reads defaults → user → project → launch overrides;
+ * save_workspace_config accepts only fields the user actually changed.
+ */
 export interface WorkspaceRuntimeConfig {
   runtime?: {
     permission_mode?: string;
@@ -428,7 +457,7 @@ export interface PluginViewResponse {
 
 /**
  * A declaration visible to the current Runner/mode. Root is deliberately
- * omitted: it is a runtime identity rather than a registry-managed agent.
+ * omitted from child discovery even though Registry also resolves its declaration.
  */
 export interface AvailableAgentInfo {
   name: string;
@@ -449,7 +478,8 @@ export interface TeamInfo {
   team_name: string;
   description: string;
   member_names: string[];
-  manifest_path: string;
+  source: "local" | "builtin";
+  manifest_path: string | null;
 }
 
 export interface TeamsListResponse {
@@ -462,24 +492,10 @@ export interface TeamManifest {
   team_name: string;
   description: string;
   member_names: string[];
+  source: "local" | "builtin";
+  manifest_path: string | null;
   /** Explicit shared Agent sources; omitted by legacy all-shared manifests. */
   shared_agent_names?: Record<string, string>;
-}
-
-export interface ModeResourceInfo {
-  mode_id: string;
-  role: string;
-  name: string;
-  source: "workspace" | "builtin" | string;
-  path: string;
-  description: string;
-  status: string;
-}
-
-export interface ModeResourcesResponse {
-  mode_ids: string[];
-  resources: ModeResourceInfo[];
-  count: number;
 }
 
 export interface SkillConfigInfo extends SkillInfo {
@@ -640,7 +656,6 @@ export interface ClientCommand {
     | "list_available_agents"
     | "list_team_configs"
     | "get_team_config"
-    | "list_mode_resources"
     | "view_skill"
     | "view_plugin"
     | "skills_config_status"

@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 import re
 from abc import ABC, abstractmethod
-from typing import Any
+from copy import deepcopy
+from dataclasses import replace
+from typing import Any, Callable
 
 from .content import (
     DEFAULT_COMPACT_CONTINUATION_TEMPLATE,
@@ -74,7 +76,9 @@ class CompressStrategy(ABC):
         """判断当前上下文树是否应触发压缩。"""
 
     @abstractmethod
-    def compress(self, tree: ContextTree) -> ContextTree:
+    def compress(
+        self, tree: ContextTree, *, on_model_usage: Callable[..., None] | None = None,
+    ) -> ContextTree:
         """执行压缩，返回新的 ContextTree（不修改原 tree）。"""
 
 
@@ -84,7 +88,9 @@ class NoCompressStrategy(CompressStrategy):
     def should_compress(self, tree: ContextTree) -> bool:
         return False
 
-    def compress(self, tree: ContextTree) -> ContextTree:
+    def compress(
+        self, tree: ContextTree, *, on_model_usage: Callable[..., None] | None = None,
+    ) -> ContextTree:
         return clone_context_tree(tree)
 
 
@@ -103,26 +109,23 @@ class RemainCompressStrategy(CompressStrategy):
     def should_compress(self, tree: ContextTree) -> bool:
         return count_action_steps(tree) > self.k
 
-    def compress(self, tree: ContextTree) -> ContextTree:
+    def compress(
+        self, tree: ContextTree, *, on_model_usage: Callable[..., None] | None = None,
+    ) -> ContextTree:
         logger.info("压缩会话: strategy=remain, k=%s", self.k)
         action_step_indices = [
             idx for idx, step in enumerate(tree.steps) if isinstance(step, ActionStep)
         ]
         keep_indices = set(action_step_indices[-self.k:]) if self.k > 0 else set()
-        compressed = ContextTree(
-            tree_id=f"{tree.tree_id}_compressed",
-            system_prompt=tree.system_prompt,
-            include_reasoning_in_context=tree.include_reasoning_in_context,
-            system_prompt_static=tree.system_prompt_static,
-            system_prompt_dynamic=tree.system_prompt_dynamic,
-        )
-        for idx, step in enumerate(tree.steps):
-            new_step = clone_step(step)
+        # Retain the full tree (including rejected proposals and their usage)
+        # while projecting observations only on the selected execution branch.
+        compressed = clone_context_tree(tree)
+        compressed.tree_id = f"{tree.tree_id}_compressed"
+        for idx, new_step in enumerate(compressed.steps):
             if isinstance(new_step, ActionStep) and idx not in keep_indices:
                 if new_step.observations or new_step.observations_images:
                     new_step.observations = [self.placeholder]
                     new_step.observations_images = []
-            compressed.append_step(new_step)
         return compressed
 
 
@@ -174,43 +177,31 @@ class CompactCompressStrategy(CompressStrategy):
             return False
         return True
 
-    def compress(self, tree: ContextTree) -> ContextTree:
+    def compress(
+        self, tree: ContextTree, *, on_model_usage: Callable[..., None] | None = None,
+    ) -> ContextTree:
         """执行压缩"""
         if self.incremental:
-            return self._incremental_compress(tree)
+            return self._incremental_compress(tree, on_model_usage=on_model_usage)
         else:
-            return self._replace_compress(tree)
+            return self._replace_compress(tree, on_model_usage=on_model_usage)
 
-    def _replace_compress(self, tree: ContextTree) -> ContextTree:
-        """替换式压缩：创建新树（原有行为）"""
-        logger.info(
-            "压缩会话(替换模式): strategy=compact, step_threshold=%s, preserve_recent_actions=%s",
-            self.step_threshold,
-            self.preserve_recent_actions,
-        )
-        prefix_steps, suffix_steps = _split_steps_for_compaction(
-            tree, preserve_recent_actions=self.preserve_recent_actions
-        )
-        summary_text = _summarize_steps(
-            tree=tree,
-            steps=prefix_steps,
-            compression_model=self.compression_model,
-            compact_instructions=self.compact_instructions,
-        )
-        continuation_text = self.continuation_template.format(summary=summary_text)
-        new_tree = ContextTree(
-            tree_id=f"{tree.tree_id}_compacted",
-            system_prompt=tree.system_prompt,
-            include_reasoning_in_context=tree.include_reasoning_in_context,
-            system_prompt_static=tree.system_prompt_static,
-            system_prompt_dynamic=tree.system_prompt_dynamic,
-        )
-        new_tree.append_step(SummaryStep(content=continuation_text))
-        for step in suffix_steps:
-            new_tree.append_step(step)
-        return new_tree
+    def _replace_compress(
+        self, tree: ContextTree, *, on_model_usage: Callable[..., None] | None = None,
+    ) -> ContextTree:
+        """Return a compacted copy while retaining auditable proposals.
 
-    def _incremental_compress(self, tree: ContextTree) -> ContextTree:
+        Both modes use the same summary branch representation.  Replacement
+        copies the tree first; incremental mode adds that branch in place.
+        Rebuilding a linear tree here would erase rejected candidates.
+        """
+        copied = clone_context_tree(tree)
+        copied.tree_id = f"{tree.tree_id}_compacted"
+        return self._incremental_compress(copied, on_model_usage=on_model_usage)
+
+    def _incremental_compress(
+        self, tree: ContextTree, *, on_model_usage: Callable[..., None] | None = None,
+    ) -> ContextTree:
         """增量压缩：在树上添加摘要分支，保留原始历史"""
         import time
         import uuid
@@ -224,8 +215,8 @@ class CompactCompressStrategy(CompressStrategy):
         # 1. 获取当前活跃路径
         active_path = self._get_active_path(tree)
         if not active_path:
-            logger.warning("没有活跃路径，回退到替换模式")
-            return self._replace_compress(tree)
+            logger.warning("没有活跃路径，跳过压缩")
+            return tree
 
         # 2. 分割步骤
         prefix_steps, suffix_steps = _split_steps_for_compaction(
@@ -239,8 +230,7 @@ class CompactCompressStrategy(CompressStrategy):
         # 3. 找到分割点节点（prefix 的最后一个节点）
         split_node_id = self._find_split_node_id(tree, active_path, len(prefix_steps))
         if not split_node_id:
-            logger.warning("无法找到分割点，回退到替换模式")
-            return self._replace_compress(tree)
+            raise ValueError("无法在当前上下文路径找到压缩分割点")
 
         # 4. 生成摘要
         summary_text = _summarize_steps(
@@ -248,6 +238,7 @@ class CompactCompressStrategy(CompressStrategy):
             steps=prefix_steps,
             compression_model=self.compression_model,
             compact_instructions=self.compact_instructions,
+            on_model_usage=on_model_usage,
         )
         continuation_text = self.continuation_template.format(summary=summary_text)
 
@@ -263,6 +254,10 @@ class CompactCompressStrategy(CompressStrategy):
                 "compression_type": "compact",
                 "compressed_step_count": len(prefix_steps),
                 "compressed_at": time.time(),
+                # Physical ancestry remains intact for inspection, but the
+                # model sees this summary in place of its older prefix.
+                "context_reset": True,
+                "compressed_node_ids": active_path.node_ids[:len(prefix_steps)],
             }
         )
         tree.add_node(summary_node, parent_id=split_node_id)
@@ -271,14 +266,23 @@ class CompactCompressStrategy(CompressStrategy):
         current_parent = summary_node_id
         preserved_node_ids = []
 
-        for step in suffix_steps:
+        # A preserved ActionStep is still the same scored model proposal.
+        # Carry its node metadata into the compacted branch so inspecting the
+        # live path retains the score, selection index and original provenance.
+        # Copy nested annotations rather than sharing them with archived nodes.
+        suffix_node_ids = active_path.node_ids[len(prefix_steps):]
+        for source_node_id, step in zip(suffix_node_ids, suffix_steps):
+            source_node = tree.nodes[source_node_id]
             new_node_id = f"node_{uuid.uuid4().hex[:8]}"
-            new_node = ContextNode(
+            new_node = replace(
+                source_node,
                 node_id=new_node_id,
                 parent_id=current_parent,
+                children_ids=[],
                 step=step,
-                status=NodeStatus.SUCCESS,
                 depth=tree.nodes[current_parent].depth + 1,
+                generation_params=deepcopy(source_node.generation_params),
+                annotations={**deepcopy(source_node.annotations), "source_node_id": source_node_id},
             )
             tree.add_node(new_node, parent_id=current_parent)
             preserved_node_ids.append(new_node_id)
@@ -292,6 +296,8 @@ class CompactCompressStrategy(CompressStrategy):
             summary_node_id,
             preserved_node_ids,
         )
+        if not any(path.node_ids == active_path.node_ids for path in tree.all_paths):
+            tree.all_paths.append(active_path)
         tree.all_paths.append(compressed_path)
 
         # 8. 设置为活跃路径
@@ -313,14 +319,15 @@ class CompactCompressStrategy(CompressStrategy):
 
     def _get_active_path(self, tree: ContextTree) -> ExplorationPath | None:
         """获取当前活跃路径"""
+        if tree.active_leaf_ids:
+            path = tree.build_path_from_leaf(tree.active_leaf_ids[0])
+            if path is not None:
+                path.node_ids = tree.get_context_node_ids(tree.active_leaf_ids[0])
+            return path
         if tree.selected_path_id:
             for path in tree.all_paths:
                 if path.path_id == tree.selected_path_id:
                     return path
-
-        # 回退：使用 active_leaf_ids 构建路径
-        if tree.active_leaf_ids:
-            return tree.build_path_from_leaf(tree.active_leaf_ids[0])
 
         return None
 
@@ -393,17 +400,15 @@ def _split_steps_for_compaction(
         len(action_indices),
         _determine_suffix_action_count(tree, preserve_recent_actions),
     )
-    keep_indices = set(action_indices[-suffix_action_count:]) if suffix_action_count > 0 else set()
-
-    prefix_steps: list[AgentStep] = []
-    suffix_steps: list[AgentStep] = []
-    for idx, step in enumerate(tree.steps):
-        cloned = clone_step(step)
-        if idx in keep_indices and isinstance(cloned, ActionStep):
-            suffix_steps.append(cloned)
-            continue
-        prefix_steps.append(cloned)
-    return prefix_steps, suffix_steps
+    # Preserve a contiguous suffix, including tasks/attachments after its
+    # first action.  Moving those later task steps into the summary prefix
+    # would reorder a multi-turn conversation and lose its latest user input.
+    steps = tree.steps
+    split_index = action_indices[-suffix_action_count] if suffix_action_count else len(steps)
+    return (
+        [clone_step(step) for step in steps[:split_index]],
+        [clone_step(step) for step in steps[split_index:]],
+    )
 
 
 def _determine_suffix_action_count(tree: ContextTree, preserve_recent_actions: int) -> int:
@@ -432,6 +437,7 @@ def _summarize_steps(
     steps: list[AgentStep],
     compression_model: Any,
     compact_instructions: str,
+    on_model_usage: Callable[..., None] | None = None,
 ) -> str:
     transcript = _build_transcript_for_steps(tree, steps)
     system_for_compress = _DEFAULT_SUMMARY_SYSTEM_PROMPT
@@ -446,9 +452,13 @@ def _summarize_steps(
     try:
         response = compression_model.generate(summarizer_messages)
     except Exception as exc:  # pragma: no cover - 运行时保护
+        if on_model_usage is not None:
+            on_model_usage(kind="generation", model=compression_model, error=exc)
         logger.exception("压缩模型生成摘要失败")
         raise RuntimeError("compact 压缩模型调用失败") from exc
 
+    if on_model_usage is not None:
+        on_model_usage(kind="generation", model=compression_model, response=response)
     response_content = response.get("content", "") if isinstance(response, dict) else str(response)
     summary_text = _extract_summary_from_content(response_content)
     if not summary_text:

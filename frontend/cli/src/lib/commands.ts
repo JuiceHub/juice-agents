@@ -22,7 +22,6 @@ import {
   presentCronStatus,
   presentCronTasks,
   presentDreamReceipt,
-  presentModeResources,
   presentGoal,
   presentMemorySearch,
   presentMemoryStatus,
@@ -52,7 +51,7 @@ export interface CommandResult {
   blocks: MessageBlock[];
   clearMessages: boolean;
   exitRequested: boolean;
-  interactiveAction?: "model-selector" | "mode-selector" | "permissions-selector" | "agent-type-selector" | "resume-selector" | "config-panel" | "active-selector" | "tasks-panel";
+  interactiveAction?: "model-selector" | "reward-model-selector" | "mode-selector" | "permissions-selector" | "agent-type-selector" | "resume-selector" | "config-panel" | "active-selector" | "tasks-panel";
   forwardMessage?: string;
   forwardAgentMode?: string;
   loadHistory?: boolean;
@@ -147,15 +146,25 @@ async function resolveLiveSession(
   return client.describeSession();
 }
 
+/** Persist a model edit without copying untouched inherited fields. */
+export function modelConfigPatch(
+  previous: { model_name?: string; model_effort?: string } | null | undefined,
+  next: { model_name: string; model_effort: string },
+): Record<string, string> {
+  const patch: Record<string, string> = {};
+  if (previous?.model_name !== next.model_name) patch.model_name = next.model_name;
+  if (previous?.model_effort !== next.model_effort) patch.model_effort = next.model_effort;
+  return patch;
+}
+
 async function saveRuntimeConfig(
   client: GatewayClient,
   baseDir: string,
   runtime: Record<string, string>
 ): Promise<void> {
-  await client.saveWorkspaceConfig({
-    base_dir: baseDir,
-    config: { runtime },
-  });
+  if (Object.keys(runtime).length > 0) {
+    await client.saveWorkspaceConfig({ base_dir: baseDir, config: { runtime } });
+  }
 }
 
 function normalizeIntervalUnit(rawUnit: string): string {
@@ -396,27 +405,6 @@ export async function executeCommand(
     };
   }
 
-  if (command === "/resources") {
-    const modeId = parts[1];
-    if (modeId && !["agent", "team", "group"].includes(modeId)) {
-      return {
-        blocks: [{ kind: "error", text: `Usage: /resources [agent|team|group]` }],
-        clearMessages: false,
-        exitRequested: false,
-      };
-    }
-    return {
-      blocks: [
-        presentModeResources(await client.listModeResources({
-          base_dir: baseDir,
-          ...(modeId ? { mode_id: modeId } : {}),
-        })),
-      ],
-      clearMessages: false,
-      exitRequested: false,
-    };
-  }
-
   if (command === "/agents") {
     const name = parts[1];
     return {
@@ -501,10 +489,7 @@ export async function executeCommand(
         model_name: parts[1] || "",
         model_effort: selectedEffort,
       });
-      await saveRuntimeConfig(client, baseDir, {
-        model_name: nextRuntime.model_name,
-        model_effort: nextRuntime.model_effort,
-      });
+      await saveRuntimeConfig(client, baseDir, modelConfigPatch(currentRuntime, nextRuntime));
       return {
         blocks: [presentPendingStatus(nextRuntime)],
         clearMessages: false,
@@ -517,10 +502,7 @@ export async function executeCommand(
       model_name: parts[1] || "",
       model_effort: selectedEffort,
     });
-    await saveRuntimeConfig(client, baseDir, {
-      model_name: status.model_name,
-      model_effort: status.model_effort,
-    });
+    await saveRuntimeConfig(client, baseDir, modelConfigPatch(currentRuntime, status));
     return {
       blocks: [presentStatus(status)],
       clearMessages: false,
@@ -529,32 +511,83 @@ export async function executeCommand(
     };
   }
 
+  if (command === "/rm") {
+    if (parts.length === 1) {
+      // Match `/model`: querying current state belongs to opening the selector,
+      // while dispatch itself remains read-only and emits no transcript block.
+      return {
+        blocks: [],
+        clearMessages: false,
+        exitRequested: false,
+        interactiveAction: "reward-model-selector",
+      };
+    }
+    if (parts.length > 2) {
+      return {
+        blocks: [{ kind: "error", text: "Usage: /rm [model_name|reset] (use /models to list models)" }],
+        clearMessages: false,
+        exitRequested: false,
+      };
+    }
+
+    try {
+      const modelName = parts[1];
+      const reset = modelName === "reset";
+      // Use the same workspace catalog as /models. The gateway resolves its
+      // credentials and constructs the scorer; the CLI only selects its name.
+      if (modelName && !reset) {
+        const models = await client.listModels({ base_dir: baseDir });
+        if (!models.some((model) => model.model_name === modelName)) {
+          return {
+            blocks: [{ kind: "error", text: `Unknown reward model: ${modelName}. Use /models to list available models.` }],
+            clearMessages: false,
+            exitRequested: false,
+          };
+        }
+      }
+      const result = await client.configureRewardModel({
+        base_dir: baseDir,
+        ...(reset ? { reset: true } : modelName ? { model_name: modelName } : {}),
+      });
+      const lines = [
+        `Reward model: ${result.model_name || (result.scorer_configured ? "SDK scorer" : "not configured")}`,
+        `Configured breadth: ${result.breadth}`,
+        result.execution === "candidate_selection"
+          ? "Strategy: Per-step candidate selection"
+          : "Strategy: 线性执行 (Linear execution)",
+      ];
+      if (!result.scorer_configured) {
+        lines.push("Use /rm <model_name> to select a reward model from /models.");
+      } else if (result.breadth <= 1) {
+        lines.push("Use /strategy breadth=N (N > 1) to enable candidate selection.");
+      }
+      return {
+        blocks: [{ kind: "system", text: lines.join("\n") }],
+        clearMessages: false,
+        exitRequested: false,
+      };
+    } catch (error: any) {
+      return {
+        blocks: [{ kind: "error", text: `Failed to configure reward model: ${error.message}` }],
+        clearMessages: false,
+        exitRequested: false,
+      };
+    }
+  }
+
   if (command === "/strategy") {
-    // 无参数：显示帮助
     if (parts.length === 1) {
       return {
         blocks: [{
           kind: "system",
           text: [
-            "Usage: /strategy [breadth=N] [depth=N] [beam_width=N]",
+            "Usage: /strategy breadth=N",
             "       /strategy reset",
             "",
-            "Parameters:",
-            "  breadth       Branches per node (int or [5,3,2] for per-layer)",
-            "  depth         Maximum exploration depth",
-            "  beam_width    Number of best paths to keep at each step",
-            "",
-            "Examples:",
-            "  /strategy reset                           # Default greedy (1,1,1)",
-            "  /strategy breadth=5 depth=1               # Best-of-N",
-            "  /strategy breadth=3 depth=5 beam_width=3  # Beam Search",
-            "  /strategy breadth=3 depth=5 beam_width=1  # Single-path exploration",
-            "  /strategy breadth=[5,3,2] depth=3         # Adaptive breadth",
-            "",
-            "Common patterns:",
-            "  breadth=N depth=1 beam_width=1            # Generate N, select best",
-            "  breadth=N depth=D beam_width=N            # Keep N paths for D layers",
-            "  breadth=N depth=D beam_width=1            # Explore N branches per step",
+            "breadth is a positive integer: generate N candidates per step, select one, execute once.",
+            "breadth=1 or no scorer: 线性执行 (Linear execution).",
+            "Use /rm <model_name> to configure a reward model from /models.",
+            "max_steps continues to limit executed steps.",
           ].join("\n"),
         }],
         clearMessages: false,
@@ -562,77 +595,36 @@ export async function executeCommand(
       };
     }
 
-    // 检查是否是 reset
-    if (parts[1] === "reset") {
-      try {
-        const result = await client.switchStrategy({ reset: true });
-        return {
-          blocks: [{ kind: "system", text: `✅ ${result.message}\n\nStrategy reset to greedy (default)` }],
-          clearMessages: false,
-          exitRequested: false,
-        };
-      } catch (error: any) {
-        return {
-          blocks: [{ kind: "error", text: `Failed to reset strategy: ${error.message}` }],
-          clearMessages: false,
-          exitRequested: false,
-        };
-      }
-    }
-
-    // 解析参数（key=value 格式）
-    const params: Record<string, any> = {};
-    for (let i = 1; i < parts.length; i++) {
-      const [key, value] = parts[i].split("=");
-      if (!key || !value) {
-        return {
-          blocks: [{ kind: "error", text: `Invalid parameter format: ${parts[i]}. Expected key=value` }],
-          clearMessages: false,
-          exitRequested: false,
-        };
-      }
-
-      // 处理数组格式 breadth=[5,3,2]
-      if (value.startsWith("[")) {
-        try {
-          params[key] = JSON.parse(value);
-        } catch {
-          return {
-            blocks: [{ kind: "error", text: `Invalid array format: ${value}` }],
-            clearMessages: false,
-            exitRequested: false,
-          };
-        }
-      } else {
-        // 尝试解析为数字
-        const numValue = parseFloat(value);
-        params[key] = isNaN(numValue) ? value : numValue;
-      }
+    // Accept exactly one supported choice. Avoid parseFloat: values such as
+    // 3.5, arrays and trailing junk must not silently change candidate counts.
+    const reset = parts.length === 2 && parts[1] === "reset";
+    const breadthMatch = parts.length === 2 ? /^breadth=([1-9]\d*)$/.exec(parts[1]) : null;
+    const breadth = breadthMatch ? Number(breadthMatch[1]) : null;
+    if (!reset && (breadth === null || !Number.isSafeInteger(breadth))) {
+      return {
+        blocks: [{ kind: "error", text: "Usage: /strategy breadth=N (positive integer) or /strategy reset" }],
+        clearMessages: false,
+        exitRequested: false,
+      };
     }
 
     try {
-      const result = await client.switchStrategy(params);
+      // Include the workspace for a cold gateway shell. The subsequent
+      // start_session RPC carries this pending configuration into its Runner.
+      const result = await client.switchStrategy({
+        base_dir: baseDir,
+        ...(reset ? { reset: true } : { breadth: breadth! }),
+      });
       const strategyInfo = result.strategy;
-      const lines = [
-        `✅ ${result.message}`,
-        "",
-      ];
-
-      // 展示策略类型
-      if (strategyInfo.type === "greedy") {
-        lines.push("Strategy: Greedy (single deterministic path)");
+      const lines = [result.message, ""];
+      if (strategyInfo.execution === "candidate_selection") {
+        lines.push(`Strategy: Per-step candidate selection (breadth=${strategyInfo.params.breadth})`);
       } else {
-        lines.push("Strategy: Exploration");
-
-        // 展示参数
-        if (strategyInfo.params && Object.keys(strategyInfo.params).length > 0) {
-          lines.push("Parameters:");
-          for (const [key, value] of Object.entries(strategyInfo.params)) {
-            lines.push(`  ${key}: ${JSON.stringify(value)}`);
-          }
+        lines.push("Strategy: 线性执行 (Linear execution)");
+        if (strategyInfo.params.breadth !== undefined) {
+          lines.push(`Configured breadth: ${strategyInfo.params.breadth}; ${strategyInfo.scorer_configured ? "scorer configured" : "no scorer configured"}`);
         }
       }
-
       return {
         blocks: [{ kind: "system", text: lines.join("\n") }],
         clearMessages: false,

@@ -1,4 +1,4 @@
-import type { ActorSessionsReport, SessionSummary } from "@juice-agents/shared/gateway/types";
+import type { ActiveAgentsReport, SessionSummary } from "@juice-agents/shared/gateway/types";
 import type { MessageBlock } from "@juice-agents/shared/presenter/stream";
 import { buildSubactorNavItems, projectRunnerLabel } from "./layout.js";
 
@@ -28,7 +28,7 @@ export type WorkspaceSearchResult =
 export function buildWorkspaceSearchResults(params: {
   query: string;
   sessions: SessionSummary[];
-  actorSessionsReport: ActorSessionsReport | null;
+  actorSessionsReport: ActiveAgentsReport | null;
   messages: MessageBlock[];
 }): WorkspaceSearchResult[] {
   const query = params.query.trim().toLowerCase();

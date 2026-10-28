@@ -12,7 +12,7 @@ A lightweight Python agent framework for building ReAct and CodeAct agents with 
 | --- | --- |
 | 🔄 **Session Resume** | Resume agents, workflows, and tasks after process restart |
 | 🎯 **Multiple Agent Modes** | `agent`, `plan`, `group`, `team` — one runtime, four collaboration patterns |
-| 🧠 **Exploration Strategies** | Greedy, Best-of-N, Beam Search, Tree-of-Thoughts for multi-path reasoning |
+| 🧠 **Per-step Candidate Selection** | Generate multiple outputs, score valid candidates, and execute one |
 | 🌐 **Workflow Orchestration** | Branch, parallelize, loop, and checkpoint complex workflows |
 | 🛠️ **Rich Toolset** | Shell, Python, file, web, browser, image, MCP, and custom tools |
 | 💾 **Persistent State** | Sessions, workflows, background tasks, and team boards survive restarts |
@@ -36,15 +36,23 @@ conda activate juice-agents
 python -m pip install -e ./sdk
 python -m pip install -r adapters/requirements.txt
 npm ci --prefix frontend
+./install-juice
 ```
 
-Configure API credentials for online models:
+The local installer binds this checkout and the active Python/Node executables
+to `~/.local/bin/juice` (keep that directory on your shell's `PATH`). After this
+one-time setup, daily use needs neither this checkout as cwd nor Conda activation.
+Re-run the installer after moving the checkout or replacing either interpreter.
+Startup checks dependencies; install or repair them explicitly with the commands
+above. It never installs packages or edits lock files during a normal launch.
+
+Configure shared settings and credentials for online models:
 
 ```bash
-mkdir -p .juice
-cp sdk/src/juice_agents/_assets/config.example.yaml .juice/config.yaml
-cp .env.example .env
-# Edit .env with your API keys
+mkdir -p ~/.juice
+cp .env.example ~/.juice/.env
+# Edit ~/.juice/.env with your API keys
+# Optional: put shared model/runtime overrides in ~/.juice/config.yaml
 ```
 
 Browser tools require: `python -m playwright install chromium`
@@ -64,7 +72,13 @@ for event in runner.stream("Analyze this project's module boundaries"):
 # Resume the same session later (even after process restart)
 runner = juice.runners.resume(runner_id=runner.runner_id)
 print(runner.run("Turn the recommendations into an implementation order"))
+print(runner.token_usage())  # generation / reward / total
 ```
+
+Agents forward model usage to `AgentManager`, which persists and totals calls in
+`agents/model_usage.jsonl`; Runner delegates to it. Totals include rejected
+candidates and survive resume. Known counts and `missing_usage_requests` remain
+separate; no token or cost estimates are made. See [Runner](sdk/src/juice_agents/core/runner/README.md#token-usage).
 
 ### Agent Modes
 
@@ -75,43 +89,126 @@ print(runner.run("Turn the recommendations into an implementation order"))
 | `group` | Root agent coordinating specialist agents |
 | `team` | Persistent task board with member claims and messages |
 
+Mode switches preserve the current ReAct/CodeAct protocol unless a new
+`agent_type` is supplied.
+
 ### CLI and Web
 
 ```bash
-./juice       # Terminal interface
+cd /path/to/project
+juice                         # This directory is the workspace
+juice --workspace /other/project
+# From the framework checkout:
 ./juice-web   # Local web workbench (localhost only)
 ```
 
-### Exploration Strategies
+```text
+Configuration: SDK defaults (or runtime_config_path)
+                  → ~/.juice/config.yaml → <workspace>/.juice/config.yaml
+                  → launch options
+Credentials:   process environment > <workspace>/.env > ~/.juice/.env
+Rules:         ~/.juice/AGENTS.md → Git root → startup directory
+```
 
-Control how agents explore solution spaces with `/strategy` in CLI or SDK:
+SDK defaults are bundled in `juice_agents/core/config/defaults.yaml`; keep
+changes in user/project overrides. The SDK ships no demonstration Skills;
+provide them through `.juice/skills`, `.agents/skills`, or configured external directories.
+
+`--workspace` wins over `JUICE_WORKSPACE_DIR` and the startup directory; it must
+exist. Root, child, Team and Workflow Agents use that workspace for tools,
+Skills and `.juice` session state. Global config is managed as files; `/config`
+and `/model` save only explicit project overrides. Missing credentials are
+reported when a provider is needed; help and configuration remain available.
+
+At each rule directory a nonempty `AGENTS.override.md` replaces `AGENTS.md`.
+Non-Git workspaces read only their own project rules. Rules carry source/scope,
+are capped at 32 KiB with a diagnostic, and are reloaded when a session resumes.
+Agents must inspect deeper directory rules before editing there. Existing Git
+worktrees work as ordinary workspaces; built-in CLI worktree management remains
+unimplemented and reports that boundary explicitly.
+
+### Runnable Examples
+
+Every example has a default task: run its main file directly, including from an
+IDE or an absolute path. Configure its model in
+`examples/<name>/.juice/config.yaml`; provider keys can stay in the repository
+root `.env`, shared by all examples (see [Examples](examples/README.md)).
 
 ```bash
-# CLI: Switch strategies dynamically
-/strategy reset                           # Default greedy (single path)
-/strategy breadth=5 depth=1               # Best-of-N: generate 5, select best
-/strategy breadth=3 depth=5 beam_width=3  # Beam Search: keep 3 parallel paths
-/strategy breadth=3 depth=5 beam_width=1  # Single-path exploration
+python examples/agent_tot/__main__.py       # Three candidates per step, model scoring, winner execution
+python examples/team_delivery/__main__.py  # Team collaboration on a built-in delivery task
+python examples/agent_tot/__main__.py "Design a caching strategy" --reward-model <model_name>
+```
+
+The example directory stays its workspace regardless of the current directory.
+Credentials resolve in this order: process environment, example `.env`, repository
+root `.env`. This also applies when launched from another directory. Model settings
+remain separate for each example; `--model <model_name>` selects a configured model.
+`python -m examples.<name>` also works from the repository root. Runs show the
+task, Runner ID, tool activity, and result; ToT also shows candidate scores and
+the selected candidate. They use real models and require configured credentials.
+
+### Exploration Strategies
+
+Choose one output at each step, then continue from its execution result:
+
+```text
+Context → generate breadth candidates → validate → score → execute one → next step
 ```
 
 ```python
-# SDK: Configure exploration strategy
-from juice_agents.core.agent.context.strategies import TreeOfThoughtsStrategy
+from openai import OpenAI
 
-strategy = TreeOfThoughtsStrategy(
-    breadth=3,        # Generate 3 candidates per step
-    depth_limit=5,    # Explore up to 5 layers deep
-    keep_top_k=2      # Keep top-2 paths at each step
-)
-agent.set_exploration_strategy(strategy)
+from juice_agents.core.agent.context.strategies import TreeOfThoughtsStrategy
+from juice_agents.core.models.reward_models import GenerativeRewardModel
+
+# Native SDK client; OpenAI reads OPENAI_API_KEY from the environment.
+scorer = GenerativeRewardModel(model_name="your-model", client=OpenAI())
+# evaluate_batch(...) returns {"scores": [...], "usage": ..., "usage_calls": [...]}.
+# scores has one finite number per valid candidate; higher wins, ties pick first.
+agent.set_exploration_strategy(TreeOfThoughtsStrategy(breadth=3, reward_model=scorer))
 ```
 
-| Strategy | Configuration | Use Case |
-| --- | --- | --- |
-| **Greedy** | `breadth=1, depth=1` | Fast, deterministic decisions |
-| **Best-of-N** | `breadth=N, depth=1, beam_width=1` | One-shot candidate generation |
-| **Beam Search** | `breadth=N, depth=D, beam_width=N` | Parallel path exploration |
-| **ToT-style** | `breadth=N, depth=D, beam_width=1` | Deep single-path with backtracking |
+The [model layer](sdk/src/juice_agents/core/models/README.md) provides one concrete
+chat class, `ChatModel`, with `backend="openai"`, `"doubao"`, or `"anthropic"`.
+It keeps `generate()` separate from reward scoring and includes complete examples.
+Chat calls retry transient failures and empty responses; invalid requests,
+credentials, and unclassified errors fail immediately. Anthropic requests with
+large output budgets use streaming even without a cancellation token.
+`GenerativeRewardModel` (GRM) calls the provider SDK to generate JSON scores and parses
+them into numbers without configuration files. To use a configured logical model
+name, choose `GenerativeRewardModel.from_config("judge", config_context)` instead.
+Exploration strategies use `BaseRewardModel`; custom scorers subclass it and
+override `evaluate_batch`, following the same base-class convention as chat models.
+
+| Configuration | Execution |
+| --- | --- |
+| Default, `breadth=1`, or no scorer | One model request per step, no scoring |
+| `breadth=N` with a scorer | N outputs from the same context; only the winner executes |
+
+The CLI configures the reward model independently of the candidate count:
+
+```text
+/models                 # List logical model names
+/rm                     # Open the reward model picker
+/strategy breadth=3     # Generate three candidates and execute the best
+/rm <model_name>         # Alternatively, select a catalog model directly
+/rm reset               # Clear scoring while keeping breadth
+/strategy reset         # Return to breadth=1 while keeping the /rm choice
+```
+
+`/rm` opens a picker like `/model`, marks the current reward model, and offers
+a clear option that preserves breadth. It reuses the `/models` catalog, connection
+settings, and credentials without changing the generation model. With breadth greater than
+one, one extra model request scores the valid candidates in a batch. Without a
+scorer, execution stays linear. Configuration makes no model requests. `breadth`
+must be a positive integer; `max_steps` still controls executed steps.
+
+Manager persists all candidates, usage, scores, and rejected status. Normal messages
+and compression follow the selected branch. Scorers are not serialized: `/rm`
+choices stay in the current CLI process, including choices made before startup
+or recovery in the same workspace. After restarting the CLI, configure `/rm`
+again (or inject an SDK scorer). There is no parallel path execution or backtracking.
 
 See [examples/agent_tot](examples/agent_tot) for complete examples.
 
@@ -128,6 +225,31 @@ Registry (static config) → Manager (runtime state) ← Runner (execution)
 
 All agent modes share the same execution path through Runner. State persists to `.juice/` in the workspace.
 
+Restored and inherited sessions own independent nested state: changing their
+outputs or metadata cannot mutate the source tree or snapshot.
+
+Registries resolve local declarations first, then read-only built-ins. Viewing,
+validating, constructing and running presets never saves default Agent YAML or
+Team manifests. The first successful edit saves a complete local override;
+deleting it restores the built-in. Pure built-ins cannot be deleted. `root` is
+the entry point; `general` is a child Agent. Runner applies mode settings and
+paths to memory copies and continues saving sessions, tasks and run records.
+New tools are saved to ToolRegistry and added to the requesting Agent's declaration;
+the current Agent can call them from its next step.
+Root discovers child Agents dynamically through the same availability query used
+by `agents_list` and dispatch. A newly saved eligible Agent is callable immediately;
+its name and description appear in the next model step. Plan policy, Team
+membership, and Runner/mode-local unloads still apply.
+
+```text
+read / run → Registry → local override → built-in fallback
+edit       → validate → atomic save in .juice
+```
+
+Use `/agents [name]` and `/teams [name]` for discovery; `/resources` and its
+`list_mode_resources` gateway API have been removed. Queries report `local` or
+`builtin`; built-in Teams have `manifest_path: null`.
+
 ## Development
 
 Run tests:
@@ -135,10 +257,15 @@ Run tests:
 ```bash
 conda activate juice-agents
 python -m pytest tests -q
-cd frontend && npm test --workspaces --if-present
+npm test --prefix frontend --workspaces --if-present
+npm run typecheck --prefix frontend --workspaces --if-present
+npm run build --prefix frontend --workspaces --if-present
 ```
 
 Contributions should include tests, documentation updates, and verification results. See [AGENTS.md](AGENTS.md) for development guidelines.
+
+Keep tool-specific prompt rules and examples in each tool's own definition so
+ReAct and CodeAct use the same contract. See the [tool creation contract](sdk/src/juice_agents/core/agent/README.md#tool-creation-contract).
 
 ## Module Documentation
 

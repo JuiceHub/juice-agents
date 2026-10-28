@@ -177,16 +177,17 @@ EXPLORE_SUBAGENT_INSTRUCTIONS = (
     "questions that still need verification."
 )
 GENERAL_CONFIG = AgentConfig(
-    name="general",
+    name="root",
     agent_type="default",
     model_config_name=DEFAULT_MODEL_CONFIG_NAME,
     model_effort=DEFAULT_MODEL_EFFORT,
-    description="General-purpose prebuilt root agent with the default tool list.",
+    description="Runner-owned root agent.",
     instructions=ROOT_GENERAL_INSTRUCTIONS,
     prompt_language="en",
     max_steps=20,
     tools=GENERAL_ROOT_TOOLS,
     managed_agent_names=("general", "explore"),
+    lifecycle="persistent",
 )
 GENERAL_SUBAGENT_CONFIG = AgentConfig(
     name="general",

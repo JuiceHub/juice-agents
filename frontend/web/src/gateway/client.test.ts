@@ -116,7 +116,7 @@ test("gateway client surfaces structured HTTP error details", async () => {
   }
 });
 
-test("describeActorSessions sends the gateway command", async () => {
+test("describeActiveAgents sends the gateway command", async () => {
   const sent: string[] = [];
   class FakeSocket {
     readyState = WebSocket.OPEN;
@@ -127,9 +127,9 @@ test("describeActorSessions sends the gateway command", async () => {
 
   const client = new WebGatewayClient("http://127.0.0.1:8003");
   Object.defineProperty(client, "socket", { value: new FakeSocket() });
-  void client.describeActorSessions();
+  void client.describeActiveAgents();
 
-  assert.match(sent[0], /"type":"describe_actor_sessions"/);
+  assert.match(sent[0], /"type":"describe_agent_sessions"/);
 });
 
 test("actor interaction helpers send gateway commands", async () => {
@@ -143,14 +143,14 @@ test("actor interaction helpers send gateway commands", async () => {
 
   const client = new WebGatewayClient("http://127.0.0.1:8003");
   Object.defineProperty(client, "socket", { value: new FakeSocket() });
-  void client.sendActorMessage({ actor_name: "researcher", message: "focus tests" });
-  void client.interruptActor({ actor_name: "researcher" });
+  void client.sendAgentMessage({ agent_name: "researcher", message: "focus tests" });
+  void client.interruptAgent({ agent_name: "researcher" });
 
-  assert.match(sent[0], /"type":"send_actor_message"/);
-  assert.match(sent[0], /"actor_name":"researcher"/);
+  assert.match(sent[0], /"type":"send_agent_message"/);
+  assert.match(sent[0], /"agent_name":"researcher"/);
   assert.match(sent[0], /"message":"focus tests"/);
-  assert.match(sent[1], /"type":"interrupt_actor"/);
-  assert.match(sent[1], /"actor_name":"researcher"/);
+  assert.match(sent[1], /"type":"interrupt_agent"/);
+  assert.match(sent[1], /"agent_name":"researcher"/);
 });
 
 test("listSkills sends the gateway command", async () => {

@@ -28,7 +28,7 @@
 
 ## 配置
 
-默认值来自 SDK 内的 `config.example.yaml`；workspace 覆盖值写入 `.juice/config.yaml`。配置命令只修改 workspace 覆盖文件。
+默认值来自 SDK 内的 `core/config/defaults.yaml`；workspace 覆盖值写入 `.juice/config.yaml`。配置命令只修改 workspace 覆盖文件。
 
 ```yaml
 memory:

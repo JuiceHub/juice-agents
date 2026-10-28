@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { INTERRUPT_MESSAGE, presentActorSession, presentStreamEvent } from "./stream.js";
-import type { ActorSessionSnapshot, RunnerStreamEvent } from "../gateway/types.js";
+import { INTERRUPT_MESSAGE, presentActiveAgent, presentStreamEvent } from "./stream.js";
+import type { ActiveAgentSnapshot, RunnerStreamEvent } from "../gateway/types.js";
 
 test("presentStreamEvent keeps action and round-end presentation separate", () => {
   const event: RunnerStreamEvent = {
@@ -9,8 +9,8 @@ test("presentStreamEvent keeps action and round-end presentation separate", () =
     permission_mode: "default",
     agent_mode: "agent",
     runner_id: "abc",
-    actor_name: "root",
-    actor_role: "root",
+    agent_name: "root",
+    agent_role: "root",
     step_num: 1,
     round_id: "round-1",
     team_event: null,
@@ -50,8 +50,8 @@ test("presentStreamEvent renders stream cancellation marker", () => {
     permission_mode: "default",
     agent_mode: "agent",
     runner_id: "abc",
-    actor_name: "root",
-    actor_role: "root",
+    agent_name: "root",
+    agent_role: "root",
     step_num: null,
     round_id: "round-2",
     team_event: null,
@@ -68,8 +68,8 @@ test("presentStreamEvent keeps lifecycle progress out of the transcript", () => 
     permission_mode: "default",
     agent_mode: "agent",
     runner_id: "abc",
-    actor_name: "root",
-    actor_role: "root",
+    agent_name: "root",
+    agent_role: "root",
     step_num: null,
     round_id: "round-3",
     team_event: null,
@@ -86,12 +86,12 @@ test("presentStreamEvent keeps lifecycle progress out of the transcript", () => 
   assert.deepEqual(presentStreamEvent(event), []);
 });
 
-test("presentActorSession renders actor task, action, and status", () => {
-  const actor: ActorSessionSnapshot = {
-    actor_id: "runner:researcher",
-    actor_name: "researcher",
-    actor_kind: "teammate",
-    actor_role: "worker",
+test("presentActiveAgent renders actor task, action, and status", () => {
+  const actor: ActiveAgentSnapshot = {
+    agent_id: "runner:researcher",
+    agent_name: "researcher",
+    agent_kind: "teammate",
+    agent_role: "worker",
     status: "active",
     is_root: false,
     current_async_task_id: "teammate_researcher_0001",
@@ -118,7 +118,7 @@ test("presentActorSession renders actor task, action, and status", () => {
     ],
   };
 
-  assert.deepEqual(presentActorSession(actor), [
+  assert.deepEqual(presentActiveAgent(actor), [
     { kind: "system", text: "researcher: active · teammate · teammate_researcher_0001" },
     { kind: "user", text: "research async state" },
     { kind: "thinking", text: "reading store" },
@@ -132,8 +132,8 @@ test("presentStreamEvent renders react tool calls and codeact python blocks", ()
     permission_mode: "default",
     agent_mode: "agent",
     runner_id: "abc",
-    actor_name: "root",
-    actor_role: "root",
+    agent_name: "root",
+    agent_role: "root",
     step_num: 2,
     round_id: "round-4",
     team_event: null,
@@ -182,8 +182,8 @@ test("presentStreamEvent renders react tool calls and codeact python blocks", ()
     permission_mode: "default",
     agent_mode: "agent",
     runner_id: "abc",
-    actor_name: "root",
-    actor_role: "root",
+    agent_name: "root",
+    agent_role: "root",
     step_num: 3,
     round_id: "round-5",
     team_event: null,
@@ -213,8 +213,8 @@ test("presentStreamEvent surfaces observation images as clickable path text", ()
     permission_mode: "default",
     agent_mode: "agent",
     runner_id: "abc",
-    actor_name: "root",
-    actor_role: "root",
+    agent_name: "root",
+    agent_role: "root",
     step_num: 4,
     round_id: "round-6",
     team_event: null,

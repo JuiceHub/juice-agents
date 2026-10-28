@@ -54,6 +54,33 @@ class RunnerContext:
             context=context,
         )
 
+    def list_available_agents(self) -> dict[str, Any]:
+        """Read the current dispatch projection without acquiring an Agent.
+
+        Root shares the Registry query used by agents_list and Runner dispatch.
+        A child keeps its explicit relationship boundary; seeing a newly saved
+        workspace declaration must not grant it additional dispatch authority.
+        Manager identity, rather than an editable Agent name, selects the scope.
+        """
+
+        managed = self.runner.agent_manager.get(self.agent_id)
+        if managed.instance is not self.agent:
+            raise RuntimeError("Agent 调用上下文与 Manager 实例不匹配")
+        response = self.runner.list_available_agents()
+        if managed.is_root:
+            return response
+        # The declaration retains relationships that were temporarily hidden
+        # by mode policy or unload state at acquisition. Intersecting a filtered
+        # startup snapshot would prevent a later enable from restoring them.
+        names = set(self.agent._declared_agent_config.managed_agent_names)
+        return {
+            **response,
+            "agents": [
+                entry for entry in response["agents"]
+                if entry["name"] in names
+            ],
+        }
+
     def launch_local_agent(
         self,
         *,

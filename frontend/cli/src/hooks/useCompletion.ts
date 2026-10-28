@@ -16,12 +16,13 @@ const SLASH_COMMANDS: CandidateItem[] = [
   { label: "/help", description: "Show available commands" },
   { label: "/status", description: "Show the current session" },
   { label: "/mode", description: "Switch agent mode" },
-  { label: "/resources", description: "List mode resources" },
   { label: "/team", description: "Run one task with the team mode" },
   { label: "/group", description: "Run one task with the group mode" },
   { label: "/agent-type", description: "Save the default Agent type" },
   { label: "/models", description: "List available models" },
   { label: "/model", description: "Show or switch runtime model" },
+  { label: "/rm", description: "Select or reset the reward model" },
+  { label: "/strategy", description: "Configure per-step candidate selection" },
   { label: "/config", description: "Edit runtime and memory config" },
   { label: "/agents", description: "List or view available agents" },
   { label: "/teams", description: "List or view Team manifests" },
@@ -30,7 +31,7 @@ const SLASH_COMMANDS: CandidateItem[] = [
   { label: "/goal", description: "Set or inspect the active goal" },
   { label: "/loop", description: "Schedule a recurring prompt" },
   { label: "/cron", description: "Manage scheduled prompts" },
-  { label: "/worktree", description: "Manage git worktrees" },
+  { label: "/worktree", description: "Reserved; launch from an existing Git worktree" },
   { label: "/skills", description: "List or view local skills" },
   { label: "/plugins", description: "List or view installed plugins" },
   { label: "/permissions", description: "Switch permission mode or inspect rules" },
@@ -54,6 +55,13 @@ const PERMISSION_OPTIONS: CandidateItem[] = [
   { label: "default", description: "Ask before mutations" },
   { label: "accept", description: "Allow workspace edits" },
   { label: "status", description: "Show permission rules" },
+];
+
+const STRATEGY_OPTIONS: CandidateItem[] = [
+  // Use a valid count so accepting completion produces an executable command;
+  // the shared completion helper appends a space after the selected token.
+  { label: "breadth=3", description: "Set candidates per step; no scorer stays linear" },
+  { label: "reset", description: "Restore linear execution" },
 ];
 
 const MEMORY_OPTIONS: CandidateItem[] = [
@@ -172,7 +180,7 @@ export function getCommandCandidates(
 
   // 无参数命令列表：输入完整后不再显示候选，允许历史导航
   const COMMANDS_WITHOUT_PARAMS = new Set([
-    "/help", "/status", "/models", "/model", "/config", "/dream", "/clear", "/exit",
+    "/help", "/status", "/models", "/model", "/rm", "/config", "/dream", "/clear", "/exit",
     "/tasks", "/active", "/resume", "/sessions",
   ]);
 
@@ -198,6 +206,30 @@ export function getCommandCandidates(
     if (parts.length === 2) {
       return prefixFilter(PERMISSION_OPTIONS, parts[1]);
     }
+  }
+
+  if (parts[0] === "/strategy") {
+    // The command accepts exactly one argument. Offer both choices after the
+    // command's whitespace, but close the list after a complete argument so
+    // arrow keys can return to history navigation without suggesting extras.
+    const awaitingArgument = parts.length === 1 && hasTrailingWhitespace;
+    const editingArgument = parts.length === 2 && !hasTrailingWhitespace;
+    return awaitingArgument || editingArgument
+      ? prefixFilter(STRATEGY_OPTIONS, parts[1] || "")
+      : [];
+  }
+
+  if (parts[0] === "/rm") {
+    // Reward models come from the runtime catalog, with one reserved reset
+    // action. Accept exactly one argument and close completed suggestions.
+    const awaitingArgument = parts.length === 1 && hasTrailingWhitespace;
+    const editingArgument = parts.length === 2 && !hasTrailingWhitespace;
+    const options = getUniqueNames(runtimeModelNames)
+      .filter((name) => name !== "reset")
+      .map((label) => ({ label, description: "Reward model" }));
+    return awaitingArgument || editingArgument
+      ? prefixFilter([...options, { label: "reset", description: "Clear the reward model" }], parts[1] || "")
+      : [];
   }
 
   if (parts[0] === "/model") {
@@ -319,6 +351,12 @@ export function buildInlineHint(params: {
     }
     if (parts[0] === "/permissions") {
       return "<default|accept|status>";
+    }
+    if (parts[0] === "/strategy") {
+      return "<breadth=N|reset>";
+    }
+    if (parts[0] === "/rm") {
+      return "<model_name|reset>";
     }
     if (parts[0] === "/memory") {
       return "<status|search|view>";

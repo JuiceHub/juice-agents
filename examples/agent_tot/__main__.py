@@ -1,109 +1,140 @@
-"""演示如何使用探索策略（ToT/Beam Search/Best-of-N）。
+"""每步生成多个候选、评分择一执行的探索示例。
 
-本示例展示：
-1. 默认贪心策略（单路径）
-2. Best-of-N 策略（生成多个候选，选最优）
-3. Beam Search 策略（保持多条路径并行）
-4. ToT 策略（单路径深度探索）
+直接运行本文件即可演示 ToT；默认使用生成模型批量评分，也可通过
+--reward-model 选择目录中的独立模型，或 main(..., reward_model=scorer) 注入。
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any, Callable
 
-from .._runtime import add_runtime_arguments, run_showcase, showcase_workspace
+# Direct-file execution starts sys.path in this example's folder, not the repo.
+# Use one canonical package import for both IDE Run and `python -m` entry points.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from examples._runtime import add_runtime_arguments, run_showcase, showcase_workspace
+from juice_agents.core.agent.context.steps import ActionStep
+from juice_agents.core.agent.context.strategies import (
+    GreedyStrategy,
+    TreeOfThoughtsStrategy,
+)
+from juice_agents.core.config.context import ConfigurationContext
+from juice_agents.core.config.model_catalog import DEFAULT_RUNTIME_MODEL_NAME, list_runtime_models
+from juice_agents.core.models.reward_models import BaseRewardModel, GenerativeRewardModel
+from juice_agents.core.registry.agents.types import DEFAULT_MODEL_CONFIG_NAME
+
+
+DEFAULT_TASK = (
+    "实现一个容量可配置的 Python LRU 缓存，get/put 均为 O(1)。"
+    "交付 lru_cache.py 和 tests/test_lru_cache.py，验证更新键、超容量淘汰和未命中，"
+    "并报告实际测试结果。"
+)
+
+
+class DemonstrationStrategy(TreeOfThoughtsStrategy):
+    """Show the real scoring decision before the winner executes its actions."""
+
+    def select(
+        self, *, context: list[dict[str, Any]], candidates: list[ActionStep],
+        on_model_usage: Callable[..., None] | None = None,
+    ) -> tuple[int, list[float | None]]:
+        selected, scores = super().select(
+            context=context, candidates=candidates, on_model_usage=on_model_usage,
+        )
+        print(f"[tot] candidates={len(candidates)} scores={scores} selected={selected + 1}", flush=True)
+        for index, candidate in enumerate(candidates):
+            # Show proposed actions, not the potentially lengthy reasoning. The
+            # full candidates and scores remain available in persisted context.
+            proposal = (
+                json.dumps(candidate.tool_calls, ensure_ascii=False)
+                if candidate.tool_calls else candidate.code_action
+            )
+            if not proposal:
+                proposal = str(candidate.error or "No tool actions")
+            print(f"  candidate {index + 1}: {proposal[:300]}", flush=True)
+        return selected, scores
+
+
+def _positive_int(value: str) -> int:
+    """Reject invalid breadth before creating workspace state or resolving models."""
+
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("breadth 必须为正整数")
+    return parsed
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """构建命令行参数解析器。"""
     parser = argparse.ArgumentParser(
         prog="python -m examples.agent_tot",
-        description=(
-            "演示探索策略的使用。支持 greedy/best_of_n/beam_search/tot 等不同策略。"
-        )
+        description="每步候选选择：生成 breadth 个候选后评分，只执行选中的输出。",
     )
+    parser.add_argument("task", nargs="?", default=DEFAULT_TASK, help="要执行的任务；默认演示 LRU 缓存实现和测试")
     parser.add_argument(
-        "task",
-        help="要执行的任务，例如：'优化这段代码的性能'",
+        "--strategy", choices=("greedy", "tot"), default="tot",
+        help="tot（默认）每步评分择优；greedy 用于对照线性执行。",
     )
-    parser.add_argument(
-        "--strategy",
-        choices=["greedy", "best_of_n", "beam_search", "tot"],
-        default="greedy",
-        help="探索策略类型 (默认: greedy)",
-    )
-    parser.add_argument(
-        "--breadth",
-        type=int,
-        default=3,
-        help="每步展开的分支数 (默认: 3)",
-    )
-    parser.add_argument(
-        "--depth",
-        type=int,
-        default=3,
-        help="最大探索深度 (默认: 3)",
-    )
-    parser.add_argument(
-        "--beam-width",
-        type=int,
-        default=2,
-        help="每步保留的路径数 (默认: 2)",
-    )
+    parser.add_argument("--breadth", type=_positive_int, default=3, help="每步候选数量（默认 3）")
+    parser.add_argument("--reward-model", metavar="MODEL_NAME", help="目录中的奖励模型名；默认复用生成模型")
     add_runtime_arguments(parser)
     return parser
 
 
-def main(argv: list[str] | None = None):
-    """运行探索策略示例。"""
-    args = build_parser().parse_args(argv)
+def main(argv: list[str] | None = None, *, reward_model: BaseRewardModel | None = None) -> Any:
+    """Run a real, scored demonstration using the example's model catalog."""
 
-    # 根据策略类型配置 agent
-    from juice_agents.core.agent.context.strategies import (
-        GreedyStrategy,
-        TreeOfThoughtsStrategy,
-    )
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.reward_model and reward_model is not None:
+        parser.error("--reward-model 不能与 Python 注入的 reward_model 同时使用")
+    if args.strategy == "greedy" and (args.reward_model or reward_model is not None):
+        parser.error("greedy 不使用评分器；请移除奖励模型设置或选择 tot")
+    workspace = showcase_workspace(__file__)
 
-    if args.strategy == "greedy":
-        # 贪心策略：单路径，确定性
-        strategy = GreedyStrategy()
-        print(f"\n使用策略: Greedy (单路径)")
-    elif args.strategy == "best_of_n":
-        # Best-of-N: 生成 N 个候选，选最优
-        strategy = TreeOfThoughtsStrategy(
-            breadth=args.breadth,
-            depth_limit=1,
-            keep_top_k=1
+    def configure_runner(runner: Any) -> None:
+        scorer = reward_model
+        if args.strategy == "tot" and scorer is None:
+            context = ConfigurationContext.from_workspace(
+                workspace, project_config_path=runner.runtime_config_path,
+            )
+            name = args.reward_model or runner.root_config.model_config_name
+            # Agent declarations use "default" as a workspace-policy selector,
+            # not a catalog entry. Follow the same runtime setting as generation.
+            if not args.reward_model and name == DEFAULT_MODEL_CONFIG_NAME:
+                runtime = context.read_merged_config().get("runtime", {})
+                name = (
+                    str(runtime.get("model_name") or DEFAULT_RUNTIME_MODEL_NAME).strip()
+                    or DEFAULT_RUNTIME_MODEL_NAME
+                )
+            catalog = list_runtime_models(
+                runtime_config_path=context.project_config_path, workspace_dir=workspace,
+            )
+            if name not in {model["model_name"] for model in catalog}:
+                raise ValueError(f"奖励模型不在当前示例模型目录中: {name}")
+            scorer = GenerativeRewardModel.from_config(name, context)
+            print(f"奖励模型: {name}", flush=True)
+        strategy = (
+            DemonstrationStrategy(breadth=args.breadth, reward_model=scorer)
+            if args.strategy == "tot" else GreedyStrategy()
         )
-        print(f"\n使用策略: Best-of-N (breadth={args.breadth})")
-    elif args.strategy == "beam_search":
-        # Beam Search: 保持固定宽度的并行路径
-        strategy = TreeOfThoughtsStrategy(
-            breadth=args.breadth,
-            depth_limit=args.depth,
-            keep_top_k=args.beam_width
-        )
-        print(f"\n使用策略: Beam Search (breadth={args.breadth}, depth={args.depth}, beam_width={args.beam_width})")
-    else:  # tot
-        # ToT: 单路径深度探索，每步探索多个分支
-        strategy = TreeOfThoughtsStrategy(
-            breadth=args.breadth,
-            depth_limit=args.depth,
-            keep_top_k=1
-        )
-        print(f"\n使用策略: ToT (breadth={args.breadth}, depth={args.depth})")
-
-    print(f"任务: {args.task}\n")
-
-    # 注意：这里演示如何设置策略
-    # 实际运行时，策略会在 agent 创建后通过 set_exploration_strategy() 设置
-    # 或在 CLI 中通过 /strategy 命令动态切换
+        if args.strategy == "tot" and args.breadth > 1:
+            print(f"每步候选选择: breadth={args.breadth}，评分后择一执行", flush=True)
+        else:
+            print("线性执行：greedy 或 breadth=1，每步仅请求一次生成模型。", flush=True)
+        # Runtime-only dependencies are reattached on both create and resume.
+        runner._root().instance.set_exploration_strategy(strategy)
 
     return run_showcase(
         args,
         agent_mode="agent",
-        workspace=showcase_workspace(__file__),
+        workspace=workspace,
         task=args.task,
+        configure_runner=configure_runner,
     )
 
 

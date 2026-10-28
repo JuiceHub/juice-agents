@@ -54,8 +54,8 @@ def test_sdk_distribution_builds_and_imports_without_repository(tmp_path: Path) 
     assert f"Homepage, {PROJECT_URL}" in metadata.get_all("Project-URL")
     assert "runner_config=\"agent\"" in metadata.get_payload()
     assert "juice_agents/py.typed" in names
-    assert "juice_agents/_assets/config.example.yaml" in names
-    assert "juice_agents/_assets/skills/joke-expert/SKILL.md" in names
+    assert "juice_agents/core/config/defaults.yaml" in names
+    assert not any("/_assets/" in name or "/joke-expert/" in name for name in names)
     assert all(name.startswith("juice_agents/") or ".dist-info/" in name for name in names)
     assert not any("/.juice/" in name or name.endswith("/.env") for name in names)
 
@@ -71,6 +71,7 @@ def test_sdk_distribution_builds_and_imports_without_repository(tmp_path: Path) 
     assert wheel_license == (SDK_ROOT.parent / "LICENSE").read_bytes()
     assert any(name.endswith("/README.md") and name.count("/") == 1 for name in source_names)
     assert any(name.endswith("/pyproject.toml") for name in source_names)
+    assert any(name.endswith("/juice_agents/core/config/defaults.yaml") for name in source_names)
     assert not any("/adapters/" in name or "/backend/" in name for name in source_names)
 
     # A target install with no source checkout on PYTHONPATH catches editable-only
@@ -85,6 +86,7 @@ def test_sdk_distribution_builds_and_imports_without_repository(tmp_path: Path) 
     )
     environment = os.environ.copy()
     environment["PYTHONPATH"] = str(target)
+    environment["HOME"] = str(tmp_path / "home")
     subprocess.run(
         [
             sys.executable,
@@ -92,8 +94,14 @@ def test_sdk_distribution_builds_and_imports_without_repository(tmp_path: Path) 
             "from importlib import resources; "
             "from pathlib import Path; "
             "import juice_agents; "
+            "from juice_agents.core.config.runtime_config import DEFAULT_RUNTIME_CONFIG_PATH, read_runtime_config; "
+            "from juice_agents.core.registry.skills import SkillRegistry; "
             "assert Path(juice_agents.__file__).resolve().is_relative_to(Path(__import__('sys').argv[1])); "
-            "assert resources.files('juice_agents').joinpath('_assets', 'config.example.yaml').is_file()",
+            "assert DEFAULT_RUNTIME_CONFIG_PATH.is_relative_to(Path(__import__('sys').argv[1])); "
+            "assert resources.files('juice_agents.core.config').joinpath('defaults.yaml').is_file(); "
+            "assert read_runtime_config()['models']; "
+            "assert SkillRegistry().builtin_dir is None; "
+            "assert not Path('.juice').exists()",
             str(target),
         ],
         cwd=tmp_path,

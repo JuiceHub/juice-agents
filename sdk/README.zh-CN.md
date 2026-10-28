@@ -32,16 +32,22 @@ python -m build --sdist --wheel --outdir sdk/dist sdk
 pip install sdk/dist/juice_agents-*.whl
 ```
 
-**配置：** 使用托管模型前，配置 `.juice/config.yaml` 并通过环境提供 API 密钥：
+**配置：** 无需复制整个模型目录；通用配置和凭据放在 `~/.juice/`，仅在需要时增加项目覆盖：
 
 ```bash
-mkdir -p .juice
-cp sdk/src/juice_agents/_assets/config.example.yaml .juice/config.yaml
-cp .env.example .env
-# 在 .env 中填写 API 密钥
+mkdir -p ~/.juice
+# ~/.juice/config.yaml 保存通用配置，~/.juice/.env 保存 API 密钥。
+# 项目按需使用 workspace 下的 .juice/config.yaml 和 .env 覆盖。
 ```
 
-模型条目可选 `api_base_env`：其指向的变量（进程环境 > `.env`）存在时覆盖 YAML 中的 `api_base`。内置 Claude 模型使用 `ANTHROPIC_BASE_URL`，接入代理/中转服务只需修改 `.env`。
+```text
+配置：SDK 默认 / config_path → ~/.juice/config.yaml → workspace/.juice/config.yaml → 启动参数
+凭据：进程环境变量 > workspace/.env > ~/.juice/.env
+```
+
+Runner、模型和工具统一通过 `ConfigurationContext` 读取配置。凭据不写入进程环境；缓存识别文件新增、修改、删除和原子替换。仅在实际使用模型或需密钥的工具时检查凭据，因此仍可查看配置与帮助。项目配置写入仅保留项目覆盖。
+
+模型条目可选 `api_base_env`：其指向的变量按上述凭据优先级覆盖 YAML 中的 `api_base`。内置 Claude 模型使用 `ANTHROPIC_BASE_URL`。参见[配置开发约定](src/juice_agents/core/config/README.zh-CN.md)。
 
 ## 快速开始
 
@@ -281,7 +287,7 @@ runner.stop()     # 协作取消
 SDK wheel 包含：
 - `juice_agents` 包
 - 类型存根
-- 内置资源（技能、提示、配置）
+- 提示词和只读默认配置 `juice_agents/core/config/defaults.yaml`
 
 **不包含：**
 - `adapters/`（协议网关）
@@ -291,6 +297,8 @@ SDK wheel 包含：
 - `.juice/` 运行时数据
 
 配置和状态写入调用者的工作区。
+SDK 不附带演示 Skill。可写技能放在 `.juice/skills`，只读来源通过 `.agents/skills`
+或配置的外部目录加载。
 
 ## 架构
 

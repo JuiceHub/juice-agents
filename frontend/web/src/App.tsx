@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import type {
-  ActorSessionsReport,
+  ActiveAgentsReport,
   AskOption,
   AskRequest,
   AskResponse,
@@ -15,7 +15,7 @@ import type {
   SkillInfo,
   SkillsConfigStatusResponse,
 } from "@juice-agents/shared/gateway/types";
-import { presentActorSession, type MessageBlock } from "@juice-agents/shared/presenter/stream";
+import { presentActiveAgent, type MessageBlock } from "@juice-agents/shared/presenter/stream";
 import { useConversationStream } from "@juice-agents/shared/conversation";
 import { WebGatewayClient, type BootstrapPayload } from "./gateway/client.js";
 import { Sidebar } from "./components/Sidebar.js";
@@ -90,7 +90,7 @@ export function App() {
   const [selectedModelEffort, setSelectedModelEffort] = useState<ModelEffort>("disabled");
   const [runtimeSwitching, setRuntimeSwitching] = useState(false);
   const [status, setStatus] = useState<SessionStatus | null>(null);
-  const [actorSessionsReport, setActorSessionsReport] = useState<ActorSessionsReport | null>(null);
+  const [actorSessionsReport, setActiveAgentsReport] = useState<ActiveAgentsReport | null>(null);
   const [activeActorName, setActiveActorName] = useState<string | null>(null);
   const [queuedMessages, setQueuedMessages] = useState<string[]>([]);
   const [pendingAsk, setPendingAsk] = useState<AskRequest | null>(null);
@@ -120,19 +120,19 @@ export function App() {
   const conversation = useConversationStream(client, {
     acceptEvent: acceptConversationEvent,
     onEvent: handleConversationEvent,
-    onActorSessionsReport: setActorSessionsReport,
+    onActiveAgentsReport: setActiveAgentsReport,
     onAskRequest: setPendingAsk,
   });
   const { messages, streaming } = conversation;
 
   const activeSession = sessions.find((session) => session.runner_id === status?.runner_id) || null;
   const selectedActor = findActorByName(actorSessionsReport, activeActorName);
-  const visibleMessages = activeActorName ? presentActorSession(selectedActor) : messages;
+  const visibleMessages = activeActorName ? presentActiveAgent(selectedActor) : messages;
   const threadTitle = activeActorName
-    ? selectedActor?.actor_name || activeActorName
+    ? selectedActor?.agent_name || activeActorName
     : rootRunnerTitle(activeSession) || status?.runner_id || "New runner";
   const threadSubtitle = activeActorName
-    ? `${selectedActor?.actor_kind || selectedActor?.actor_role || "actor"} · interactive`
+    ? `${selectedActor?.agent_kind || selectedActor?.agent_role || "actor"} · interactive`
     : undefined;
   const activeActorBusy = Boolean(activeActorName);
   const browserLiveSocketUrl = browserPreview?.external_window
@@ -183,9 +183,9 @@ export function App() {
   async function initialize(): Promise<void> {
     try {
       const initial = await client.bootstrap(baseDir);
-      const initialModelName = resolveRuntimeModelName(initial.models, initial.workspace_config.runtime?.model_name);
+      const initialModelName = resolveRuntimeModelName(initial.models, initial.effective_config.runtime?.model_name);
       const initialModelEffort = normalizeModelEffort(
-        initial.workspace_config.runtime?.model_effort,
+        initial.effective_config.runtime?.model_effort,
         initial.models.find((model) => model.model_name === initialModelName),
       );
       setBootstrap(initial);
@@ -232,7 +232,7 @@ export function App() {
       activeRunnerIdRef.current = "";
       setStatus(null);
       conversation.clearMessages();
-      setActorSessionsReport(null);
+      setActiveAgentsReport(null);
       setActiveActorName(null);
       setError("");
       const sessions = await client.command<SessionSummary[]>("list_sessions", { base_dir: baseDirOverride });
@@ -241,7 +241,7 @@ export function App() {
   }
 
   function acceptConversationEvent(event: RunnerStreamEvent): boolean {
-    const eventRunnerId = event.runner_id || event.actor_sessions_report?.runner_id || "";
+    const eventRunnerId = event.runner_id || event.agent_sessions_report?.runner_id || "";
     return !(eventRunnerId && activeRunnerIdRef.current && eventRunnerId !== activeRunnerIdRef.current);
   }
 
@@ -270,12 +270,12 @@ export function App() {
       conversation.clearMessages();
     }
     setActiveActorName(null);
-    setActorSessionsReport(null);
+    setActiveAgentsReport(null);
     const result = await client.command<SessionStatus>("start_session", {
       base_dir: bootstrap?.base_dir || baseDir,
-      mode: "default",
-      agent_mode: "agent",
-      agent_type: bootstrap?.workspace_config.runtime?.agent_type || "react",
+      permission_mode: bootstrap?.effective_config.runtime?.permission_mode || "default",
+      agent_mode: bootstrap?.effective_config.runtime?.agent_mode || "agent",
+      agent_type: bootstrap?.effective_config.runtime?.agent_type || "react",
       model_name: selectedModelName || models[0]?.model_name || "doubao_lite",
       model_effort: selectedModelEffort,
     });
@@ -297,7 +297,7 @@ export function App() {
     setActiveView("thread");
     conversation.clearMessages();
     setActiveActorName(null);
-    setActorSessionsReport(null);
+    setActiveAgentsReport(null);
     const result = await client.command<SessionStatus>("resume_session", {
       runner_id: runnerId,
       base_dir: options.baseDirOverride || bootstrap?.base_dir || baseDir,
@@ -375,10 +375,10 @@ export function App() {
     }
   }
 
-  async function refreshActorSessions(options: { updateRootMessages?: boolean } = {}): Promise<ActorSessionsReport | null> {
+  async function refreshActorSessions(options: { updateRootMessages?: boolean } = {}): Promise<ActiveAgentsReport | null> {
     try {
-      const report = await client.describeActorSessions();
-      setActorSessionsReport(report);
+      const report = await client.describeActiveAgents();
+      setActiveAgentsReport(report);
       if (options.updateRootMessages) {
         conversation.replaceMessages(loadRootMessages(report));
       }
@@ -431,7 +431,7 @@ export function App() {
     if (activeActorName) {
       setError("");
       try {
-        const result = await client.sendActorMessage({ actor_name: activeActorName, message: trimmed });
+        const result = await client.sendAgentMessage({ agent_name: activeActorName, message: trimmed });
         if (!result.accepted) {
           setError(`Actor message rejected: ${result.error || result.status || "not_live"}`);
         }
@@ -487,10 +487,10 @@ export function App() {
       if (result.workspaceAgentType) {
         setBootstrap((current) => current ? {
           ...current,
-          workspace_config: {
-            ...current.workspace_config,
+          effective_config: {
+            ...current.effective_config,
             runtime: {
-              ...current.workspace_config.runtime,
+              ...current.effective_config.runtime,
               agent_type: result.workspaceAgentType,
             },
           },
@@ -719,7 +719,7 @@ export function App() {
         activeRunnerIdRef.current = "";
         setStatus(null);
         conversation.clearMessages();
-        setActorSessionsReport(null);
+        setActiveAgentsReport(null);
         setActiveActorName(null);
         setPendingAsk(null);
       }
@@ -816,7 +816,7 @@ export function App() {
         onSend={(text) => void sendComposerText(text)}
         onCancel={() => {
           if (activeActorName) {
-            void client.interruptActor({ actor_name: activeActorName }).then(() => refreshActorSessions()).catch((exc) => {
+            void client.interruptAgent({ agent_name: activeActorName }).then(() => refreshActorSessions()).catch((exc) => {
               setError(exc instanceof Error ? exc.message : String(exc));
             });
             return;
@@ -888,8 +888,8 @@ export function App() {
   );
 }
 
-function loadRootMessages(report: ActorSessionsReport | null): MessageBlock[] {
+function loadRootMessages(report: ActiveAgentsReport | null): MessageBlock[] {
   const rootActor = findRootActor(report);
   if (!rootActor) return [];
-  return presentActorSession(rootActor).slice(1);
+  return presentActiveAgent(rootActor).slice(1);
 }

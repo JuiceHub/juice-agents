@@ -3,10 +3,24 @@
 from __future__ import annotations
 
 import argparse
+import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from .._runtime import add_runtime_arguments, run_showcase, showcase_workspace
+# Direct file execution has no package context; add only this repository root.
+# Absolute imports then behave identically for file and ``python -m`` launches.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from examples._runtime import add_runtime_arguments, run_showcase, showcase_workspace
+
+
+DEFAULT_TASK = (
+    "工单 DEMO-001：需要一个客户反馈标签归一化能力和对应复核专员。"
+    "输入样例为 [' Bug ', 'BUG', ' Feature ', '', 'feature']；"
+    "预期输出 labels=['bug', 'feature']，忽略空白并按首次出现顺序去重。"
+)
 
 
 EVOLUTION_SYSTEM_INSTRUCTIONS = """
@@ -34,25 +48,19 @@ details; this fixed workflow is mandatory:
 """.strip()
 
 
-def build_evolution_agent(args: argparse.Namespace, *, workspace: Path) -> Any:
-    """Build the standard Agent with this Showcase's fixed system policy only."""
+def configure_evolution_runner(runner: Any) -> None:
+    """Extend the detached root declaration before lazy Agent construction.
 
-    # The public SDK's ``agent_builder`` extension point owns Runner creation;
-    # this factory only appends the scenario's process and safety constraints.
-    from juice_agents.core.agent.builtin import build_general_agent
+    Apply the same policy after create and resume. Runner owns Agent creation;
+    the example changes only its fixed scenario instructions and leaves model,
+    tool binding, persisted conversations, and lifecycle to the shared runtime.
+    """
 
-    agent = build_general_agent(
-        workspace_dir=workspace,
-        model_name=args.model,
-        model_effort=args.model_effort,
-        agent_type=args.agent_type,
-    )
-    existing = str(getattr(agent, "instructions", "") or "").strip()
-    agent.instructions = "\n\n".join(
+    existing = str(runner.root_config.instructions or "").strip()
+    instructions = "\n\n".join(
         part for part in (existing, EVOLUTION_SYSTEM_INSTRUCTIONS) if part
     )
-    agent.refresh_system_prompt()
-    return agent
+    runner.root_config = replace(runner.root_config, instructions=instructions)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -65,7 +73,12 @@ def build_parser() -> argparse.ArgumentParser:
             "capability change for a real work order."
         )
     )
-    parser.add_argument("ticket", help="Dynamic ticket or work-order details.")
+    parser.add_argument(
+        "ticket",
+        nargs="?",
+        default=DEFAULT_TASK,
+        help="Work-order details; defaults to creating and verifying feedback-label normalization.",
+    )
     add_runtime_arguments(parser)
     return parser
 
@@ -80,20 +93,9 @@ def main(argv: list[str] | None = None):
         agent_mode="agent",
         workspace=workspace,
         task=args.ticket,
-        # The builder is passed into the public SDK, which calls it as part of
-        # the normal Agent-profile bootstrap. No mock model or private Runner
-        # construction is hidden inside this Showcase.
-        create_options={
-            "agent_builder": lambda: build_evolution_agent(args, workspace=workspace)
-        },
-        # ``resume_prebuilt_runner`` accepts a rebuilt root rather than an
-        # ``agent_builder`` callback. Rebuild through that public SDK option so
-        # the resumed session keeps the same controlled-evolution constraints.
-        resume_options={
-            "root_agent": build_evolution_agent(args, workspace=workspace)
-        } if args.resume else None,
+        configure_runner=configure_evolution_runner,
     )
 
 
-if __name__ == "__main__":  # pragma: no cover - exercised through ``python -m``.
+if __name__ == "__main__":  # pragma: no cover - exercised through subprocess entry tests.
     main()

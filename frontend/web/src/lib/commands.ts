@@ -14,7 +14,6 @@ import {
   presentCronStatus,
   presentCronTasks,
   presentDreamReceipt,
-  presentModeResources,
   presentGoal,
   presentMemorySearch,
   presentMemoryStatus,
@@ -157,11 +156,6 @@ export async function executeWebCommand(
   if (command === "/help") return { blocks: [presentCommandHelp()], clearMessages: false };
   if (command === "/status") return { blocks: [presentStatus(context.status)], clearMessages: false };
   if (command === "/models") return { blocks: [presentModels(await client.listModels(baseDir))], clearMessages: false };
-  if (command === "/resources") {
-    const modeId = parts[1];
-    if (modeId && !["agent", "team", "group"].includes(modeId)) return { blocks: [errorBlock("Usage: /resources [agent|team|group]")], clearMessages: false };
-    return { blocks: [presentModeResources(await client.listModeResources(baseDir, modeId || ""))], clearMessages: false };
-  }
   if (command === "/agents") {
     return {
       blocks: [

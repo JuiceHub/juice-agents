@@ -2,326 +2,235 @@
 
 > [简体中文](README.zh-CN.md)
 
-`core/agent` defines the Agent protocol and manages their runtime lifecycle. Agents are the core reasoning units that execute tasks using ReAct or CodeAct strategies.
+ReAct and CodeAct provide step protocols. `AgentManager` owns lifecycle, context
+checkpoints, and cancellation; tools execute through the Runner permission boundary.
 
-## Core Capabilities
+## Project workspace
 
-| Feature | Description |
-| --- | --- |
-| 🧠 **ReAct & CodeAct** | Thought-action reasoning (ReAct) or Python code execution (CodeAct) |
-| 💾 **Session Persistence** | Resume conversations and context after process restart |
-| 🔄 **Context Compression** | Automatic context window management with incremental compression |
-| 🛠️ **Rich Toolset** | 20+ built-in tools: shell, filesystem, web, browser, image, MCP, Workflow, and more |
-| 📎 **Attachments** | User messages, task notifications, and async results injection |
-| 🎯 **Delegation** | Root agents can spawn and coordinate helper agents |
-| 🔒 **Controlled Execution** | All tool calls go through permission and audit boundaries |
+Root, child and restored Agents share the Runner's `ConfigurationContext`.
+Runtime tools added with `tool_manage` reuse that same context. File tools use
+the project root; Shell defaults to it and resolves relative `workdir` from it.
+Skills use `<workspace>/.juice/skills`, `<workspace>/.agents/skills` and
+`~/.agents/skills`; custom Skill storage does not change the project root.
 
-## Agent Types
+```text
+ConfigurationContext → Agent / runtime tool → project files and .juice state
+```
 
-### ReAct Agent
+CodeAct and the `python` tool resolve ordinary `open`, concrete `pathlib.Path`,
+standard `os` filesystem calls and subprocess working directories against the
+workspace, without changing the SDK process directory. Pass absolute project
+paths to third-party APIs, or run project scripts through `shell`.
+Keep workspace paths in construction context rather than saved Agent YAML.
 
-Reasoning and acting in structured steps:
+## Built-in declarations
+
+`build_general_agent()` constructs `root`; `general` is exclusively a child
+Agent. Both this SDK helper and Runner resolve declarations through
+AgentRegistry, using local YAML before the unified built-in catalog. Viewing,
+validation and construction do not save defaults. Agent list/view tools report
+`source: builtin` with `path: null`, or `source: local` with its actual path.
+
+```text
+read / validate / construct → local override → builtin fallback
+successful edit            → validate → atomic local override
+remove local override      → builtin fallback
+```
+
+Runtime paths, protocol overrides and mode restrictions apply to detached
+copies. Only successful edits create `.juice/agents/<name>.yaml`; deleting an
+override restores the built-in declaration. Team-private self edits stay in
+that Team's private directory and never fall back to same-name global Agents.
+
+## Dynamic child discovery
+
+Runner-bound Agents query child availability through `RunnerContext` at call
+time, sharing the Registry projection used by `agents_list` and Runner dispatch.
+Root discovers eligible declarations dynamically; child Agents retain their
+explicit managed relationships. A startup name snapshot never authorizes a call.
+Before each model request, compare visible names and descriptions and refresh
+the system prompt when they change, without reconstructing the Agent.
+
+```text
+agent_manage save / Registry edit → current availability → agent_tool
+                                           └───────────→ next-step system prompt
+```
+
+`allowed_modes`, Plan policy, Team membership and Runner/mode-local unloads
+remain authoritative. Team inspection may additionally show shared candidates;
+listing a candidate does not authorize dispatch before it joins the Team.
+Saved target configuration applies to fresh acquisition; existing target
+sessions keep their lifecycle. Detached SDK Agents use explicit references.
+
+## Protocols
 
 ```xml
-<thought>I need to check the current directory structure</thought>
-<actions>[{"name": "list_directory", "args": {"path": "."}}]</actions>
+<!-- ReAct: validate the entire actions list before executing tools. -->
+<thought>Read the project instructions.</thought>
+<actions>[{"name":"read_file","args":{"path":"README.md"}}]</actions>
 ```
-
-**Best for:** Multi-step reasoning, investigation, planning, complex decision-making.
-
-### CodeAct Agent
-
-Execute Python code with thought and action:
 
 ```xml
-<thought>I need to check the project structure and read the README</thought>
-<code>
-import os
-files = os.listdir('.')
-print(f"Found {len(files)} files")
-
-# Use tools through runtime
-result = tools.read_file('README.md')
-print(result)
-</code>
+<!-- CodeAct: execute the selected code block in the agent's Python runtime. -->
+<thought>Calculate the result.</thought>
+<code>submit_output(output=6 * 7)</code>
 ```
 
-**Best for:** Data processing, rapid iteration, computational tasks, algorithmic workflows.
+`submit_output` ends a round. Empty ReAct actions continue with an observation;
+protocol errors return to the next model step for correction. `max_steps` controls
+the step budget with the existing final submission fallback.
 
-## Architecture
+## Tool Creation Contract
+
+`tool_manage` keeps its configuration rules, complete `save_args` example, and
+verification requirements in its own `description`, `inputs`, and `outputs`.
+Both protocols render those definitions; fixed tool rules belong there rather
+than in generic system sections or user task messages.
+
+New tools require a configuration object with Python source defining
+`def forward(self, ...)`; its parameters and return value match `inputs` and
+`outputs`. Optional parameters have defaults. See the rendered `tool_manage`
+definition for all supported fields and the current-time example.
 
 ```text
-AgentBinding → AgentRegistry.instantiate() → AgentManager.acquire()
-                                              → ManagedAgent
-                                                 • session restore
-                                                 • context binding
-                                                 • checkpoint
-                                                 • cancellation
+save declaration → inspect runtime_refresh → available tool → invoke and verify
 ```
 
-**Key principle:** Agents are stateless step functions. `AgentManager` owns their lifecycle:
+`tool_manage save/unload` persists the Agent's tool references through
+AgentRegistry, including `.juice/agents/root.yaml`. `scheduled` / `next_step`
+refreshes the current Agent's tool prompt and CodeAct functions before its next
+model request, using the existing runtime reference table without rebuilding the
+Agent. Resume reads the saved declaration and refreshes the restored prompt.
+`fresh_acquire` applies when only a static declaration can be updated;
+`unsupported` does not activate the tool. A save error can occur after the tool
+YAML was written, so inspect the declaration before retrying. Report saved,
+registered, and executed outcomes separately. One-off Python execution does not
+create a tool. Tests execute the rendered example and both Agent protocols locally.
 
-1. **Instantiate**: Fresh Agent object from Registry
-2. **Restore**: Load session snapshot from disk
-3. **Bind**: Attach `RunnerContext` for controlled tool execution
-4. **Execute**: Process user request through ReAct/CodeAct loop
-5. **Checkpoint**: Save session state
-6. **Release**: Persist and release (functional) or retain (persistent)
+## Per-step Candidate Selection
 
-## Tool Execution Flow
+```python
+from juice_agents.core.agent.context.strategies import GreedyStrategy, TreeOfThoughtsStrategy
 
-Agents don't own tools directly. All actions go through the Runner's permission boundary:
+agent.set_exploration_strategy(TreeOfThoughtsStrategy(breadth=3, reward_model=scorer))
+# Restore one model request per step:
+agent.set_exploration_strategy(GreedyStrategy())
+```
+
+Inject `GenerativeRewardModel` (GRM) with a native SDK client to generate JSON
+scores without configuration files:
+
+```python
+from openai import OpenAI
+
+from juice_agents.core.models.reward_models import GenerativeRewardModel
+
+# OpenAI reads OPENAI_API_KEY from the environment.
+scorer = GenerativeRewardModel(model_name="your-model", client=OpenAI())
+agent.set_exploration_strategy(TreeOfThoughtsStrategy(breadth=3, reward_model=scorer))
+```
+
+The [model layer](../models/README.md#reward-model) shows complete direct
+construction and the optional `GenerativeRewardModel.from_config(...)` entry
+point for catalog resolution. It owns evaluation prompts, provider calls, and
+score parsing. The strategy consumes the
+injected scorer and selects a candidate. Invalid scores and provider failures
+propagate before any candidate executes.
+
+Custom injected scorers subclass the regular `BaseRewardModel` base class and
+override its synchronous `evaluate_batch` method. As with `BaseChatModel`, calling
+the unimplemented base method raises `NotImplementedError`:
+
+```python
+from juice_agents.core.models.reward_models import BaseRewardModel
+
+class MyRewardModel(BaseRewardModel):
+    def evaluate_batch(self, *, context: list[dict], actions: list[dict]) -> dict:
+        # context is the generation message snapshot; actions contain
+        # {"role": "assistant", "content": raw_output} for valid candidates only.
+        # A local rule makes no SDK requests; higher scores are better.
+        return {"scores": score_candidates(context, actions), "usage": None, "usage_calls": []}
+```
 
 ```text
-Agent.step()
-  → RunnerContext.execute_tools(actions)
-     → Runner.tool_manager.execute_for_agent()
-        → Permission check
-        → Tool binding
-        → Execution
-        → Audit logging
-        → Return observations
+Current selected leaf
+  ├─ candidate 0 [rejected; raw output + usage + score]
+  ├─ candidate 1 [selected] → tools/code once → next candidates
+  └─ candidate 2 [rejected; raw output + usage + score]
 ```
 
-This ensures:
-- Unified permission control
-- Cancellation propagation
-- Audit trail for all actions
-- No Agent-owned worker pools or executors
-
-## Built-in Tools
-
-| Category | Tools |
+| Setting or result | Behavior |
 | --- | --- |
-| **Filesystem** | `read_file`, `write_file`, `edit_file`, `list_directory`, `search_files` |
-| **Execution** | `shell`, `python_repl`, `python_script` |
-| **Web** | `web_search`, `web_fetch`, `browser_navigate`, `browser_screenshot` |
-| **Memory** | `memory_create`, `memory_update`, `memory_search`, `memory_list` |
-| **Agent** | `agent_spawn`, `agent_list`, `agent_message` |
-| **Workflow** | `workflow_call` |
-| **Skills** | `skill_view`, `skills_list`, `skill_manage` |
-| **Output** | `submit_output`, `ask_user` |
-| **Task** | `task_create`, `task_update`, `task_list` |
-| **Team** | `team_finish`, `team_members`, `team_broadcast` |
+| Default, `breadth=1`, or missing scorer | One generation, no evaluation |
+| `breadth=N > 1` with scorer | N generations from identical context; execute one |
+| Invalid protocol candidate | Retain its error; exclude it from scoring |
+| All candidates invalid | Select first and use normal protocol recovery |
+| Equal scores | Select the first generated valid candidate |
+| Scorer failure, wrong count, nonfinite/nonnumeric score | Fail the round explicitly before execution |
 
-Tools are dynamically available based on Agent capabilities and Runner policy.
+`breadth` is a positive integer. The strategy has no depth, beam width, or
+temperature settings; model sampling configuration stays on the model. There is
+no multi-path execution, environment isolation, or backtracking. CLI controls breadth
+with `/strategy breadth=N` and the catalog reward model independently with `/rm`;
+`/rm` opens a model picker with the current reward model marked and a clear
+option; `/rm judge` selects directly, and `/rm reset` clears it. Selection and
+clearing retain breadth and the generation model. `/strategy reset` restores breadth to 1 while
+retaining the reward model. Settings apply only in the current CLI process;
+without a scorer it reports linear execution.
 
-## Context Management
+## Context and Persistence
 
-### Context Tree
+`ContextTree` stores task, action, and summary nodes. Manager inserts every
+candidate before execution, advances one active leaf, then updates the selected
+node with observations instead of appending a duplicate. ReAct streaming events
+and persisted observations use the same tool execution results.
 
-Agent context is managed as a tree structure (`ContextTree`) that tracks:
+Normal `steps` / `to_messages()` follow the active selected branch. Rejected
+nodes remain available in `tree.nodes` and serialized snapshots. Remain compression
+only projects older observations; compact creates a summary continuation while
+retaining the original nodes for inspection. Subsequent tasks extend the active
+branch; `reset_session=True` clears its tree and history.
 
-```text
-Root (TaskStep)
-  ├─ ActionStep 1 (thought + tool calls + observations)
-  ├─ ActionStep 2
-  │   ├─ Branch A (exploration path)
-  │   └─ Branch B (alternative path)
-  └─ ActionStep 3
-```
+Agents collect `usage_calls` from generation, summaries, and strategy scoring
+results or exceptions, then explicitly forward them to `AgentManager` for
+persistence and totals in `agents/model_usage.jsonl` under the Runner root.
+Rejected candidates, empty-response retries, failed scoring, and usage known
+before cancellation count; a batch reward request counts once. Functional or
+ephemeral calls retain token metadata even when their sessions are not saved.
 
-**Core concepts:**
+The usage file contains no prompts or transcripts and survives compression and
+resume. `ContextTree` owns conversation state only. `ActionStep.usage` retains
+the last generation response's usage for tracing and window calibration; do not
+add it to the usage file again. Query records with
+`runner.agent_manager.model_usage_records()` and totals with
+[`runner.token_usage()`](../runner/README.md#token-usage).
 
-- **ContextNode**: A single step in the conversation (TaskStep or ActionStep)
-- **ExplorationPath**: A complete trajectory from root to leaf (for Best-of-N)
-- **AgentStep**: Abstract base for all step types
+Snapshots live in `.juice/runners/<runner_id>/agents/<agent_id>/session.json`.
+Restoration creates a fresh Agent and restores its context. Passing a `ContextTree`
+or serialized mapping to `AgentManager.acquire(session_state=...)`, or decoding a
+snapshot with `deserialize_snapshot`, creates an independent context, including
+nested outputs, tool arguments, attachments, usage and metadata. Scorers are runtime
+dependencies and never enter snapshots: inject one again after restoration to
+enable candidate selection. Otherwise execution stays linear.
 
-### Agent Steps
+## Development
 
-**TaskStep** - User task input:
-```python
-TaskStep(
-    task="Analyze the codebase",
-    task_images=[...],        # Optional images
-    attachments=[...]         # Runtime attachments
-)
-```
-
-**ActionStep** - Agent reasoning and tool execution:
-```python
-ActionStep(
-    step_num=1,
-    thought="I need to list files first",
-    tool_calls=[{"name": "list_directory", "args": {"path": "."}}],
-    observations=["file1.py\nfile2.py\n..."],
-    code_action="",           # For CodeAct agents
-    reasoning_content="",     # Extended reasoning
-    round_outcome="continue"  # continue|submitted|failed; only submit_output ends a round, empty actions continue to the next step
-)
-```
-
-**SummaryStep** - Compressed history:
-```python
-SummaryStep(
-    content="[Compressed summary of previous 10 steps...]"
-)
-```
-
-### Session Persistence
-
-Sessions persist across restarts with full fidelity:
-
-```python
-# First run
-agent = manager.acquire("root", binding, workspace)
-result = agent.step(user_input)
-manager.checkpoint(agent)  # Saves context tree to disk
-
-# After restart (even different process)
-agent = manager.acquire("root", binding, workspace)
-# Context tree automatically restored:
-#   - Full conversation history
-#   - Tool execution results
-#   - Compressed sections (if any)
-#   - Node structure and metadata
-result = agent.step(continuation_input)
-```
-
-**Checkpoint includes:**
-- `ContextTree` with all nodes
-- System prompts (static + dynamic)
-- Exploration paths and selected path
-- Compression state
-- Agent-specific configuration
-
-**Storage:** `.juice/runners/<runner_id>/agents/<agent_id>/session.json`
-
-### Message Serialization
-
-Steps are converted to model messages:
-
-```python
-# TaskStep → user message
-{"role": "user", "content": [{"type": "text", "text": "<task>...</task>"}]}
-
-# ActionStep → assistant + user feedback
-{"role": "assistant", "content": [{"type": "text", "text": "<thought>...</thought>..."}]}
-{"role": "user", "content": [{"type": "text", "text": "<observations>...</observations>"}]}
-```
-
-The tree tracks the current active path and converts it to the message sequence sent to the model.
-
-## Session Persistence
-
-Sessions persist across process restarts with full fidelity:
-
-```python
-# First run
-agent = manager.acquire("root", binding, workspace)
-result = agent.step(user_input)
-manager.checkpoint(agent)  # Saves to disk
-
-# After restart (even different process)
-agent = manager.acquire("root", binding, workspace)
-# Session automatically restored
-result = agent.step(continuation_input)
-```
-
-**What's persisted:**
-- Complete ContextTree (all nodes and paths)
-- System prompts (static + dynamic)
-- Compression state
-- Agent configuration
-
-**Storage location:** `.juice/runners/<runner_id>/agents/<agent_id>/session.json`
-
-**How it works:**
-1. `manager.checkpoint()` atomically writes the session
-2. On `acquire()`, manager loads snapshot from disk
-3. Fresh Agent instance is created from Registry
-4. Session is restored to the Agent
-5. Agent continues from where it left off
-
-## Context Compression
-
-When approaching token limits, Juice automatically compresses history while preserving critical information.
-
-### Compression Strategies
-
-**CompactCompressStrategy** - Aggressive compression:
-```python
-# Compresses old steps into a single SummaryStep
-# Keeps: current task, recent steps, unfinished actions
-# Result: Maximum token savings
-```
-
-**RemainCompressStrategy** - Preserve recent context:
-```python
-# Keeps recent N steps intact
-# Compresses only older history
-# Result: Better context quality, less savings
-```
-
-**NoCompressStrategy** - Disabled:
-```python
-# No compression (fails when hitting limits)
-```
-
-### Incremental Compression
-
-Compression is incremental - only new content since last compression is processed:
-
-```text
-Before compression:
-  TaskStep → ActionStep1 → ... → ActionStep10
-
-After first compression (compress steps 1-7):
-  TaskStep → SummaryStep(1-7) → ActionStep8 → ActionStep9 → ActionStep10
-
-After more steps + second compression:
-  TaskStep → SummaryStep(1-7) → SummaryStep(8-12) → ActionStep13 → ActionStep14
-```
-
-**Never compressed:**
-- Current TaskStep
-- Steps after last compression
-- Active observations
-- Unfinished tool calls
-
-**Compression trigger:**
-- Approaching context window limit (configurable threshold)
-- Manual trigger via compression API
-
-**Storage:** Compressed state is checkpointed, so resumed sessions don't re-compress.
-
-## Attachments
-
-Runtime attachments inject information into Agent sessions:
-
-```python
-# User message
-attachment = UserMessageAttachment(content="Additional context")
-agent.attach(attachment)
-
-# Task notification
-attachment = TaskNotificationAttachment(
-    task_id="task_123",
-    status="completed",
-    result={"output": "..."}
-)
-agent.attach(attachment)
-```
-
-Attachments appear in the Agent's next step as system messages.
-
-## Module Structure
-
-| File | Purpose |
+| Module | Responsibility |
 | --- | --- |
-| `agents.py` | `MultiStepAgent`, `ReActAgent`, `CodeActAgent` protocols |
-| `manager.py` | `AgentManager` - lifecycle, snapshots, checkpoints |
-| `attachments.py` | Runtime attachment protocol |
-| `tools/` | Tool declarations, runtime binding, and adapters |
-| `context/` | Context tree, compression, serialization |
-| `prompts/` | System prompts and prompt segments |
+| `agents.py` | Generate, parse, select, then execute ReAct/CodeAct outputs |
+| `context/strategies/` | Candidate count and scoring selection; no tree mutation |
+| `../models/reward_models.py` | BaseRewardModel base class and GRM subclass; no strategy or tree dependency |
+| `manager.py` | Agent lifecycle, candidate checkpoints, and persistence/totals for usage forwarded by Agents |
+| `context/` | Tree, selected-path messages, compression, serialization |
+| `tools/`, `prompts/` | Tool declarations/runtime binding and fixed protocol instructions |
 
-## Development Conventions
+Persistent agents reuse live instances; functional agents release after a request.
+Do not reconstruct a live Agent or create an Agent-owned ToolManager. Keep dynamic
+task input in user prompts and fixed workflow instructions in system prompts.
+Add functional tests under `tests/core/agent/` and keep runtime logs scoped to
+Runner/Agent IDs.
 
-- **Fresh instances**: `AgentManager.acquire()` always instantiates a fresh Agent from Registry, then restores session. Live Agents are never reconstructed in place.
-- **No tool ownership**: Agents execute tools only through `RunnerContext`. They don't own `ToolManager`, thread pools, or executor instances.
-- **Two lifecycles**: `persistent` Agents retain their instance; `functional` Agents are checkpointed and released after each request.
-- **Atomic persistence**: Checkpoints are atomic writes. Include Runner/Agent IDs in all logs.
-- **Plan mode**: Planning is a root Agent capability, not a special Agent type. There's no reserved `plan` Agent declaration.
-
-Add lifecycle tests in `tests/core/agent/`, tool routing tests in `tests/core/managers/`.
+```bash
+conda activate juice-agents
+python -m pytest tests/core/agent -q
+```

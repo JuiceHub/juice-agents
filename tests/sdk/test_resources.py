@@ -1,40 +1,50 @@
-"""Package-resource contracts for templates and builtin Skills."""
+"""Bundled defaults work independently of user configuration and runtime state."""
 
 from __future__ import annotations
 
 from importlib import resources
-import json
 from pathlib import Path
 
+import pytest
+import yaml
 
-def _asset(relative_path: str):
-    return resources.files("juice_agents").joinpath("_assets", *relative_path.split("/"))
-
-
-def test_config_template_is_readable_via_importlib_resources() -> None:
-    template = _asset("config.example.yaml")
-
-    assert template.is_file()
-    text = template.read_text(encoding="utf-8")
-    assert "models:" in text
-    assert "tools:" in text
+from juice_agents.core.config.runtime_config import (
+    DEFAULT_RUNTIME_CONFIG_PATH,
+    read_runtime_config,
+    write_workspace_config,
+)
 
 
-def test_builtin_skill_tree_is_packaged_as_read_only_source_data() -> None:
-    skill = _asset("skills/joke-expert/SKILL.md")
-    data = _asset("skills/joke-expert/data/jokes.json")
-    script = _asset("skills/joke-expert/scripts/get_random_joke.py")
+def test_sdk_defaults_are_readable_via_importlib_resources() -> None:
+    defaults = resources.files("juice_agents.core.config").joinpath("defaults.yaml")
 
-    assert skill.is_file()
-    assert data.is_file()
-    assert script.is_file()
-    assert "joke" in skill.read_text(encoding="utf-8").lower()
-    assert isinstance(json.loads(data.read_text(encoding="utf-8")), list)
-    assert "def " in script.read_text(encoding="utf-8")
+    assert defaults.is_file()
+    assert DEFAULT_RUNTIME_CONFIG_PATH == Path(str(defaults)).resolve()
+    payload = yaml.safe_load(defaults.read_text(encoding="utf-8"))
+    assert payload["models"]
+    assert payload["tools"]
+
+
+def test_project_overrides_preserve_bundled_defaults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Exercise real loading and persistence; never edit the SDK's base file.
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    original = DEFAULT_RUNTIME_CONFIG_PATH.read_bytes()
+    defaults = yaml.safe_load(original)
+    write_workspace_config(workspace, {"skills": {"enabled": False}})
+
+    merged = read_runtime_config(workspace_dir=workspace)
+    assert merged["skills"]["enabled"] is False
+    assert merged["models"] == defaults["models"]
+    assert read_runtime_config() == defaults
+    assert DEFAULT_RUNTIME_CONFIG_PATH.read_bytes() == original
 
 
 def test_agent_module_has_no_legacy_skills_directory() -> None:
-    # 内置技能只从包资源加载，避免在 Agent 模块下重新引入空的旧目录。
+    # 技能由调用方配置，不应在 Agent 代码目录重新引入旧的资源目录。
     agent_dir = Path(__file__).resolve().parents[2] / "sdk/src/juice_agents/core/agent"
     assert not (agent_dir / "skills").exists()
 

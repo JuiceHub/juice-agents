@@ -468,10 +468,10 @@ test("streamed actor session reports refresh the actor selector without blocking
     "utf-8"
   );
 
-  assert.match(messagesSource, /onActorSessionsReport/);
-  assert.match(messagesSource, /event\.actor_sessions_report/);
+  assert.match(messagesSource, /onActiveAgentsReport/);
+  assert.match(messagesSource, /event\.agent_sessions_report/);
   assert.match(appSource, /useConversationStream/);
-  assert.match(appSource, /onActorSessionsReport:\s*handleStreamActorSessionsReport/);
+  assert.match(appSource, /onActiveAgentsReport:\s*handleStreamActiveAgentsReport/);
   assert.match(appSource, /selector\.updateItemsIfOpen/);
   assert.match(selectorSource, /updateItemsIfOpen/);
 });
@@ -487,10 +487,10 @@ test("skill aliases are normalized before slash completion state is populated", 
 test("Ctrl+S actor session refresh cannot reopen a selector after Main is selected", () => {
   const appSource = readFileSync(fileURLToPath(new URL("./app.tsx", import.meta.url)), "utf-8");
   const handlerMatch = appSource.match(
-    /const handleToggleActors = useCallback\(async \(\) => \{[\s\S]*?\n  \}, \[selector/
+    /const handleToggleActive = useCallback\(async \(\) => \{[\s\S]*?\n  \}, \[selector/
   );
 
-  assert.ok(handlerMatch, "handleToggleActors callback should be present");
+  assert.ok(handlerMatch, "handleToggleActive callback should be present");
   const handlerSource = handlerMatch[0];
 
   assert.equal(
@@ -505,14 +505,14 @@ test("Ctrl+S actor session refresh cannot reopen a selector after Main is select
 test("Ctrl+S actor selector uses cached actor report instead of starting a blocking RPC", () => {
   const appSource = readFileSync(fileURLToPath(new URL("./app.tsx", import.meta.url)), "utf-8");
   const handlerMatch = appSource.match(
-    /const handleToggleActors = useCallback\(async \(\) => \{[\s\S]*?\n  \}, \[selector/
+    /const handleToggleActive = useCallback\(async \(\) => \{[\s\S]*?\n  \}, \[selector/
   );
 
-  assert.ok(handlerMatch, "handleToggleActors callback should be present");
+  assert.ok(handlerMatch, "handleToggleActive callback should be present");
   const handlerSource = handlerMatch[0];
 
-  assert.doesNotMatch(handlerSource, /refreshActorSessions/);
-  assert.doesNotMatch(handlerSource, /describeActorSessions/);
+  assert.doesNotMatch(handlerSource, /refreshActiveAgents/);
+  assert.doesNotMatch(handlerSource, /describeActiveAgents/);
 });
 
 test("new CLI sessions inherit both persisted modes and show them in composer dock", () => {
@@ -606,7 +606,7 @@ test("mode coordinator keeps only the latest target and consumes RPC status dire
       appSource.indexOf("const processRequestedMode"),
       appSource.indexOf("const requestModeSwitch"),
     ),
-    /refreshStatus|refreshActorSessions/,
+    /refreshStatus|refreshActiveAgents/,
   );
 });
 
@@ -654,6 +654,6 @@ test("Ctrl+C on empty composer cancels during streaming instead of exiting", () 
   // streaming 时同一次按键由 cancel 层取消 stream，composer 侧必须忽略，不能退出 CLI。
   assert.equal(resolveCtrlCAction({ streaming: true, activeAgentName: null }), "ignore");
   assert.equal(resolveCtrlCAction({ streaming: true, activeAgentName: "worker" }), "ignore");
-  assert.equal(resolveCtrlCAction({ streaming: false, activeAgentName: "worker" }), "interrupt-actor");
+  assert.equal(resolveCtrlCAction({ streaming: false, activeAgentName: "worker" }), "interrupt-agent");
   assert.equal(resolveCtrlCAction({ streaming: false, activeAgentName: null }), "exit");
 });

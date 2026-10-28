@@ -15,20 +15,31 @@ import unittest
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
 from examples import _runtime
+from juice_agents.core.config.context import ConfigurationContext
+from juice_agents.core.registry.agents.types import AgentConfig
 
 
 class _FakeRunner:
     """Small public Runner double recording stream and lifecycle calls."""
 
     def __init__(self, *, runner_id: str = "showcase-runner", error: Exception | None = None) -> None:
+        self.root_config = AgentConfig(name="root", instructions="existing policy")
+        self.config_context = ConfigurationContext.from_workspace(Path.cwd())
+        self._root_instance = SimpleNamespace(tools={})
         self.runner_id = runner_id
         self.error = error
         self.tasks: list[str] = []
         self.stop_calls = 0
+
+    def _root(self):
+        """Expose the actual scoped-capability installer surface without models."""
+
+        return SimpleNamespace(instance=self._root_instance)
 
     def stream(self, task: str):
         self.tasks.append(task)
@@ -36,9 +47,9 @@ class _FakeRunner:
             raise self.error
         yield {
             "kind": "action_step",
-            "actor_name": "manager",
+            "agent_name": "manager",
             "step_num": 1,
-            "action_step": type("Step", (), {"output": "classified feedback"})(),
+            "action_step": type("Step", (), {"model_output": "classified feedback"})(),
         }
         yield {"kind": "round_end", "outcome": "submitted", "output": "business result"}
 
@@ -88,7 +99,7 @@ class _Showcase:
     business_input: str
     agent_mode: str
     stream_task: str | None = None
-    has_evolution_builder: bool = False
+    has_evolution_policy: bool = False
 
 
 SHOWCASES = (
@@ -102,7 +113,7 @@ SHOWCASES = (
         "examples.agent_evolution.__main__",
         "工单 OPS-42：增加能归一化客户反馈标签的工具并委派复核",
         "agent",
-        has_evolution_builder=True,
+        has_evolution_policy=True,
     ),
     _Showcase(
         "examples.group_operations.__main__",
@@ -130,7 +141,7 @@ class ShowcaseRuntimeTests(unittest.TestCase):
 
         self.assertEqual(
             _CapturingJuice.received_kwargs,
-            {"workspace": workspace, "model_name": "verified-model", "model_effort": "high"},
+            {"workspace": workspace, "ask_handler": _runtime.console_ask},
         )
 
     def test_stream_error_still_stops_runner(self):
@@ -200,12 +211,19 @@ class ShowcaseEntryPointTests(unittest.TestCase):
                 self.assertEqual(juice.runners.resume_calls, [])
 
                 create_call = juice.runners.create_calls[0]
-                self.assertEqual(create_call["agent_mode"], showcase.agent_mode)
+                self.assertEqual(create_call["runner_config"], showcase.agent_mode)
                 self.assertEqual(create_call["permission_mode"], "accept")
-                self.assertEqual(create_call["agent_type"], "codeact")
-                self.assertEqual("agent_builder" in create_call, showcase.has_evolution_builder)
-                if showcase.has_evolution_builder:
-                    self._assert_evolution_builder(create_call["agent_builder"], expected_workspace, showcase)
+                self.assertNotIn("agent_type", create_call)
+                self.assertEqual(runner.root_config.agent_type, "codeact")
+                self.assertEqual(runner.root_config.model_config_name, "showcase-model")
+                self.assertEqual(runner.root_config.model_effort, "medium")
+                if showcase.has_evolution_policy:
+                    self.assertIn("existing policy", runner.root_config.instructions)
+                    self.assertIn("Controlled ticket capability evolution", runner.root_config.instructions)
+                    self.assertNotIn(showcase.business_input, runner.root_config.instructions)
+                if showcase.module_name == "examples.agent_research.__main__":
+                    self.assertEqual(runner._root_instance.tools["workflow_run"].workflow_name, "deep_research")
+                    self.assertEqual(runner._root_instance._manual_workflow_authorization, "deep_research")
 
     def test_entries_resume_only_when_resume_id_is_explicit(self):
         for showcase in SHOWCASES:
@@ -213,18 +231,9 @@ class ShowcaseEntryPointTests(unittest.TestCase):
                 module = importlib.import_module(showcase.module_name)
                 runner = _FakeRunner(runner_id=f"{showcase.agent_mode}-resume")
                 juice = _FakeJuice(runner)
-                rebuilt_root: object | None = None
 
                 with ExitStack() as patches:
                     patches.enter_context(patch.object(_runtime, "_juice_from_args", return_value=juice))
-                    # A resumed evolution Agent must rebuild its customised root.
-                    # Keep construction at the test boundary to avoid resolving
-                    # a real workspace model during this CLI contract test.
-                    if showcase.has_evolution_builder:
-                        rebuilt_root = object()
-                        patches.enter_context(
-                            patch.object(module, "build_evolution_agent", return_value=rebuilt_root)
-                        )
                     # Stream rendering is asserted in the create path above;
                     # capture it here so a normal test run stays concise.
                     with redirect_stdout(io.StringIO()):
@@ -234,11 +243,11 @@ class ShowcaseEntryPointTests(unittest.TestCase):
                 self.assertEqual(len(juice.runners.resume_calls), 1)
                 resume_call = juice.runners.resume_calls[0]
                 self.assertEqual(resume_call["runner_id"], "existing-runner-001")
-                self.assertEqual(resume_call["agent_type"], "react")
-                if showcase.has_evolution_builder:
-                    self.assertIs(resume_call["root_agent"], rebuilt_root)
-                else:
-                    self.assertNotIn("root_agent", resume_call)
+                self.assertEqual(resume_call, {"runner_id": "existing-runner-001"})
+                if showcase.has_evolution_policy:
+                    self.assertIn("Controlled ticket capability evolution", runner.root_config.instructions)
+                if showcase.module_name == "examples.agent_research.__main__":
+                    self.assertEqual(runner._root_instance.tools["workflow_run"].workflow_name, "deep_research")
                 self.assertEqual(runner.tasks, [showcase.stream_task or showcase.business_input])
                 self.assertEqual(runner.stop_calls, 1)
 
@@ -251,33 +260,6 @@ class ShowcaseEntryPointTests(unittest.TestCase):
                 with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                     module.main([showcase.business_input, "--workspace", "/outside-workspace"])
 
-    def _assert_evolution_builder(self, builder, workspace: Path, showcase: _Showcase) -> None:
-        """Ensure fixed policy remains separate from the dynamic ticket text."""
-
-        class _BuiltAgent:
-            instructions = "existing policy"
-            refreshed = False
-
-            def refresh_system_prompt(self) -> None:
-                self.refreshed = True
-
-        built_agent = _BuiltAgent()
-        with patch(
-            "juice_agents.core.agent.builtin.build_general_agent",
-            return_value=built_agent,
-        ) as build_agent:
-            self.assertIs(builder(), built_agent)
-
-        build_agent.assert_called_once_with(
-            workspace_dir=workspace,
-            model_name="showcase-model",
-            model_effort="medium",
-            agent_type="codeact",
-        )
-        self.assertTrue(built_agent.refreshed)
-        self.assertIn("existing policy", built_agent.instructions)
-        self.assertIn("Controlled ticket capability evolution", built_agent.instructions)
-        self.assertNotIn(showcase.business_input, built_agent.instructions)
 
 
 if __name__ == "__main__":

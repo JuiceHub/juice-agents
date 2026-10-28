@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from pathlib import Path
 from typing import Any, Dict
@@ -20,6 +21,77 @@ try:
     from json_repair import repair_json
 except Exception:  # pragma: no cover - 依赖缺失按降级路径运行
     repair_json = None
+
+
+def _get_field(obj: Any, field: str) -> Any:
+    return obj.get(field) if isinstance(obj, dict) else getattr(obj, field, None)
+
+
+def _to_plain_data(value: Any, *, _depth: int = 0) -> Any:
+    """把 SDK 的 Pydantic / 普通对象转换为可保存的原始用量快照。"""
+    if _depth > 8:
+        return str(value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _to_plain_data(item, _depth=_depth + 1) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_to_plain_data(item, _depth=_depth + 1) for item in value]
+    for name in ("model_dump", "dict"):
+        dump = getattr(value, name, None)
+        if callable(dump):
+            try:
+                return _to_plain_data(dump(), _depth=_depth + 1)
+            except TypeError:
+                continue
+    fields: dict[str, Any] = {}
+    for name in dir(value):
+        if name.startswith("_"):
+            continue
+        try:
+            item = getattr(value, name)
+        except Exception:
+            continue
+        if not callable(item):
+            fields[name] = item
+    return _to_plain_data(fields, _depth=_depth + 1) if fields else str(value)
+
+
+def _coerce_token_count(value: Any) -> int | None:
+    """接受非负整数；拒绝布尔值、负数、非有限数及需要截断的小数。"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        return int(value) if math.isfinite(value) and value >= 0 and value.is_integer() else None
+    if isinstance(value, str) and value.strip().isascii() and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def normalize_token_usage(usage: Any) -> dict[str, Any] | None:
+    """归一化 OpenAI / Ark / Anthropic 用量，并保留 provider 原始详情。
+
+    仅在输入和输出均已知时推导 total；不把未知值默认为 0。函数幂等，
+    再次传入归一化记录时保留原 provider_usage，不增加嵌套包装。
+    """
+    if usage is None:
+        return None
+    input_value = _get_field(usage, "input_tokens")
+    output_value = _get_field(usage, "output_tokens")
+    input_tokens = _coerce_token_count(input_value if input_value is not None else _get_field(usage, "prompt_tokens"))
+    output_tokens = _coerce_token_count(output_value if output_value is not None else _get_field(usage, "completion_tokens"))
+    total_tokens = _coerce_token_count(_get_field(usage, "total_tokens"))
+    if total_tokens is None and input_tokens is not None and output_tokens is not None:
+        total_tokens = input_tokens + output_tokens
+    provider_usage = usage["provider_usage"] if isinstance(usage, dict) and "provider_usage" in usage else usage
+    normalized: dict[str, Any] = {"provider_usage": _to_plain_data(provider_usage)}
+    for name, value in zip(("input_tokens", "output_tokens", "total_tokens"), (input_tokens, output_tokens, total_tokens)):
+        if value is not None:
+            normalized[name] = value
+    return normalized
+
 
 
 def _extract_json_candidate(raw_text: str) -> str | None:
@@ -178,6 +250,7 @@ def load_env_file(path: str | Path) -> Dict[str, str]:
 
 
 __all__ = [
+    "normalize_token_usage",
     "load_env_file",
     "parse_model_json",
     "strip_quotes",

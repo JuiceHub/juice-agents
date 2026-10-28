@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Bind a local command to this checkout and the currently activated runtimes.
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+INSTALL_DIR="${HOME}/.local/bin"
+if [[ $# -gt 0 ]]; then
+    case "$1" in
+        --bin-dir) [[ $# -eq 2 ]] || { printf 'Usage: ./install-juice [--bin-dir DIRECTORY]\n' >&2; exit 1; }; INSTALL_DIR="$2" ;;
+        --help|-h) printf 'Usage: ./install-juice [--bin-dir DIRECTORY]\nRun after conda activate juice-agents and installing Python/frontend dependencies.\n'; exit 0 ;;
+        *) printf 'Usage: ./install-juice [--bin-dir DIRECTORY]\n' >&2; exit 1 ;;
+    esac
+fi
+[[ "${CONDA_DEFAULT_ENV:-}" == "juice-agents" ]] || { printf 'Activate the runtime first: conda activate juice-agents\n' >&2; exit 1; }
+PYTHON_BIN="$(python -c 'import sys; print(sys.executable)')"
+NODE_BIN="$(command -v node || true)"
+[[ -x "$NODE_BIN" ]] || { printf 'Node is missing. Install Node, then rerun ./install-juice.\n' >&2; exit 1; }
+# Validate the same dependencies as normal startup before replacing a launcher.
+PYTHONPATH="$SCRIPT_DIR/sdk/src:$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON_BIN" -P -c 'import juice_agents; import adapters.stdio_gateway.entry'
+"$NODE_BIN" "$SCRIPT_DIR/frontend/check-cli-dependencies.mjs" "$SCRIPT_DIR/frontend"
+"$PYTHON_BIN" - "$SCRIPT_DIR" "$PYTHON_BIN" "$NODE_BIN" "$INSTALL_DIR" <<'PY'
+import os
+from pathlib import Path
+import shlex
+import sys
+import tempfile
+
+repo, python, node, raw_directory = sys.argv[1:]
+directory = Path(raw_directory).expanduser().resolve()
+directory.mkdir(parents=True, exist_ok=True)
+# Shell quoting preserves whitespace, Unicode, quotes, and shell metacharacters.
+body = "#!/bin/bash\nset -euo pipefail\n"
+body += f"export JUICE_PYTHON_PATH={shlex.quote(python)}\n"
+body += f"export JUICE_NODE_PATH={shlex.quote(node)}\n"
+body += f"JUICE_SOURCE_DIR={shlex.quote(repo)}\n"
+body += 'if [[ ! -x "$JUICE_SOURCE_DIR/juice" ]]; then\n'
+body += '  printf \'juice: source checkout is missing: %s. Restore it or rerun install-juice from the new checkout.\\n\' "$JUICE_SOURCE_DIR" >&2\n  exit 1\nfi\n'
+body += 'exec "$JUICE_SOURCE_DIR/juice" "$@"\n'
+fd, temporary = tempfile.mkstemp(prefix=".juice-", dir=directory)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(body)
+    os.chmod(temporary, 0o755)
+    os.replace(temporary, directory / "juice")
+finally:
+    Path(temporary).unlink(missing_ok=True)
+print(f"Installed {directory / 'juice'}")
+print(f"Add {directory} to PATH if needed, then run juice from any project.")
+PY

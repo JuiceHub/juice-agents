@@ -197,10 +197,12 @@ class ActionEvent:
     - "tool_start": data 包含 tool_name, tool_args, tool_index
     - "tool_end": data 包含 tool_name, tool_index, observation, error, execution_time
     - "step_complete": data 包含完整的 ActionStep
+    - "candidates": 内部事件，包含 steps、scores、selected_index 和生成信息；
+      由 Manager 消费并持久化，不进入用户可见事件流。
     """
 
     step_num: int
-    event_type: str  # "thinking" | "tool_start" | "tool_end" | "step_complete"
+    event_type: str
     data: dict[str, Any]
 
 

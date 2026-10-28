@@ -40,16 +40,16 @@ class ContextNode:
     # === 评估（用于路径选择和训练数据）===
     score: Optional[float] = None
     # score 可以来自：
-    # - RewardModel 评估
+    # - 奖励模型评估
     # - 执行结果（测试通过=1.0, 失败=0.0）
     # - 人工标注
     # - 其他启发式
 
     # === 生成信息（用于分析和复现）===
     generated_by: str = ""                    # 模型名称
-    generation_strategy: str = ""             # 策略：greedy/best_of_n/tot
+    generation_strategy: str = ""             # 生成时的候选选择策略类名
     generation_params: Dict[str, Any] = field(default_factory=dict)
-    # 例如：{"temperature": 0.8, "top_p": 0.95, "candidate_index": 2}
+    # 例如：{"breadth": 3, "candidate_index": 2}；模型采样配置不属于探索策略。
 
     # === 自由标注（可选，用于训练数据标注）===
     annotations: Dict[str, Any] = field(default_factory=dict)

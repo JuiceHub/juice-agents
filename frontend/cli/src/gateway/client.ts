@@ -27,7 +27,6 @@ import type {
   AvailableAgentsResponse,
   TeamManifest,
   TeamsListResponse,
-  ModeResourcesResponse,
   DreamRunResponse,
   CronStatusResponse,
   CronTask,
@@ -48,6 +47,9 @@ import type {
   InterruptAgentResponse,
   StreamStepNotification,
   AskRequestNotification,
+  StrategyConfiguration,
+  StrategySwitchResult,
+  RewardModelConfiguration,
 } from "@juice-agents/shared/gateway/types";
 
 // Resolve project root: frontend/cli/src/gateway/client.ts -> project root
@@ -69,7 +71,10 @@ export class GatewayClient {
   private ambientAskHandler: ((request: AskRequest) => void) | null = null;
   private rl: readline.Interface | null = null;
 
-  constructor(private pythonPath: string = "python") {}
+  constructor(
+    private pythonPath: string = process.env.JUICE_PYTHON_PATH || "python",
+    private workspace: string = process.env.JUICE_WORKSPACE_DIR || process.cwd(),
+  ) {}
 
   /** 注册常驻 stream 事件处理器，接收无活跃请求时的自动续跑推送。 */
   setAmbientStreamHandler(handler: ((event: RunnerStreamEvent) => void) | null): void {
@@ -82,12 +87,21 @@ export class GatewayClient {
   }
 
   async start(): Promise<void> {
-    // Spawn Python gateway process in project root so imports work
+    // Import the framework explicitly while keeping relative Python I/O in the workspace.
     this.process = spawn(this.pythonPath, [
+      // Python 3.11+ safe-path mode keeps a project's adapters.py or
+      // juice_agents package from shadowing the bound framework checkout.
+      "-P",
       "-m",
       "adapters.stdio_gateway.entry",
     ], {
-      cwd: PROJECT_ROOT,
+      cwd: this.workspace,
+      env: {
+        ...process.env,
+        JUICE_WORKSPACE_DIR: this.workspace,
+        PYTHONPATH: [path.join(PROJECT_ROOT, "sdk", "src"), PROJECT_ROOT, process.env.PYTHONPATH]
+          .filter(Boolean).join(path.delimiter),
+      },
       stdio: ["pipe", "pipe", "pipe"],
     });
 
@@ -344,13 +358,17 @@ export class GatewayClient {
     return this.sendRequest("switch_model", params);
   }
 
-  async switchStrategy(params: {
-    breadth?: number | number[];
-    depth?: number;
-    beam_width?: number;
-    reset?: boolean;
-  }): Promise<{ status: string; strategy: any; message: string }> {
+  async switchStrategy(params: StrategyConfiguration & { base_dir?: string }): Promise<StrategySwitchResult> {
     return this.sendRequest("switch_strategy", params);
+  }
+
+  /** Query or select a catalog reward model without changing candidate breadth. */
+  async configureRewardModel(params: {
+    base_dir?: string;
+    model_name?: string;
+    reset?: boolean;
+  } = {}): Promise<RewardModelConfiguration> {
+    return this.sendRequest("configure_reward_model", params);
   }
 
   async stopSession(): Promise<{ stopped: boolean }> {
@@ -400,13 +418,6 @@ export class GatewayClient {
 
   async getTeam(params: { team_name: string; base_dir?: string }): Promise<TeamManifest> {
     return this.sendRequest("get_team_config", params);
-  }
-
-  async listModeResources(params: {
-    base_dir?: string;
-    mode_id?: string;
-  } = {}): Promise<ModeResourcesResponse> {
-    return this.sendRequest("list_mode_resources", params);
   }
 
   async viewSkill(params: {
@@ -552,6 +563,11 @@ export class GatewayClient {
     enabled: boolean;
   }): Promise<ImageConfigResponse> {
     return this.sendRequest("set_image_config", params);
+  }
+
+  /** Read the same layered configuration used by backend Agents and tools. */
+  async loadEffectiveConfig(params: { base_dir: string; runtime_config_path?: string }): Promise<WorkspaceRuntimeConfig> {
+    return this.sendRequest("load_effective_config", params);
   }
 
   async loadWorkspaceConfig(params: { base_dir: string }): Promise<WorkspaceRuntimeConfig> {

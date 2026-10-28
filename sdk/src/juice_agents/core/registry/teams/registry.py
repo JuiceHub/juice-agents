@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from juice_agents.core.config.context import ConfigurationContext
-from juice_agents.core.registry.agents.store import AgentConfigStore
+from juice_agents.core.registry.agents.registry import AgentRegistry
 from juice_agents.core.registry.agents.types import AgentConfig
 from juice_agents.core.registry.common.store import normalize_name
 
@@ -33,17 +33,20 @@ class TeamRegistry:
         self.config_context = config_context or ConfigurationContext.from_workspace(workspace_dir)
         base_dir = self.config_context.workspace_dir or Path.cwd().resolve()
         self._store = TeamConfigStore(base_dir)
-        # Use the AgentConfigStore directly. Team validation needs declarations,
-        # not instantiated Agents or an AgentRegistry that might itself be
-        # checking Team references during an Agent delete/save operation.
-        self._agent_store = AgentConfigStore(self.config_context.agents_dir)
+        # Shared members use exactly the same effective declarations as
+        # discovery and Agent construction. Private members remain Store-only.
+        self._agent_registry = AgentRegistry(config_context=self.config_context)
+        from juice_agents.core.team.builtin.configs import build_default_team_config
+
+        default = build_default_team_config()
+        self._builtin_manifests = {default.team_name: default}
 
     @classmethod
     def default(cls, workspace_dir: str | Path | None = None) -> "TeamRegistry":
         return cls(workspace_dir)
 
     def list(self) -> list[str]:
-        return self._store.list_names()
+        return sorted(set(self._store.list_names()) | self._builtin_manifests.keys())
 
     def list_shared_member_candidates(self) -> list[dict[str, str]]:
         """List reusable Agent declarations that a new Team member can use.
@@ -53,9 +56,9 @@ class TeamRegistry:
         no way to discover a shared candidate.
         """
         candidates = []
-        for name in self._agent_store.list():
-            config = self._agent_store.load(name)
-            if (config.lifecycle == "persistent"
+        for name in self._agent_registry.list_configs():
+            config = self._agent_registry.load_config(name)
+            if (name != "root" and config.lifecycle == "persistent"
                     and (config.allowed_modes is None or "team" in config.allowed_modes)):
                 candidates.append({"name": name, "description": config.description})
         return candidates
@@ -63,10 +66,25 @@ class TeamRegistry:
     def list_manifests(self) -> list[TeamManifest]:
         """Return detached static definitions for UI and cold queries."""
 
-        return [TeamManifest.from_dict(manifest.to_dict()) for manifest in self._store.list()]
+        return [self.get_manifest(name) for name in self.list()]
 
     def get_manifest(self, team_name: str) -> TeamManifest:
-        return TeamManifest.from_dict(self._store.get_manifest(team_name).to_dict())
+        normalized = normalize_name(team_name)
+        try:
+            manifest = self._store.get_manifest(normalized)
+        except FileNotFoundError:
+            if normalized not in self._builtin_manifests:
+                raise
+            manifest = self._builtin_manifests[normalized]
+        return TeamManifest.from_dict(manifest.to_dict())
+
+    def get_source(self, team_name: str) -> str | None:
+        """Return the effective manifest source without allocating a Runner."""
+
+        normalized = normalize_name(team_name)
+        if self._store.exists(normalized):
+            return "local"
+        return "builtin" if normalized in self._builtin_manifests else None
 
     def manifest_path(self, team_name: str) -> Path:
         """Return a declaration path for transport/UI display only."""
@@ -87,7 +105,7 @@ class TeamRegistry:
         manifest = self.get_manifest(team_name)
         shared_name = manifest.shared_agent_name(member_name)
         if shared_name is not None:
-            config = self._agent_store.load(shared_name)
+            config = self._agent_registry.load_config(shared_name)
         else:
             config = self._store.load_member_config(team_name, member_name)
         return AgentConfig.from_dict(config)
@@ -114,22 +132,14 @@ class TeamRegistry:
             try:
                 shared_name = manifest.shared_agent_name(member_name)
                 agent = (
-                    self._agent_store.load(shared_name)
+                    self._agent_registry.load_config(shared_name)
                     if shared_name is not None
                     else self._store.load_member_config(manifest.team_name, member_name)
                 )
             except FileNotFoundError as exc:
                 source = "全局 Agent" if shared_name is not None else "专属成员配置"
                 raise ValueError(f"Team 引用了不存在的{source}: team={manifest.team_name} member={member_name}") from exc
-            # ``allowed_modes`` is introduced on AgentConfig by the unified
-            # declaration layer. Keep the check local to the relationship so a
-            # Team can never publish an Agent explicitly excluded from team.
-            allowed_modes = getattr(agent, "allowed_modes", None)
-            if allowed_modes is not None and "team" not in allowed_modes:
-                raise ValueError(
-                    "Team 成员不适用于 team mode: "
-                    f"team={manifest.team_name} agent={member_name}"
-                )
+            self._validate_member_candidate(agent, manifest.team_name, member_name)
         return TeamManifest.from_dict(manifest.to_dict())
 
     def instantiate(
@@ -152,6 +162,8 @@ class TeamRegistry:
 
     def create(self, raw: dict[str, Any] | TeamManifest) -> TeamManifest:
         manifest = self.validate(raw)
+        if self.get_source(manifest.team_name) is not None:
+            raise ValueError(f"Team 配置已存在: {manifest.team_name}")
         self._store.create(manifest)
         return manifest
 
@@ -185,7 +197,7 @@ class TeamRegistry:
         if agent_name is not None:
             normalized_agent = normalize_name(agent_name)
             try:
-                candidate = self._agent_store.load(normalized_agent)
+                candidate = self._agent_registry.load_config(normalized_agent)
             except FileNotFoundError as exc:
                 raise ValueError(
                     f"Shared Agent {normalized_agent!r} does not exist; "
@@ -213,9 +225,7 @@ class TeamRegistry:
         self._validate_member_candidate(candidate, team_name, normalized_member)
         # Validate referenced tools before either YAML or manifest is written.
         # Otherwise the member would appear dispatchable until its first turn.
-        from juice_agents.core.registry.agents.registry import AgentRegistry
-
-        candidate = AgentRegistry(config_context=self.config_context).validate(candidate)
+        candidate = self._agent_registry.validate(candidate)
 
         private_written = False
         try:
@@ -226,7 +236,7 @@ class TeamRegistry:
                 member_names=[*manifest.member_names, normalized_member],
                 shared_agent_names=shared,
             )
-            self._store.update(updated)
+            self.update(updated)
         except Exception:
             if private_written:
                 self._store.delete_member_config(team_name, normalized_member)
@@ -249,7 +259,7 @@ class TeamRegistry:
             member_names=[name for name in manifest.member_names if name != normalized_member],
             shared_agent_names=shared,
         )
-        self._store.update(updated)
+        self.update(updated)
         if shared_name is None:
             self._store.delete_member_config(team_name, normalized_member)
         logger.info("已移除 Team 成员: team=%s member=%s", team_name, normalized_member)
@@ -263,14 +273,21 @@ class TeamRegistry:
 
     def update(self, raw: dict[str, Any] | TeamManifest) -> TeamManifest:
         manifest = self.validate(raw)
-        self._store.update(manifest)
+        self.get_manifest(manifest.team_name)
+        self._store.save_manifest(manifest)
         return manifest
 
     def delete(self, team_name: str) -> None:
+        if self.get_source(team_name) == "builtin":
+            raise ValueError(f"内置 Team 只读，不能删除: {team_name}")
         self._store.delete(team_name)
 
     def referencing_teams(self, agent_name: str) -> tuple[str, ...]:
-        return self._store.referencing_teams(normalize_name(agent_name))
+        normalized = normalize_name(agent_name)
+        return tuple(
+            manifest.team_name for manifest in self.list_manifests()
+            if normalized in manifest.explicit_shared_agent_names().values()
+        )
 
 
 __all__ = ["TeamConfig", "TeamRegistry"]

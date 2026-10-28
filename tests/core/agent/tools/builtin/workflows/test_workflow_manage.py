@@ -66,6 +66,78 @@ def test_edit_requires_existing_workflow(tmp_path: Path) -> None:
     assert result == {"success": False, "action": "edit", "error": result["error"]}
     assert "不存在" in result["error"]
     assert not _path(tmp_path).exists()
+    assert not (tmp_path / ".juice").exists()
+
+
+def test_first_builtin_edit_saves_local_override_and_removal_restores_builtin(tmp_path: Path) -> None:
+    """首次 edit 只落盘完整覆盖；重新加载和删除覆盖均沿用统一解析顺序。"""
+
+    context = ConfigurationContext.from_workspace(tmp_path)
+    registry = WorkflowRegistry(config_context=context)
+    builtin = registry.get_metadata("deep_research")
+    assert builtin.source == "builtin"
+    assert builtin.path is not None
+    builtin_source = builtin.path.read_text(encoding="utf-8")
+    assert not (tmp_path / ".juice").exists()
+
+    content = SOURCE.replace("counter", "deep_research")
+    result = WorkflowManageTool(workflow_registry=registry).forward("edit", "deep_research", content=content)
+
+    assert result["success"], result
+    assert result["metadata"]["source"] == "local"
+    assert _path(tmp_path, "deep_research").read_text(encoding="utf-8") == content
+    reloaded = WorkflowRegistry(config_context=context)
+    assert reloaded.get_metadata("deep_research").source == "local"
+    assert reloaded.instantiate("deep_research")(None, {"value": 4}) == {"value": 5}
+    assert builtin.path.read_text(encoding="utf-8") == builtin_source
+
+    _path(tmp_path, "deep_research").unlink()
+    assert reloaded.get_metadata("deep_research").source == "builtin"
+    assert reloaded.view("deep_research")["content"] == builtin_source
+
+
+def test_invalid_builtin_edit_does_not_materialize_workspace(tmp_path: Path) -> None:
+    content = "import os\n" + SOURCE.replace("counter", "deep_research")
+
+    result = _tool(tmp_path).forward("edit", "deep_research", content=content)
+
+    assert not result["success"]
+    assert "禁止直接导入" in result["error"]
+    assert not (tmp_path / ".juice").exists()
+
+
+def test_edit_can_repair_invalid_existing_local_source(tmp_path: Path) -> None:
+    """发现过程跳过的坏源码仍是已存在资源，edit 应能将其修复。"""
+
+    path = _path(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text("def run(ctx, args:\n", encoding="utf-8")
+
+    result = _tool(tmp_path).forward("edit", "counter", content=SOURCE)
+
+    assert result["success"], result
+    assert path.read_text(encoding="utf-8") == SOURCE
+
+
+def test_builtin_override_write_failure_cleans_temporary_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """模拟目录只读导致的原子替换失败，不能遗留临时源码或改变内置来源。"""
+
+    registry = WorkflowRegistry(config_context=ConfigurationContext.from_workspace(tmp_path))
+
+    def refuse_replace(_source: Path, _target: Path) -> None:
+        raise PermissionError("workspace is read-only")
+
+    monkeypatch.setattr(Path, "replace", refuse_replace)
+    result = WorkflowManageTool(workflow_registry=registry).forward(
+        "edit", "deep_research", content=SOURCE.replace("counter", "deep_research")
+    )
+
+    assert not result["success"]
+    assert "read-only" in result["error"]
+    assert list(registry.local_dir.iterdir()) == []
+    assert registry.get_metadata("deep_research").source == "builtin"
 
 
 @pytest.mark.parametrize("action", ["delete", "pause", "resume", "restart", "stop", "run"])

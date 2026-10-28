@@ -11,6 +11,13 @@ conda activate juice-agents
 
 Open the `http://127.0.0.1:5173/` URL printed in the terminal. The script starts the local Web gateway and Vite development server. The gateway accepts local connections only and has no remote authentication.
 
+Initialization uses bootstrap `effective_config` (base → `~/.juice/config.yaml` →
+project `.juice/config.yaml`); `workspace_config` retains project-only semantics.
+`GET /api/effective-config` provides the same read-only merged view. Save sparse
+project patches through `PUT /api/workspace-config`; launch selections do not
+copy inherited defaults to disk. Credentials share process environment → project
+`.env` → `~/.juice/.env` precedence.
+
 ## Interface and capabilities
 
 | Area | Purpose |
@@ -20,6 +27,8 @@ Open the `http://127.0.0.1:5173/` URL printed in the terminal. The script starts
 | Right | Operate the current Runner Browser or preview workspace files read-only |
 
 Team sessions show task completion, member state, and errors. The input supports `/agents`, `/teams`, `/skills` and other commands, `$<skill>` / `$workflow:<name> <task>` explicit invocation, plus model and thinking-effort selection.
+
+`/agents [name]` and `/teams [name]` query the Registry without creating a Runner or resource files. They report the effective `local` or `builtin` source; built-in Teams have `manifest_path: null`. Local declarations take priority, are saved on the first successful edit, and restore built-ins when deleted. `/resources` and its dedicated gateway API have been removed from dispatch, help, and completion.
 
 Browser uses a real Chromium page through Playwright. Run `python -m playwright install chromium` before first use. A desktop session is required for a separate visible window; pure SSH environments can use the embedded preview.
 
@@ -36,7 +45,7 @@ Browser uses a real Chromium page through Playwright. Run `python -m playwright 
 
 ### Development conventions
 
-- The Web Runner is the task conversation, and child Agents belong to it. Use `send_actor_message` and `interrupt_actor` for child-Agent input and stopping; root uses its own stream and cancellation requests.
+- The Web Runner is the task conversation, and child Agents belong to it. Use `send_agent_message` and `interrupt_agent` for child-Agent input and stopping; root uses its own stream and cancellation requests.
 - Route WebSocket stream events by request `id`. Reject pending requests and show an error when a connection closes or fails; the message queue must remain usable.
 - Reuse shared message lifecycle and stream/command presentation models. Web components own styling only; render model Markdown without raw HTML and show user input and tool arguments as plain text.
 - Read-only commands such as `/teams` must not create a Runner. The gateway persists model and effort choices in workspace configuration; `/agent-type` changes only the default for future sessions.

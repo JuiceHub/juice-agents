@@ -105,7 +105,7 @@ def test_registry_instantiation_is_fresh_and_manager_independent(tmp_path: Path)
     assert plugin_registry.instantiate("demo").name == "demo"
 
     team_registry = TeamRegistry(config_context=context)
-    agent_registry.save_config(_agent_declaration("member"))
+    agent_registry.save_config({**_agent_declaration("member"), "lifecycle": "persistent"})
     team = team_registry.instantiate(
         {
             "team_name": "review",

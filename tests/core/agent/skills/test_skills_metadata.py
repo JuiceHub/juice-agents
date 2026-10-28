@@ -1,5 +1,3 @@
-import json
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -7,7 +5,6 @@ from pathlib import Path
 
 # tests/core/agent/skills/test_skills_metadata.py -> 向上 4 层到仓库根目录
 ROOT_DIR = Path(__file__).resolve().parents[4]
-ASSETS_DIR = ROOT_DIR / "sdk" / "src" / "juice_agents" / "_assets"
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
@@ -29,33 +26,25 @@ class _NoOpTool(Tool):
         return "ok"
 
 
-def _run_script(script_name: str, args: list[str] | None = None) -> dict:
-    script_path = ASSETS_DIR / "skills" / "joke-expert" / "scripts" / script_name
-    cmd = [sys.executable, str(script_path)]
-    if args:
-        cmd.extend(args)
-    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-    return json.loads(result.stdout.strip())
-
-
 class SkillMetadataTests(unittest.TestCase):
     def setUp(self):
         self._skills_tmp = tempfile.TemporaryDirectory()
+        # 每个测试自行提供最小 workspace 技能，避免依赖 SDK 的演示资源。
+        local_skills_path = Path(self._skills_tmp.name) / ".juice" / "skills"
+        self.skill_file = local_skills_path / "test-skill" / "SKILL.md"
+        self.skill_file.parent.mkdir(parents=True)
+        self.skill_file.write_text(
+            "---\nname: test-skill\ndescription: Test skill metadata loading.\n---\n"
+            "# Test skill\n\nRead the full instructions before applying this skill.\n",
+            encoding="utf-8",
+        )
         self.skill_kwargs = {
-            "skill_names": ["joke-expert"],
-            "skills_config_path": ASSETS_DIR / "config.example.yaml",
-            "local_skills_path": Path(self._skills_tmp.name) / ".juice" / "skills",
+            "skill_names": ["test-skill"],
+            "local_skills_path": local_skills_path,
         }
 
     def tearDown(self):
         self._skills_tmp.cleanup()
-
-    def test_builtin_skills_directory_only_keeps_joke_expert(self):
-        skills_dir = ASSETS_DIR / "skills"
-        builtin_skill_dirs = sorted(
-            path.name for path in skills_dir.iterdir() if path.is_dir() and not path.name.startswith("__")
-        )
-        self.assertEqual(builtin_skill_dirs, ["joke-expert"])
 
     def test_skill_metadata_loaded(self):
         agent = ReActAgent(
@@ -63,8 +52,14 @@ class SkillMetadataTests(unittest.TestCase):
             model=DummyModel(),
             **self.skill_kwargs,
         )
-        self.assertTrue(agent.skills_metadata)
-        self.assertIn("joke-expert", agent.system_prompt)
+        self.assertEqual(len(agent.skills_metadata), 1)
+        metadata = agent.skills_metadata[0]
+        self.assertEqual(metadata["name"], "test-skill")
+        self.assertEqual(metadata["description"], "Test skill metadata loading.")
+        self.assertEqual(metadata["source"], "local")
+        self.assertEqual(Path(metadata["location"]), self.skill_file)
+        self.assertIn("test-skill", agent.system_prompt)
+        self.assertIn(metadata["description"], agent.system_prompt)
         self.assertIn("# Skills", agent.system_prompt)
         self.assertIn("skill_view", agent.system_prompt)
 
@@ -107,23 +102,6 @@ class SkillMetadataTests(unittest.TestCase):
         self.assertIn("skill_view", agent.system_prompt)
         self.assertNotIn("shell(command=\"cat <skill_location>\")", agent.system_prompt)
         self.assertNotIn("你需要使用shell工具去导入python函数和执行", agent.system_prompt)
-
-
-class JokeSkillScriptTests(unittest.TestCase):
-    def test_list_categories(self):
-        data = _run_script("list_joke_categories.py")
-        self.assertEqual(data["categories"], ["dad", "tech"])
-        self.assertEqual(data["count"], 2)
-
-    def test_get_random_joke_with_category(self):
-        data = _run_script("get_random_joke.py", ["--category", "tech"])
-        joke_text = data["joke"]["text"]
-        self.assertIn("程序员", joke_text)
-
-    def test_get_random_joke_any(self):
-        data = _run_script("get_random_joke.py")
-        joke_text = data["joke"]["text"]
-        self.assertTrue(any(keyword in joke_text for keyword in ["程序员", "腰带"]))
 
 
 if __name__ == "__main__":

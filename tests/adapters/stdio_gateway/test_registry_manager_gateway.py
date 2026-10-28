@@ -128,3 +128,38 @@ def test_gateway_rejects_retired_memory_dream_command() -> None:
 
     with pytest.raises(ValueError, match="Unknown method: run_dream"):
         RpcHandlers().dispatch("run_dream", {})
+
+
+def test_gateway_rejects_retired_mode_resource_command(tmp_path: Path) -> None:
+    """A removed method fails before constructing any workspace runtime."""
+
+    handlers = RpcHandlers()
+    with pytest.raises(ValueError, match="Unknown method: list_mode_resources"):
+        handlers.dispatch("list_mode_resources", {"base_dir": str(tmp_path)})
+    assert handlers._runtime is None
+    assert not (tmp_path / ".juice").exists()
+
+
+def test_gateway_team_queries_report_effective_source_without_workspace_writes(tmp_path: Path) -> None:
+    """Built-in Team paths stay null until a validated local edit is saved."""
+
+    handlers = RpcHandlers()
+    params = {"base_dir": str(tmp_path), "team_name": "default"}
+    listed = handlers.dispatch("list_team_configs", params)
+    default = next(team for team in listed["teams"] if team["team_name"] == "default")
+    detail = handlers.dispatch("get_team_config", params)
+    assert default["source"] == detail["source"] == "builtin"
+    assert default["manifest_path"] is detail["manifest_path"] is None
+    assert handlers._runtime is None
+    assert not (tmp_path / ".juice").exists()
+
+    updated = handlers.dispatch("update_team_manifest", {**params, "description": "Local Team"})
+    detail = handlers.dispatch("get_team_config", params)
+    assert detail["source"] == "local"
+    assert detail["description"] == "Local Team"
+    assert detail["manifest_path"] == updated["manifest_path"]
+    assert Path(detail["manifest_path"]).is_file()
+    handlers.dispatch("delete_team_config", params)
+    restored = handlers.dispatch("get_team_config", params)
+    assert restored["source"] == "builtin"
+    assert restored["manifest_path"] is None

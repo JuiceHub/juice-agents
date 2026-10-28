@@ -69,7 +69,6 @@ class TeamConfigStore:
     ) -> AgentConfig:
         """Create one private declaration and refuse to overwrite stale files."""
 
-        self.get_manifest(team_name)
         path = self.member_config_path(team_name, member_name)
         if path.exists():
             raise ValueError(f"Team 成员配置已存在: {path}")
@@ -152,6 +151,19 @@ class TeamConfigStore:
         path = self.manifest_path(candidate.team_name)
         write_yaml_config(path, candidate.to_persisted_dict())
         logger.info("已更新 Team manifest: team=%s path=%s", candidate.team_name, path)
+        return path
+
+    def save_manifest(self, manifest: TeamManifest) -> Path:
+        """Commit a Registry-validated manifest, including its first override.
+
+        The Registry owns effective existence checks. In particular a built-in
+        Team has no disk manifest before the first membership edit, and its
+        private member may already have been staged when we commit here.
+        """
+
+        path = self.manifest_path(manifest.team_name)
+        write_yaml_config(path, manifest.to_persisted_dict())
+        logger.info("已保存 Team manifest: team=%s path=%s", manifest.team_name, path)
         return path
 
     def delete(self, team_name: str) -> None:

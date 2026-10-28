@@ -14,11 +14,13 @@ class BuiltinAgentConfigTests(unittest.TestCase):
     def test_default_root_manages_only_general_and_explore(self) -> None:
         root = get_general_config()
 
+        self.assertEqual(root.name, "root")
         self.assertEqual(root.managed_agent_names, ("general", "explore"))
         self.assertNotIn("plan", root.managed_agent_names)
 
     def test_builtin_templates_do_not_reserve_plan_name(self) -> None:
         self.assertEqual(get_explore_config().name, "explore")
+        self.assertEqual(get_general_subagent_config().name, "general")
         self.assertEqual(get_general_subagent_config().allowed_modes, ("agent", "plan"))
         self.assertEqual(get_explore_config().allowed_modes, ("agent", "plan"))
         with self.assertRaisesRegex(ValueError, "未知内置 Agent 模板"):

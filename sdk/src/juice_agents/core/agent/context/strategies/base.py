@@ -1,45 +1,25 @@
-"""探索策略基类和接口定义。"""
+"""每步候选选择协议；模型生成、动作执行和落树分别由 Agent / Manager 负责。"""
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Callable, Protocol
 
-from ..tree import ContextTree
+from ..steps import ActionStep
 
 
 class ExplorationStrategy(Protocol):
-    """探索策略接口
+    """只决定候选数量和选择结果，不调用模型、执行动作或修改上下文树。"""
 
-    负责：
-    1. 如何从当前节点探索（单次/多次/并行）
-    2. 如何控制模型采样参数
-    3. 如何评估和选择路径
-    """
+    @property
+    def candidate_count(self) -> int:
+        """本步实际生成数；没有评分器时应为 1，避免无意义的模型请求。"""
+        ...
 
-    def rollout(
-        self,
-        tree: ContextTree,
-        current_node_id: str,
-        model: Any,
-        *,
-        temperature: float = 1.0,
-        top_p: float = 1.0,
-        **kwargs
-    ) -> List[str]:
-        """执行一次 rollout，返回新创建的子节点 IDs
-
-        Args:
-            tree: 上下文树
-            current_node_id: 当前节点ID
-            model: 聊天模型（实现 generate 接口）
-            temperature: 采样温度
-            top_p: nucleus sampling 参数
-            **kwargs: 其他参数
-
-        Returns:
-            新创建的子节点 ID 列表
-        """
+    def select(
+        self, *, context: list[dict[str, Any]], candidates: list[ActionStep],
+        on_model_usage: Callable[..., None] | None = None,
+    ) -> tuple[int, list[float | None]]:
+        """返回选中下标及各候选分数；协议无效或未评分的候选分数为 None。"""
         ...
 
 

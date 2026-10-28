@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any, Iterator
 
 from juice_agents.core.config.runtime_config import read_workspace_config, update_workspace_config
@@ -39,12 +40,12 @@ class RpcHandlers:
             payload = params or {}
             self._runtime = DirectRunnerRuntime(
                 base_dir=payload.get("base_dir", "."),
-                permission_mode=payload.get("permission_mode", "default"),
-                agent_mode=payload.get("agent_mode", "agent"),
-                agent_type=payload.get("agent_type", "react"),
+                permission_mode=payload.get("permission_mode"),
+                agent_mode=payload.get("agent_mode"),
+                agent_type=payload.get("agent_type"),
                 runtime_config_path=payload.get("runtime_config_path"),
-                model_name=payload.get("model_name", "doubao_lite"),
-                model_effort=payload.get("model_effort", "disabled"),
+                model_name=payload.get("model_name"),
+                model_effort=payload.get("model_effort"),
                 worktree=payload.get("worktree"),
                 ask_handler=self._ask_handler,
             )
@@ -61,12 +62,17 @@ class RpcHandlers:
     def handle_start_session(self, params: dict[str, Any]) -> dict[str, Any]:
         """Create a fresh runtime session for the requested workspace and mode."""
         base_dir = params.get("base_dir", ".")
-        permission_mode = params.get("permission_mode", "default")
-        agent_mode = params.get("agent_mode", "agent")
-        agent_type = params.get("agent_type", "react")
+        pending_strategy, pending_reward_model = self._pending_configuration_for_workspace(base_dir)
+        permission_mode = params.get("permission_mode")
+        agent_mode = params.get("agent_mode")
+        agent_type = params.get("agent_type")
         runtime_config_path = params.get("runtime_config_path")
-        model_name = params.get("model_name", "doubao_lite")
-        model_effort = params.get("model_effort", "disabled")
+        # A pending name belongs to its project catalog. Preserve that source
+        # unless startup explicitly selects a different configuration file.
+        if runtime_config_path is None and pending_reward_model is not None:
+            runtime_config_path = self._runtime.runtime_config_path
+        model_name = params.get("model_name")
+        model_effort = params.get("model_effort")
         worktree = params.get("worktree")
 
         self._runtime = DirectRunnerRuntime(
@@ -80,6 +86,10 @@ class RpcHandlers:
             worktree=None if worktree is None else str(worktree),
             ask_handler=self._ask_handler,
         )
+        if pending_strategy is not None:
+            self._runtime.switch_strategy(pending_strategy)
+        if pending_reward_model is not None:
+            self._runtime.configure_reward_model(pending_reward_model)
         status = self._runtime.start_session()
         return _serialize_session_status(status)
 
@@ -87,9 +97,12 @@ class RpcHandlers:
         """Resume an existing runtime session from persisted runner state."""
         runner_id = params["runner_id"]
         base_dir = params.get("base_dir", ".")
+        pending_strategy, pending_reward_model = self._pending_configuration_for_workspace(base_dir)
         runtime_config_path = params.get("runtime_config_path")
-        model_name = params.get("model_name", "doubao_lite")
-        model_effort = params.get("model_effort", "disabled")
+        if runtime_config_path is None and pending_reward_model is not None:
+            runtime_config_path = self._runtime.runtime_config_path
+        model_name = params.get("model_name")
+        model_effort = params.get("model_effort")
 
         self._runtime = DirectRunnerRuntime(
             base_dir=base_dir,
@@ -98,8 +111,28 @@ class RpcHandlers:
             model_effort=model_effort,
             ask_handler=self._ask_handler,
         )
+        if pending_strategy is not None:
+            self._runtime.switch_strategy(pending_strategy)
+        if pending_reward_model is not None:
+            self._runtime.configure_reward_model(pending_reward_model)
         status = self._runtime.resume_session(runner_id)
         return _serialize_session_status(status)
+
+    def _pending_configuration_for_workspace(
+        self, base_dir: str | Path,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Keep `/strategy` and `/rm` choices across runtime replacement.
+
+        This is in-memory configuration for the same workspace only; scorer
+        objects and settings from another workspace are never transferred.
+        """
+
+        if self._runtime is None or self._runtime.base_dir != Path(base_dir).expanduser().resolve():
+            return None, None
+        return (
+            self._runtime.pending_strategy_configuration,
+            self._runtime.pending_reward_model_configuration,
+        )
 
     def handle_stream_message(self, params: dict[str, Any]) -> Iterator[dict[str, Any]]:
         """Forward a user message and yield serialized streaming steps."""
@@ -145,27 +178,16 @@ class RpcHandlers:
         return _serialize_session_status(self._runtime.describe_session())
 
     def handle_enter_worktree(self, params: dict[str, Any]) -> dict[str, Any]:
-        if self._runtime is None:
-            raise RuntimeError("No active session")
-        name = params.get("name")
-        return self._runtime.enter_worktree(None if name is None else str(name))
+        raise NotImplementedError(DirectRunnerRuntime._worktree_message())
 
     def handle_exit_worktree(self, params: dict[str, Any]) -> dict[str, Any]:
-        if self._runtime is None:
-            raise RuntimeError("No active session")
-        return self._runtime.exit_worktree(discard=bool(params.get("discard", False)))
+        raise NotImplementedError(DirectRunnerRuntime._worktree_message())
 
     def handle_list_worktrees(self, params: dict[str, Any]) -> dict[str, Any]:
-        del params
-        if self._runtime is None:
-            raise RuntimeError("No active session")
-        return self._runtime.list_worktrees()
+        raise NotImplementedError(DirectRunnerRuntime._worktree_message())
 
     def handle_worktree_status(self, params: dict[str, Any]) -> dict[str, Any]:
-        if self._runtime is None:
-            raise RuntimeError("No active session")
-        name = params.get("name")
-        return self._runtime.worktree_status(None if name is None else str(name))
+        raise NotImplementedError(DirectRunnerRuntime._worktree_message())
 
     def handle_list_async_tasks(self, params: dict[str, Any]) -> list[dict[str, Any]]:
         """Return public async task status rows for the active session."""
@@ -363,14 +385,6 @@ class RpcHandlers:
             mode_id=None if mode_id is None else str(mode_id),
         )
 
-    def handle_list_mode_resources(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Return workspace resources grouped by registered mode id."""
-        runtime = self._bootstrap_runtime(params)
-        mode_id = params.get("mode_id")
-        return runtime.list_mode_resources(
-            mode_id=None if mode_id is None else str(mode_id),
-        )
-
     def handle_view_skill(self, params: dict[str, Any]) -> dict[str, Any]:
         """Read a visible skill's SKILL.md or a supporting file."""
         runtime = self._bootstrap_runtime(params)
@@ -456,7 +470,7 @@ class RpcHandlers:
         """切换 Agent 执行模式（agent/plan/team/group）；空闲时刷新 root 配置。"""
         runtime = self._bootstrap_runtime(params)
         agent_mode = params["agent_mode"]
-        agent_type = params.get("agent_type", "react")
+        agent_type = params.get("agent_type")
         model_name = params.get("model_name")
         model_effort = params.get("model_effort")
         status = runtime.switch_agent_mode(agent_mode, agent_type, model_name, model_effort)
@@ -469,8 +483,8 @@ class RpcHandlers:
             self._runtime = DirectRunnerRuntime(
                 base_dir=base_dir,
                 runtime_config_path=params.get("runtime_config_path"),
-                model_name=params.get("model_name", "doubao_lite"),
-                model_effort=params.get("model_effort", "disabled"),
+                model_name=params.get("model_name"),
+                model_effort=params.get("model_effort"),
                 ask_handler=self._ask_handler,
             )
         return list(self._runtime.list_models())
@@ -485,20 +499,7 @@ class RpcHandlers:
         return _serialize_session_status(status)
 
     def handle_switch_strategy(self, params: dict[str, Any]) -> dict[str, Any]:
-        """切换 Agent 的探索策略
-
-        统一使用 breadth/depth/beam_width 参数配置策略。
-
-        Args:
-            params: 包含策略参数的字典
-                - breadth: 每步展开分支数 (int 或 list)
-                - depth: 最大探索深度
-                - beam_width: 每步保留路径数
-                - reset: 是否重置为默认贪心策略
-
-        Returns:
-            包含策略切换状态和信息的字典
-        """
+        """Configure positive integer breadth, or reset to linear execution."""
         runtime = self._bootstrap_runtime(params)
 
         # 提取策略参数（移除 base_dir 等非策略参数）
@@ -508,6 +509,17 @@ class RpcHandlers:
         }
 
         return runtime.switch_strategy(strategy_params)
+
+    def handle_configure_reward_model(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Query or update `/rm` without creating a Runner or making a request."""
+        # This RPC's model_name names the scorer. Do not let the generic cold
+        # bootstrap interpret it as the generation model for a new shell.
+        runtime = self._bootstrap_runtime({key: value for key, value in params.items() if key != "model_name"})
+        configuration = {
+            key: value for key, value in params.items()
+            if key not in ("base_dir", "runtime_config_path")
+        }
+        return runtime.configure_reward_model(configuration)
 
     def handle_stop_session(self, params: dict[str, Any]) -> dict[str, bool]:
         """Stop active backend work for the current session before CLI exit."""
@@ -534,6 +546,20 @@ class RpcHandlers:
         summaries = list_sessions(base_dir)
         return [_serialize_session_summary(summary) for summary in summaries]
 
+    def handle_load_effective_config(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Read layered defaults without creating a session or writing overrides."""
+        workspace = Path(params.get("base_dir", ".")).expanduser().resolve()
+        requested_path = params.get("runtime_config_path")
+        if (
+            self._runtime is not None
+            and self._runtime.base_dir == workspace
+            and (requested_path is None or Path(requested_path).expanduser().resolve() == self._runtime.runtime_config_path)
+        ):
+            return self._runtime.effective_config()
+        return ConfigurationContext.from_workspace(
+            workspace, project_config_path=params.get("runtime_config_path")
+        ).read_merged_config()
+
     def handle_load_workspace_config(self, params: dict[str, Any]) -> dict[str, Any]:
         """Load workspace-local YAML runtime overrides from `.juice/config.yaml`."""
         base_dir = params.get("base_dir", ".")
@@ -548,7 +574,12 @@ class RpcHandlers:
                     "team_name": manifest.team_name,
                     "description": manifest.description,
                     "member_names": list(manifest.member_names),
-                    "manifest_path": str(registry.manifest_path(manifest.team_name)),
+                    "source": registry.get_source(manifest.team_name),
+                    "manifest_path": (
+                        str(registry.manifest_path(manifest.team_name))
+                        if registry.get_source(manifest.team_name) == "local"
+                        else None
+                    ),
                 }
                 for manifest in registry.list_manifests()
             ]
@@ -559,7 +590,16 @@ class RpcHandlers:
         team_name = str(params.get("team_name") or "").strip()
         if not team_name:
             raise ValueError("team_name 不能为空")
-        return self._team_registry(params).get_manifest(team_name).to_dict()
+        registry = self._team_registry(params)
+        manifest = registry.get_manifest(team_name)
+        source = registry.get_source(team_name)
+        return {
+            **manifest.to_dict(),
+            "source": source,
+            # Built-ins have no persisted manifest; expose a path only once a
+            # successful mutation creates the complete local override.
+            "manifest_path": str(registry.manifest_path(team_name)) if source == "local" else None,
+        }
 
     def handle_create_team_config(self, params: dict[str, Any]) -> dict[str, Any]:
         """Create an empty Team unless explicit member references are supplied."""

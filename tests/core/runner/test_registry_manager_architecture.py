@@ -136,26 +136,30 @@ def test_runner_queues_user_messages_as_agent_attachments(tmp_path: Path) -> Non
 
 
 @pytest.mark.parametrize("mode_id", ["agent", "plan", "group", "team"])
-def test_prebuilt_factory_seeds_only_static_declarations(tmp_path: Path, mode_id: str) -> None:
-    """Prebuilt setup seeds workers but never writes a root declaration."""
+def test_prebuilt_factory_keeps_builtin_declarations_in_memory(tmp_path: Path, mode_id: str) -> None:
+    """Resource defaults resolve without writes or constructing live Agents."""
 
     runner = create_prebuilt_runner(runner_config=mode_id, base_dir=tmp_path)
-    assert not (tmp_path / ".juice" / "agents" / "root.yaml").exists()
+    assert not (tmp_path / ".juice" / "agents").exists()
+    assert runner.agent_registry.load_config("root").name == "root"
     assert not runner.agent_manager.live_agents
     assert runner.root_agent_name == "root"
     runner.close()
 
 
 @pytest.mark.parametrize("mode_id", ["agent", "plan", "group", "team"])
-def test_builtin_modes_construct_root_from_an_in_memory_agent_config(tmp_path: Path, mode_id: str) -> None:
-    """Root is a detached AgentConfig and cannot become Registry YAML."""
+def test_builtin_modes_construct_root_from_an_effective_agent_config(tmp_path: Path, mode_id: str) -> None:
+    """Mode-specific overlays do not become the canonical Registry declaration."""
 
     runner = create_prebuilt_runner(runner_config=mode_id, base_dir=tmp_path)
     try:
         instance = runner.agent_registry.instantiate(runner.root_config, model=object())
         assert instance.name == "root"
         assert not hasattr(instance, "tool_executor")
-        assert not (tmp_path / ".juice" / "agents" / "root.yaml").exists()
+        assert not (tmp_path / ".juice" / "agents").exists()
+        stored = runner.agent_registry.load_config("root")
+        assert stored.name == "root"
+        assert not {"plan", "exit_plan", "team_finish"} & {ref.name for ref in stored.tools}
     finally:
         runner.close()
 
@@ -238,13 +242,13 @@ def test_unload_state_is_runner_and_mode_local_and_can_be_reactivated(tmp_path: 
         runner.close()
 
 
-def test_team_runner_initializes_empty_default_manifest(tmp_path: Path) -> None:
+def test_team_runner_resolves_empty_builtin_default_manifest(tmp_path: Path) -> None:
     """A new Team starts without members or a separate teamlead declaration."""
 
     runner = Runner.create(runner_config="team", base_dir=tmp_path)
     try:
         assert runner.team_name == "default"
-        assert (tmp_path / ".juice" / "teams" / "default" / "manifest.yaml").is_file()
+        assert not (tmp_path / ".juice" / "teams").exists()
         assert runner.available_agent_names() == frozenset()
         assert {item["name"] for item in runner.list_available_agents()["agents"]} == set()
         assert [member["name"] for member in runner.team_manager.snapshot()["members"]] == ["root"]

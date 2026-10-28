@@ -12,7 +12,7 @@ test("safe command tokens bypass a busy stream and existing ordinary FIFO", () =
   for (const input of [
     "/tasks",
     "/tasks ",
-    "/actors",
+    "/active",
     "/permissions",
     "/permissions accept",
     "/help",
@@ -60,7 +60,7 @@ test("ordinary messages, reconfiguration, and execution commands stay FIFO", () 
 
 test("the classifier uses an exact first token instead of slash prefixes", () => {
   assert.equal(getCommandExecutionPolicy("/tasks-extra"), "fifo");
-  assert.equal(getCommandExecutionPolicy("/actors/list"), "fifo");
+  assert.equal(getCommandExecutionPolicy("/active/list"), "fifo");
   assert.equal(getCommandExecutionPolicy("/unknown"), "fifo");
   assert.equal(getCommandToken("  /tasks  "), "/tasks");
   assert.equal(getCommandToken("ordinary text"), null);

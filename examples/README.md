@@ -2,67 +2,117 @@
 
 > [简体中文](README.zh-CN.md)
 
-The four examples use a real model to demonstrate complete workflows. Each example is an independent entry point and workspace; its configuration, Runner state, and model artifacts live under that example's `.juice/` directory.
+Each example runs a built-in task with a real model when you execute its main
+file without arguments. The example directory is its fixed workspace; configuration
+and Runner state live in `.juice/`, and generated files stay in that workspace.
 
-| Scenario | Command | Result |
+| Scenario | Run from repository root | Demonstrates |
 | --- | --- | --- |
-| Traceable research | `python -m examples.agent_research` | Report, sources, claims, and a Graph trace |
-| Capability evolution | `python -m examples.agent_evolution` | Reusable tools or specialists that are created and called |
-| Feedback operations | `python -m examples.group_operations` | Feedback classification, priority, and action suggestions |
-| Team delivery | `python -m examples.team_delivery` | Team tasks/inbox, code artifacts, and verification results |
-| Exploration strategies | `python -m examples.agent_tot` | Demonstrates greedy, best-of-N, beam search, and ToT strategies |
+| Traceable research | `python examples/agent_research/__main__.py` | Research local sources, connect claims to evidence, and write a report |
+| Capability evolution | `python examples/agent_evolution/__main__.py` | Create and call a reusable tool or specialist |
+| Feedback operations | `python examples/group_operations/__main__.py` | Coordinate specialists to classify feedback and prioritize actions |
+| Team delivery | `python examples/team_delivery/__main__.py` | Coordinate team tasks, implement a bounded requirement, and verify it |
+| Per-step candidate selection | `python examples/agent_tot/__main__.py` | Generate three candidates, score them, and execute the winner at each step |
 
-## Run an example
+## Setup and run
 
-From the repository root, enter the environment and configure a model and provider key for the example you want to run:
+Enter the environment and configure the example you want to run:
 
 ```bash
 conda activate juice-agents
 python -m pip install -e ./sdk
-mkdir -p examples/agent_research/.juice
-cp sdk/src/juice_agents/_assets/config.example.yaml examples/agent_research/.juice/config.yaml
-# Edit config.yaml and set the provider environment variables.
-python -m examples.agent_research "Compare hosted and self-managed deployment for a customer portal"
+mkdir -p examples/agent_tot/.juice
+cp sdk/src/juice_agents/core/config/defaults.yaml examples/agent_tot/.juice/config.yaml
+# Edit config.yaml; put provider API keys in the repository root .env.
+python examples/agent_tot/__main__.py
 ```
 
-Configure `.juice/config.yaml` separately for other examples. Commands commonly used are:
+Configure `.juice/config.yaml` separately for each example; `--model <model_name>`
+selects a model from that example's catalog. All examples can reuse the repository
+root `.env`, without copying keys into every example. Credentials resolve in this
+order: process environment, example `.env`, repository root `.env`. The paths are
+fixed relative to the example and repository, so another current directory or an
+IDE launch does not change credential lookup. These are real model runs and
+require usable provider credentials.
+Research uses local sources by default, so its built-in task needs no search API key.
+
+All main files also support IDE execution, absolute paths, and other current
+directories. For example, substitute your repository path below:
 
 ```bash
-python -m examples.agent_evolution "Create release-note review capability for upgrade support"
-python -m examples.group_operations "Review feedback and propose this week's operations plan"
-python -m examples.team_delivery "Implement the requirement in TASK.md and verify it"
-python -m examples.team_delivery --resume <runner_id> "Continue the unfinished task and report verification"
-python -m examples.agent_tot "Optimize this code's performance" --strategy beam_search --breadth 3 --depth 4
+python /path/to/juice-agents/examples/agent_tot/__main__.py
 ```
 
-### Exploration Strategy Example
-
-The `agent_tot` example demonstrates different exploration strategies:
+From the repository root, the original module form still works:
 
 ```bash
-# Default greedy (single path)
-python -m examples.agent_tot "Design a caching strategy"
-
-# Best-of-N: generate 5 candidates, select best
-python -m examples.agent_tot "Design a caching strategy" --strategy best_of_n --breadth 5
-
-# Beam Search: keep 3 parallel paths for 4 layers
-python -m examples.agent_tot "Design a caching strategy" --strategy beam_search --breadth 3 --depth 4 --beam-width 3
-
-# ToT-style: single path with deep exploration
-python -m examples.agent_tot "Design a caching strategy" --strategy tot --breadth 5 --depth 3
+python -m examples.agent_tot
 ```
 
-All four entry points support `--model`, `--model-effort`, `--agent-type react|codeact`, `--permission-mode default|accept`, and `--resume RUNNER_ID`. Without `--resume`, a new Runner is created. The process prints the Runner ID and progress events, then releases the Runner. The examples use a real model and have no offline mock path.
+A positional argument replaces the default task. Shared options are `--model`,
+`--model-effort`, `--agent-type react|codeact`, `--permission-mode default|accept`,
+and `--resume RUNNER_ID`; `--help` lists the scenario's arguments.
+
+By default, tool approvals are answered in the terminal. For noninteractive runs,
+explicitly pass `--permission-mode accept` to allow tool operations. `--model`,
+`--model-effort`, and `--agent-type` override the root Agent; collaborating members
+retain their own model and protocol settings.
+
+```bash
+python examples/agent_research/__main__.py "Compare the deployment options in the local project files"
+python examples/team_delivery/__main__.py --resume <runner_id> "Continue the unfinished task and verify it"
+```
+
+Each run prints the workspace, task, Runner ID, steps, tool calls, and final
+result. A new Runner is created unless `--resume` is provided; the Runner is
+released on exit and its persisted state remains available for resumption.
+Resuming retains the session's existing approval mode.
+
+## ToT candidate selection
+
+`agent_tot` defaults to `--strategy tot --breadth 3`. Its `GenerativeRewardModel`
+(GRM), from `juice_agents.core.models.reward_models`, calls the provider SDK
+directly to generate JSON scores and parses them into numbers. It defaults to
+the root Agent's logical model name, creating its own SDK client. The entry point uses
+`GenerativeRewardModel.from_config(name, context)`, reusing the same example
+workspace catalog and credential precedence above. Construction and empty batches
+do not resolve a provider.
+Select another configured scoring model with `--reward-model`:
+
+```bash
+python examples/agent_tot/__main__.py
+python examples/agent_tot/__main__.py "Design a caching strategy" --model <generation_model> --reward-model <scoring_model>
+python examples/agent_tot/__main__.py --strategy greedy
+```
+
+```text
+Same context → generate breadth candidates → validate → score → execute winner → next step
+                                                  └── print scores and selected candidate
+```
+
+Only the selected candidate executes; rejected candidates remain in the persisted
+tree. `--strategy greedy` or `--breadth 1` uses one generation request per step
+without scoring. This is per-step selection without parallel path execution or
+backtracking. Pass
+`main(..., reward_model=GenerativeRewardModel(model_name="your-model", client=sdk_client))`
+to use a native SDK client without configuration files for scoring; the client
+must match the backend.
+`main(..., reward_model=scorer)` also supports a custom scorer whose
+`evaluate_batch(context=..., actions=...)` returns a dict with `scores`, `usage`,
+and `usage_calls`; `scores` has one finite number per valid candidate.
+Scorer objects are not persisted; the entry point configures
+GRM again when resuming, and callers must reinject custom scorers.
 
 ## Development conventions
 
 ```text
-Dynamic business input → scenario system instruction → Juice(workspace=example) → Runner stream
-                                                                            └── .juice/ state and artifacts
+Default/explicit task → scenario system instruction → Juice(workspace=example) → Runner stream
+                                                                               └── workspace state and artifacts
 ```
 
-- User prompts contain only dynamic business information; workflow, boundaries, and acceptance criteria belong in the scenario system instruction.
-- Each scenario enters through `__main__.py`, uses the public `Juice(...).runners.create/resume` API, and uses its own directory as the workspace. Do not add a `--workspace` option. Reuse common arguments, event rendering, and Runner lifecycle code from `examples/_runtime.py`.
-- Scenarios use a real model configured in their dedicated workspace. Do not add mocks, fake artifacts, or silent fallbacks. Call `runner.stop()` on both success and error paths.
-- Add behavior tests under `tests/examples/` for new or changed scenarios, and update this README and the [project README](../README.md).
+- Keep dynamic task data in the user prompt; workflow, boundaries, and acceptance criteria belong in the scenario system instruction.
+- Give each `__main__.py` a useful default task and retain both direct-file and module execution. Keep tasks bounded and independent of external input files unless supplied explicitly.
+- Use the public `Juice(...).runners.create/resume` API and the example's own directory as the workspace; do not add `--workspace`. Reuse shared arguments, event rendering, and Runner cleanup from `examples/_runtime.py`.
+- SDK `Runner.stream` does not parse gateway `$workflow` syntax. The research entry uses the existing `ManualCapability.install` to authorize `deep_research` explicitly without enabling automatic workflows.
+- Use real configured models; do not add mocks, fake artifacts, or silent fallbacks. Always release the Runner with `runner.stop()` on success and errors.
+- Add functional tests under `tests/examples/`, leave no generated test files behind, and update this README and the [project README](../README.md).

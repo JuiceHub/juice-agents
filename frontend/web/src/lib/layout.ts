@@ -1,6 +1,6 @@
 import type {
-  ActorSessionsReport,
-  ActorSessionSnapshot,
+  ActiveAgentsReport,
+  ActiveAgentSnapshot,
   BrowserPreview,
   BrowserTabInfo,
   RunnerStreamEvent,
@@ -55,42 +55,42 @@ export function isPreviewFeature(value: string): value is PreviewFeature {
   return PREVIEW_FEATURES.includes(value as PreviewFeature);
 }
 
-export function findRootActor(report: ActorSessionsReport | null): ActorSessionSnapshot | null {
+export function findRootActor(report: ActiveAgentsReport | null): ActiveAgentSnapshot | null {
   if (!report) return null;
   return (
-    report.actors.find((actor) => actor.is_root) ||
-    report.actors.find((actor) => actor.actor_name === report.root_actor_name) ||
+    report.agents.find((actor) => actor.is_root) ||
+    report.agents.find((actor) => actor.agent_name === report.root_agent_name) ||
     null
   );
 }
 
 export function findActorByName(
-  report: ActorSessionsReport | null,
+  report: ActiveAgentsReport | null,
   actorName: string | null
-): ActorSessionSnapshot | null {
+): ActiveAgentSnapshot | null {
   if (!report || !actorName) return null;
   return (
-    report.actors.find((actor) => {
-      const name = String(actor.actor_name || "").trim();
-      const id = String(actor.actor_id || "").trim();
+    report.agents.find((actor) => {
+      const name = String(actor.agent_name || "").trim();
+      const id = String(actor.agent_id || "").trim();
       return name === actorName || id === actorName;
     }) || null
   );
 }
 
 export function buildSubactorNavItems(
-  report: ActorSessionsReport | null,
+  report: ActiveAgentsReport | null,
   activeActorName: string | null
 ): SubactorNavItem[] {
   const root = findRootActor(report);
-  const rootName = root?.actor_name || report?.root_actor_name || "";
-  return (report?.actors || [])
-    .filter((actor) => !actor.is_root && actor.actor_name !== rootName)
+  const rootName = root?.agent_name || report?.root_agent_name || "";
+  return (report?.agents || [])
+    .filter((actor) => !actor.is_root && actor.agent_name !== rootName)
     .map((actor) => {
-      const actorName = String(actor.actor_name || actor.actor_id || "").trim();
-      const actorId = String(actor.actor_id || actorName).trim();
+      const actorName = String(actor.agent_name || actor.agent_id || "").trim();
+      const actorId = String(actor.agent_id || actorName).trim();
       const description = [
-        actor.actor_kind || actor.actor_role || "actor",
+        actor.agent_kind || actor.agent_role || "actor",
         actor.status || "unknown",
         actor.current_async_task_id || "",
       ].filter(Boolean).join(" · ");

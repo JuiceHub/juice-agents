@@ -1,4 +1,4 @@
-"""内置 general root Agent 的装配逻辑。"""
+"""Build the Registry-resolved root without materializing built-in declarations."""
 
 from __future__ import annotations
 
@@ -21,12 +21,6 @@ from juice_agents.core.agent.tools.builtin.memory.memory_tools import (
 from juice_agents.core.memory.config import get_memory_config
 from juice_agents.core.memory.prompt import build_memory_prompt_context
 from juice_agents.core.runner.workspace import RuntimeWorkspace, bind_workspace_to_agent_config
-
-from .configs import (
-    get_explore_config,
-    get_general_config,
-    get_general_subagent_config,
-)
 
 
 def _resolve_path(value: str | Path | None, default: Path) -> Path:
@@ -159,47 +153,6 @@ def _install_memory_capabilities(
     _refresh_prompt(agent)
 
 
-def _attach_builtin_subagents(
-    root_agent: Any,
-    *,
-    factory: AgentRegistry,
-    runtime_workspace: RuntimeWorkspace,
-    default_plan_base_dir: str | Path,
-    browser_enabled: bool,
-    image_enabled: bool,
-) -> Any:
-    child_configs = [
-        _prepare_config(
-            _without_browser_tools(
-                _with_image_generation_tool(
-                    get_general_subagent_config(lifecycle="functional"),
-                    image_enabled=image_enabled,
-                ),
-                browser_enabled=browser_enabled,
-            ),
-            runtime_workspace=runtime_workspace,
-            default_plan_base_dir=default_plan_base_dir,
-        ),
-        _prepare_config(
-            get_explore_config(lifecycle="functional"),
-            runtime_workspace=runtime_workspace,
-            default_plan_base_dir=default_plan_base_dir,
-        ),
-    ]
-    for config in child_configs:
-        factory.seed_config(config)
-    declared_names = set(
-        getattr(getattr(root_agent, "_declared_agent_config", None), "managed_agent_names", ())
-    )
-    root_agent._runtime_managed_agent_refs = {
-        name: {"agent_config_dir": str(factory.config_dir)}
-        for name in sorted(declared_names)
-        if (factory.config_dir / f"{name}.yaml").is_file()
-    }
-    _refresh_prompt(root_agent)
-    return root_agent
-
-
 def _build_create_kwargs(
     *,
     runtime_config_path: str | Path | None,
@@ -227,13 +180,11 @@ def build_general_agent(
     workspace_dir: str | Path | None = None,
     agent_type: str | None = None,
 ):
-    """Build the single ``general`` root using the requested agent protocol.
+    """Build ``root`` from the effective Registry declaration.
 
-    The persisted root and built-in child declarations intentionally keep
-    ``agent_type: default``.  When ``agent_type`` is omitted, ``AgentRegistry``
-    resolves that policy from the workspace.  A supplied protocol is a
-    transient SDK invocation override: it selects this root's ReAct/CodeAct
-    runtime without rewriting the user's durable Agent YAML.
+    Local ``root.yaml`` overrides the built-in root. Workspace paths, feature
+    switches and an explicit protocol apply only to the runtime copy, so
+    construction never writes portable root or child declarations.
     """
     runtime_workspace = _runtime_workspace(workspace_dir)
     default_plan_base_dir = runtime_workspace.writable_base_dir()
@@ -242,37 +193,13 @@ def build_general_agent(
         if runtime_workspace.enabled
         else None
     )
-    runtime_config = _prepare_config(
-        _with_image_generation_tool(
-            _without_browser_tools(
-                get_general_config(),
-                browser_enabled=_browser_tools_enabled(
-                    runtime_config_path=runtime_config_path,
-                    runtime_workspace=runtime_workspace,
-                ),
-            ),
-            image_enabled=_image_generation_enabled(
-                runtime_config_path=runtime_config_path,
-                runtime_workspace=runtime_workspace,
-            ),
-        ),
-        runtime_workspace=runtime_workspace,
-        default_plan_base_dir=default_plan_base_dir,
-    )
     factory = AgentRegistry(
         config_context=ConfigurationContext.from_workspace(
             runtime_workspace.workspace_dir,
             project_config_path=runtime_config_path,
         ),
-        config_dir=ConfigurationContext.from_workspace(
-            runtime_workspace.workspace_dir,
-            project_config_path=runtime_config_path,
-        ).agents_dir,
     )
-    subagent_factory = AgentRegistry(
-        config_context=factory.config_context,
-        config_dir=factory.config_context.agents_dir,
-    )
+    declared_config = factory.load_config("root")
     create_kwargs = _build_create_kwargs(
         runtime_config_path=runtime_config_path,
         model_name=model_name,
@@ -287,33 +214,24 @@ def build_general_agent(
         runtime_config_path=runtime_config_path,
         runtime_workspace=runtime_workspace,
     )
-    declared_config = (
-        factory.seed_config(runtime_config)
-        if runtime_workspace.enabled
-        else runtime_config
-    )
-    runtime_config = _with_image_generation_tool(
-        _without_browser_tools(declared_config, browser_enabled=browser_enabled),
-        image_enabled=image_enabled,
-    )
-    # Keep the workspace declaration portable (``agent_type: default``), while
-    # allowing public SDK callers such as a Showcase CLI to select a protocol
-    # for the currently created root.  ``copy_with`` creates an in-memory
-    # config only; the earlier ``seed_config`` write remains untouched.
-    runtime_root_config = runtime_config
-    if agent_type is not None:
-        runtime_root_config = runtime_config.copy_with(
-            agent_type=normalize_agent_type(agent_type)
-        )
-    root_agent = factory.instantiate(runtime_root_config, **create_kwargs)
-    root_agent = _attach_builtin_subagents(
-        root_agent,
-        factory=subagent_factory,
+    runtime_config = _prepare_config(
+        _with_image_generation_tool(
+            _without_browser_tools(declared_config, browser_enabled=browser_enabled),
+            image_enabled=image_enabled,
+        ),
         runtime_workspace=runtime_workspace,
         default_plan_base_dir=default_plan_base_dir,
-        browser_enabled=browser_enabled,
-        image_enabled=image_enabled,
     )
+    if agent_type is not None:
+        runtime_config = runtime_config.copy_with(
+            agent_type=normalize_agent_type(agent_type)
+        )
+    root_agent = factory.instantiate(runtime_config, **create_kwargs)
+    # Registry metadata must retain the portable declaration. Later management
+    # saves start from this value and must not persist transient bound paths or
+    # feature/protocol overrides from the runtime configuration above.
+    root_agent._declared_agent_config = AgentConfig.from_dict(declared_config)
+    root_agent._declared_tool_refs = tuple(declared_config.tools)
     _install_memory_capabilities(
         root_agent,
         workspace_dir=runtime_workspace.workspace_dir,

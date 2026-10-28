@@ -21,9 +21,6 @@ from juice_agents.core.agent.tools.builtin.agents.subagents_tools import AgentTo
 from juice_agents.core.agent.tools.runtime.base_tools import Tool
 from juice_agents.core.registry import AgentRegistry
 
-ROOT_DIR = Path(__file__).resolve().parents[4]
-
-
 class DummyModel:
     """Prompt-only model double kept local to the prompt contract tests."""
 
@@ -87,17 +84,18 @@ class _PromptGenerateImageTool(Tool):
 class PromptTests(unittest.TestCase):
     def setUp(self):
         self._skills_tmp = tempfile.TemporaryDirectory()
+        # 提示词契约只需要技能索引，不应依赖生产包中的示例技能。
+        local_skills_path = Path(self._skills_tmp.name) / ".juice" / "skills"
+        skill_file = local_skills_path / "test-skill" / "SKILL.md"
+        skill_file.parent.mkdir(parents=True)
+        skill_file.write_text(
+            "---\nname: test-skill\ndescription: Test skill prompt guidance.\n---\n"
+            "# Test skill\n\nRead the full instructions before applying this skill.\n",
+            encoding="utf-8",
+        )
         self.skill_prompt_kwargs = {
-            "skill_names": ["joke-expert"],
-            "skills_config_path": (
-                ROOT_DIR
-                / "sdk"
-                / "src"
-                / "juice_agents"
-                / "_assets"
-                / "config.example.yaml"
-            ),
-            "local_skills_path": Path(self._skills_tmp.name) / ".juice" / "skills",
+            "skill_names": ["test-skill"],
+            "local_skills_path": local_skills_path,
         }
 
     def tearDown(self):

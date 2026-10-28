@@ -54,10 +54,10 @@ test("GatewayClient exposes actor interaction RPC helpers", () => {
   const sourcePath = fileURLToPath(new URL("./client.ts", import.meta.url));
   const source = readFileSync(sourcePath, "utf-8");
 
-  assert.match(source, /sendActorMessage/);
-  assert.match(source, /send_actor_message/);
-  assert.match(source, /interruptActor/);
-  assert.match(source, /interrupt_actor/);
+  assert.match(source, /sendAgentMessage/);
+  assert.match(source, /send_agent_message/);
+  assert.match(source, /interruptAgent/);
+  assert.match(source, /interrupt_agent/);
 });
 
 test("streamMessage uses the same RPC id for the request and its handlers", async () => {

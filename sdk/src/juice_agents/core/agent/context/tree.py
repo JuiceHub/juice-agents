@@ -131,6 +131,23 @@ class ContextTree:
         node_ids = self.get_path_to_node(node_id)
         return [self.nodes[nid] for nid in node_ids]
 
+    def get_context_node_ids(self, node_id: str) -> List[str]:
+        """Return the selected ancestry visible to the next model request.
+
+        Compact summaries retain their original ancestors for inspection but
+        replace those ancestors in model context.  The marker lives on the
+        summary node, so later appends and serialization preserve this view
+        without freezing a completed ``ExplorationPath`` snapshot.
+        """
+        return self._project_context_node_ids(self.get_path_to_node(node_id))
+
+    def _project_context_node_ids(self, node_ids: List[str]) -> List[str]:
+        start = 0
+        for index, node_id in enumerate(node_ids):
+            if self.nodes[node_id].annotations.get("context_reset"):
+                start = index
+        return node_ids[start:]
+
     def get_children(self, node_id: str) -> List[ContextNode]:
         """获取节点的所有子节点"""
         node = self.get_node(node_id)
@@ -245,7 +262,7 @@ class ContextTree:
             messages.append({"role": "system", "content": self.system_prompt})
 
         # 2. 路径上的所有 steps
-        path_nodes = self.get_path_nodes(node_id)
+        path_nodes = [self.nodes[nid] for nid in self.get_context_node_ids(node_id)]
         for node in path_nodes:
             step_messages = node.step.to_messages(
                 include_reasoning_in_context=self.include_reasoning_in_context
@@ -284,7 +301,10 @@ class ContextTree:
 
     def to_linear_steps(self, path_id: Optional[str] = None) -> List[Any]:
         """转换为线性 steps 列表（向后兼容）"""
-        target_path_id = path_id or self.selected_path_id
+        # An explicit historical path is an inspection request.  Ordinary
+        # reads always follow the live selected leaf, including actions/tasks
+        # appended after compression or after a completed previous round.
+        target_path_id = path_id
 
         if target_path_id:
             path = next(
@@ -292,12 +312,16 @@ class ContextTree:
                 None
             )
             if path:
-                return [self.nodes[nid].step for nid in path.node_ids]
+                return [self.nodes[nid].step for nid in self._project_context_node_ids(path.node_ids)]
+
+        if not path_id and self.active_leaf_ids:
+            node_ids = self.get_context_node_ids(self.active_leaf_ids[0])
+            return [self.nodes[nid].step for nid in node_ids]
 
         # 如果没有指定路径，使用最优路径
         best_path = self.get_best_path()
         if best_path:
-            return [self.nodes[nid].step for nid in best_path.node_ids]
+            return [self.nodes[nid].step for nid in self._project_context_node_ids(best_path.node_ids)]
 
         # 如果没有完整路径，使用根节点到某个活跃叶子
         if self.active_leaf_ids:

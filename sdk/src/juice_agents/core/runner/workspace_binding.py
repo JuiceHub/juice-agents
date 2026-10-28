@@ -1,7 +1,7 @@
 """Workspace 绑定逻辑（纯函数）。
 
-将 workspace 约束注入到 agent config，实现文件工具的 root_dir 限制、
-shell 工具的 default_workdir、以及 todos/plan 工具的路径绑定。
+保留声明规范化入口；路径只在 ToolRegistry 创建运行时实例时绑定。
+这样可移植声明不会混入当前机器的 workspace 绝对路径。
 """
 
 from __future__ import annotations
@@ -10,16 +10,8 @@ from pathlib import Path
 from typing import Any
 
 from juice_agents.core.registry.agents.types import AgentConfig
-from juice_agents.core.registry.tools.types import ToolRef
+from juice_agents.core.registry.tools.registry import FILE_TOOL_NAMES
 from juice_agents.core.runner.workspace import RuntimeWorkspace
-
-FILE_TOOL_NAMES = {
-    "read",
-    "write",
-    "edit",
-    "glob",
-    "grep",
-}
 
 
 def bind_workspace_to_agent_config(
@@ -29,12 +21,9 @@ def bind_workspace_to_agent_config(
     default_plan_base_dir: str | Path,
 ) -> dict[str, Any]:
     """
-    将 workspace 约束注入到 agent config（纯函数）。
+    规范化声明，工作区路径通过 Registry 的 ConfigurationContext 绑定。
 
-    规则：
-    - 文件工具补 `root_dir`
-    - shell 工具补 `default_workdir`
-    - `todos` / `plan` 落到 workspace 下的 `.juice/todos|plans`
+    历史参数保留给现有组合入口使用；本函数不再复制工具路径推导逻辑。
     """
 
     normalized = AgentConfig.from_dict(agent_config).to_dict()
@@ -45,35 +34,6 @@ def bind_workspace_to_agent_config(
     if not normalized.get("additional_authorized_imports"):
         normalized.pop("additional_authorized_imports", None)
 
-    if not runtime_workspace.enabled:
-        return normalized
-
-    agent_name = str(normalized.get("name") or "").strip()
-    rebound_tools: list[dict[str, Any]] = []
-    for idx, raw_tool in enumerate(list(normalized.get("tools") or [])):
-        tool_ref = ToolRef.from_raw(raw_tool, field_name=f"tools[{idx}]")
-        params = dict(tool_ref.params)
-        if tool_ref.name in FILE_TOOL_NAMES:
-            params["root_dir"] = str(runtime_workspace.workspace_dir)
-        if tool_ref.name == "shell":
-            params["default_workdir"] = str(runtime_workspace.workspace_dir)
-        if tool_ref.name == "todos" and agent_name:
-            params["file_path"] = str(
-                runtime_workspace.todos_file(
-                    agent_name,
-                    default_base_dir=default_plan_base_dir,
-                )
-            )
-        if tool_ref.name == "plan" and agent_name:
-            params["file_path"] = str(
-                runtime_workspace.plan_file(
-                    agent_name,
-                    default_base_dir=default_plan_base_dir,
-                )
-            )
-        rebound_tools.append({"name": tool_ref.name, "params": params})
-
-    normalized["tools"] = rebound_tools
     return normalized
 
 

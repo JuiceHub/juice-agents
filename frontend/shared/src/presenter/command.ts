@@ -13,7 +13,6 @@ import type {
   CronTask,
   CronTaskDeleteResponse,
   CronTaskListResponse,
-  ModeResourcesResponse,
   DreamRunResponse,
   GoalSummary,
   MemorySearchResponse,
@@ -57,20 +56,20 @@ export function presentCommandHelp(commands?: { label: string; description?: str
     { label: "/help" },
     { label: "/status" },
     { label: "/mode [agent|plan|team|group]" },
-    { label: "/resources [agent|team|group]" },
     { label: "/team <task>" },
     { label: "/group <task>" },
     { label: "/agent-type [react|codeact]" },
     { label: "/models" },
     { label: "/model [model_name] [effort]" },
-    { label: "/strategy [breadth=N] [depth=N] [beam_width=N]" },
+    { label: "/rm [model_name|reset]" },
+    { label: "/strategy [breadth=N|reset]" },
     { label: "/config" },
     { label: "/agents [name]" },
     { label: "/teams [name]" },
     { label: "/memory [status|search|view] [query|path]" },
     { label: "/dream" },
     { label: "/goal [pause|resume|clear|objective]" },
-    { label: "/worktree [enter|exit|list|status] [name]" },
+    { label: "/worktree [enter|exit|list|status] [name] (reserved; use juice --workspace <existing-worktree>)" },
     { label: "/loop <interval> <prompt>" },
     { label: "/loop [list|delete|status]" },
     { label: "/cron [list|delete|status]" },
@@ -331,6 +330,7 @@ export function presentAvailableAgents(payload: AvailableAgentsResponse): Messag
   const display = table(
     [
       ["agent", "AGENT"],
+      ["source", "SOURCE"],
       ["type", "TYPE"],
       ["modes", "MODES"],
       ["tools", "TOOLS"],
@@ -338,6 +338,7 @@ export function presentAvailableAgents(payload: AvailableAgentsResponse): Messag
     ],
     agents.map((agent) => ({
       agent: agent.name,
+      source: agent.source,
       type: String(agent.config?.agent_type || "default"),
       modes: agent.allowed_modes?.join(", ") || "all",
       tools: truncateOneLine(
@@ -361,11 +362,13 @@ export function presentTeams(payload: TeamsListResponse): MessageBlock {
   const display = table(
     [
       ["team", "TEAM"],
+      ["source", "SOURCE"],
       ["members", "MEMBERS"],
       ["description", "DESCRIPTION"],
     ],
     teams.map((team) => ({
       team: team.team_name,
+      source: team.source,
       members: team.member_names.join(", "),
       description: truncateOneLine(team.description, 80),
     })),
@@ -377,39 +380,13 @@ export function presentTeams(payload: TeamsListResponse): MessageBlock {
 export function presentTeamManifest(manifest: TeamManifest): MessageBlock {
   const display = kv([
     ["team_name", manifest.team_name],
+    ["source", manifest.source],
+    ["manifest_path", manifest.manifest_path || ""],
     ["schema_version", String(manifest.schema_version)],
     ["description", manifest.description],
     ["member_names", manifest.member_names.join(", ")],
   ]);
   return { kind: "system", title: `Team ${manifest.team_name}`, text: formatDisplayAsText(display), display };
-}
-
-export function presentModeResources(payload: ModeResourcesResponse | Record<string, any>): MessageBlock {
-  const resources = (payload.resources || []) as Array<Record<string, any>>;
-  if (resources.length === 0) {
-    return { kind: "system", title: "Mode Resources", text: "No mode resources found." };
-  }
-  const display = table(
-    [
-      ["mode_id", "MODE ID"],
-      ["role", "ROLE"],
-      ["name", "NAME"],
-      ["source", "SOURCE"],
-      ["status", "STATUS"],
-      ["path", "PATH"],
-      ["description", "DESCRIPTION"],
-    ],
-    resources.map((resource) => ({
-      mode_id: String(resource.mode_id || ""),
-      role: String(resource.role || ""),
-      name: String(resource.name || ""),
-      source: String(resource.source || ""),
-      status: String(resource.status || ""),
-      path: String(resource.path || ""),
-      description: truncateOneLine(String(resource.description || ""), 72),
-    })),
-  );
-  return { kind: "system", title: "Mode Resources", text: formatDisplayAsText(display), display };
 }
 
 export function presentSkillView(payload: SkillViewResponse | Record<string, any>): MessageBlock {

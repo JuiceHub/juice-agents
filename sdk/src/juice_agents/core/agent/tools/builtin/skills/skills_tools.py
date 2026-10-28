@@ -13,7 +13,9 @@ from pathlib import Path
 from typing import Any
 
 from juice_agents.core.config.runtime_config import DEFAULT_RUNTIME_CONFIG_PATH
+from juice_agents.core.config.context import ConfigurationContext
 from juice_agents.core.registry.skills import SkillRegistry
+from juice_agents.core.registry.skills.registry import _workspace_dir_from_local_dir
 
 from ...runtime.base_tools import CONTENT_OBSERVATION_CHARS, LIST_OBSERVATION_CHARS, Tool
 from ...runtime.owner_context import resolve_owner_context
@@ -35,10 +37,12 @@ class SkillToolBase(Tool):
         allow_names: list[str] | None = None,
         deny_names: list[str] | None = None,
         platform: str = "cli",
+        config_context: ConfigurationContext | None = None,
         **_: Any,
     ) -> None:
         super().__init__()
         self.owner_agent = owner_agent
+        self.config_context = config_context
         self.local_dir = None if local_dir is None else Path(local_dir)
         self.builtin_dir = None if builtin_dir is None else Path(builtin_dir)
         self.external_dirs = list(external_dirs or [])
@@ -65,13 +69,27 @@ class SkillToolBase(Tool):
             else []
         )
         local_dir = self._runtime_local_dir()
-        workspace = None if local_dir is None else local_dir.parent.parent
+        context = self.config_context
+        if context is None:
+            # Detached tools can infer a project only from the canonical
+            # <project>/.juice/skills shape. An owner always wins over storage.
+            if self.owner_agent is None and self.local_dir is not None:
+                context = ConfigurationContext.from_workspace(
+                    _workspace_dir_from_local_dir(self.local_dir),
+                    project_config_path=self.config_path,
+                )
+            else:
+                context = resolve_owner_context(self.owner_agent, explicit_workspace_dir=None)
+        # Explicit custom Skill storage never changes the project root. The
+        # same context controls config, credentials, Plugins and external roots.
+        workspace = context.workspace_dir
         return SkillRegistry(
             local_dir=local_dir,
             builtin_dir=self.builtin_dir,
             external_dirs=self.external_dirs,
             config_path=self.config_path,
             workspace_dir=workspace,
+            config_context=context,
             platform=self.platform,
             allow_names=self.allow_names,
             deny_names=deny_names,

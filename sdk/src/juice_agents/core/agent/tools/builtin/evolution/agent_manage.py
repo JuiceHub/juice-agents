@@ -19,7 +19,6 @@ from juice_agents.core.registry.agents.types import (
     DEFAULT_MODEL_CONFIG_NAME,
     AgentConfig,
 )
-from juice_agents.core.registry.common import normalize_name
 from juice_agents.core.registry.skills.registry import SkillRegistry
 
 from ..agents.agents_tools import AgentConfigToolBase, AgentTarget
@@ -32,7 +31,8 @@ class AgentManageTool(AgentConfigToolBase):
     # 与同一 step 内的其他动作串行，避免并发写 .juice/agents。
     description = (
         "校验或保存 Agent YAML，或仅卸载 managed-agent 引用；"
-        "save 强制复用 validate 校验，能力在目标 Agent 下一 step 生效。"
+        "save 强制复用 validate 校验，目标配置在 fresh acquire 生效；"
+        "当前 root 动态发现可调用子 Agent，名单与描述在下一 step 更新。"
     )
     inputs = {
         "action": {"type": "string", "description": "validate/save/unload"},
@@ -69,18 +69,11 @@ class AgentManageTool(AgentConfigToolBase):
                 skills.get(skill_name, include_disabled=True, ignore_global_enabled=True)
 
         if candidate.managed_agent_names:
-            child_dir = target.directory
             for managed_name in candidate.managed_agent_names:
-                managed_path = child_dir / f"{normalize_name(managed_name)}.yaml"
-                builtin_target = AgentTarget(
-                    name=managed_name,
-                    mode_id=target.mode_id,
-                    role="member",
-                    target_scope="authorized",
-                    directory=child_dir,
-                )
-                if not managed_path.is_file() and self._builtin_config(builtin_target) is None:
-                    raise ValueError(f"未知 managed Agent 引用: {managed_name}")
+                try:
+                    registry.load_config(managed_name)
+                except FileNotFoundError as exc:
+                    raise ValueError(f"未知 managed Agent 引用: {managed_name}") from exc
 
         model_names = self._context().get_mapping("models")
         configured_model = str(candidate.model_config_name or DEFAULT_MODEL_CONFIG_NAME).strip()
@@ -226,11 +219,12 @@ class AgentManageTool(AgentConfigToolBase):
                 target.path,
                 runtime_refresh["status"],
             )
+            saved_path = self._registry(target).config_path(target.name)
             return {
                 "result": {
                     "action": "unload",
                     "name": target.name,
-                    "path": str(target.path) if target.path.is_file() else None,
+                    "path": None if saved_path is None else str(saved_path),
                     **self._target_metadata(target),
                     "runtime_refresh": runtime_refresh,
                 }

@@ -17,7 +17,9 @@ Team root 的 `agents_list` 会列出符合成员资格的共享 Agent。Team �
 
 任务的 `eligible_members` 是一组固定的当前成员；root 创建任务时会把 `"all"` 展开为成员清单。依赖完成后，符合资格的成员可以领取任务，成功领取者会记录在 `claimed_by`。成员执行失败时，任务保留 `in_progress` 并记录错误，等待 root 审核。状态变化发出 `team_update`；`team_finish` 会释放成员 session。`team_member_stop_request` 向 root 发送结构化请求；普通消息不会停止成员，由 root 决定是否结束。
 
-`/teams [name]` 可以读取声明，不会启动 Runner。
+`/teams [name]` 读取声明，不启动 Runner，也不创建 `.juice`。本地 manifest 优先于内置空 `default` Team；内置来源的 `manifest_path` 为 `null`。首次成功修改才保存完整 manifest，删除本地覆盖恢复内置，纯内置 Team 不允许删除。
+
+共享成员经 AgentRegistry 按本地优先、内置兜底解析；私有成员仅从 `.juice/teams/<name>/members/` 读取。首次添加成员失败会清理暂存的私有文件。删除被引用的 Agent 覆盖前，回退定义必须仍满足 Team 模式和持久生命周期约束。
 
 ## 开发约定
 

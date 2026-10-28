@@ -64,7 +64,7 @@ def test_web_team_config_defaults_to_empty_members() -> None:
 def test_web_team_config_preserves_shared_member_source() -> None:
     with TemporaryDirectory() as workspace:
         AgentRegistry(config_context=ConfigurationContext.from_workspace(workspace)).save_config(
-            {"name": "reviewer", "agent_type": "react", "max_steps": 3, "tools": []}
+            {"name": "reviewer", "agent_type": "react", "max_steps": 3, "tools": [], "lifecycle": "persistent"}
         )
         client = TestClient(create_app(), base_url="http://localhost")
         created = client.post("/api/teams/configs", json={

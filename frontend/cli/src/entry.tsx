@@ -14,10 +14,7 @@ import { createMouseAwareStdin, DISABLE_MOUSE_TRACKING } from "./lib/mouseAwareS
 async function main() {
   // Parse command line arguments
   const args = process.argv.slice(2);
-  const baseDir = resolveWorkspaceDir({
-    env: process.env,
-    cwd: process.cwd(),
-  });
+  let workspace: string | undefined;
   let permissionMode: string | undefined;
   let agentMode: string | undefined;
   let agentType: string | undefined;
@@ -26,7 +23,15 @@ async function main() {
 
   // Simple argument parsing
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === "--mode" && i + 1 < args.length) {
+    if (args[i] === "--workspace") {
+      if (!args[i + 1] || args[i + 1].startsWith("--")) {
+        throw new Error("--workspace requires a directory");
+      }
+      workspace = args[++i];
+    } else if (args[i].startsWith("--workspace=")) {
+      workspace = args[i].slice("--workspace=".length);
+      if (!workspace) throw new Error("--workspace requires a directory");
+    } else if (args[i] === "--mode" && i + 1 < args.length) {
       // --mode 与 /mode 对应，只表示执行模式；审批策略走 --permissions。
       agentMode = args[i + 1];
       i++;
@@ -54,11 +59,12 @@ Usage:
   juice [options]
 
 Options:
+  --workspace <dir>       Use a project directory (default: JUICE_WORKSPACE_DIR or cwd)
   --mode <mode>           Set agent mode (agent, plan, team, group)
   --permissions <mode>    Set permission mode (default, accept)
   --agent-type <type>     Set agent type (react, codeact)
   --resume <runner_id>    Resume an existing session
-  --worktree [name]       Start in a managed git worktree
+  --worktree [name]       Reserved; use an existing git worktree as --workspace
   --help, -h              Show this help message
 
 Examples:
@@ -66,14 +72,18 @@ Examples:
   juice --mode team
   juice --permissions accept --agent-type codeact
   juice --resume abc123
-  juice --worktree feature-x
+  juice --workspace /path/to/existing-worktree
       `);
       process.exit(0);
     }
   }
 
-  // Create and start gateway client
-  const client = new GatewayClient();
+  if (worktree !== undefined) {
+    throw new Error("Managed worktrees are not implemented. Create one with git worktree add, then run juice --workspace <directory>.");
+  }
+  const baseDir = resolveWorkspaceDir({ env: process.env, cwd: process.cwd(), workspace, validate: true });
+  // The gateway must inherit the project cwd even when the framework is elsewhere.
+  const client = new GatewayClient(process.env.JUICE_PYTHON_PATH || "python", baseDir);
 
   // 包装 stdin：过滤 SGR mouse 序列（不让 mouse 字节泄漏到 ink useInput）
   // 非 TTY 时跳过（CI / 管道），emitter 为 null，App 退化为仅键盘滚动。

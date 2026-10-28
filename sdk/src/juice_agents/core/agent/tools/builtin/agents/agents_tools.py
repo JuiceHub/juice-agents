@@ -16,7 +16,6 @@ import logging
 from pathlib import Path
 from typing import Any, Literal
 
-from juice_agents.core.agent.builtin.configs import build_builtin_agent_config
 from juice_agents.core.config.context import ConfigurationContext
 from juice_agents.core.registry.agents.registry import AgentRegistry
 from juice_agents.core.registry.agents.types import AgentConfig
@@ -142,7 +141,13 @@ class AgentConfigToolBase(Tool):
         # the trusted global Registry projection of a live Runner Agent.
         if not identity.has_runner and self.agent_config_dir is not None:
             return self.agent_config_dir
-        del scope
+        if scope == "self" and identity.has_runner:
+            # Manager-bound declaration metadata preserves Team-private self
+            # edits. Its Registry is disk-only and cannot resolve a same-name
+            # global built-in when the private member file is missing.
+            declared_dir = getattr(self.owner_agent, "_declared_agent_config_dir", None)
+            if declared_dir is not None:
+                return Path(declared_dir)
         return self._context().agents_dir
 
     def _can_manage_authorized(self, identity: AgentIdentity) -> bool:
@@ -154,9 +159,9 @@ class AgentConfigToolBase(Tool):
         if not identity.has_runner:
             return None
         if identity.is_root:
-            # Root has no Registry declaration of its own.  Its effective
-            # call set is Runner-owned (Plan policy / selected Team / mode
-            # filtering) and must be shared with `/agents` and dispatch.
+            # Root's effective child-Agent availability is Runner-owned
+            # (Plan policy / selected Team / mode filtering), independently
+            # of its persisted declaration. Listing and dispatch share it.
             runner = self._runner()
             available = getattr(runner, "list_available_agents", None)
             if callable(available):
@@ -229,15 +234,10 @@ class AgentConfigToolBase(Tool):
             directory=self._scope_dir(identity, scope),
         )
 
-    def _builtin_config(self, target: AgentTarget) -> dict[str, Any] | None:
-        template_by_name = {"explore": "explore", "plan": "plan"}
-        if target.name == "general":
-            template = "general" if target.target_scope == "self" and target.role == "root" else "general_subagent"
-        else:
-            template = template_by_name.get(target.name)
-        if template is None:
-            return None
-        return build_builtin_agent_config(template).to_dict()
+    def _registry(self, target: AgentTarget) -> AgentRegistry:
+        """Use the same effective declaration/source resolver for read and write."""
+
+        return AgentRegistry(config_context=self._context(), config_dir=target.directory)
 
     @staticmethod
     def _target_metadata(target: AgentTarget) -> dict[str, Any]:
@@ -249,44 +249,38 @@ class AgentConfigToolBase(Tool):
         }
 
     def _view_target(self, target: AgentTarget) -> dict[str, Any]:
-        path = target.path
-        if path.is_file():
-            config = AgentRegistry(config_context=self._context(), config_dir=target.directory).load_config(target.name)
-            return {
-                "name": config.name,
-                "source": "workspace",
-                "path": str(path),
-                **self._target_metadata(target),
-                "config": config.to_dict(),
-            }
-        builtin = self._builtin_config(target)
-        if builtin is None:
-            raise FileNotFoundError(f"Agent 配置不存在: {target.name}")
+        registry = self._registry(target)
+        config = registry.load_config(target.name)
+        path = registry.config_path(target.name)
         return {
-            "name": str(builtin["name"]),
-            "source": "builtin",
-            "path": None,
+            "name": config.name,
+            "source": registry.get_source(target.name),
+            "path": None if path is None else str(path),
             **self._target_metadata(target),
-            "config": builtin,
+            "config": config.to_dict(),
         }
 
     def _visible_targets(self) -> list[AgentTarget]:
         identity = self._identity()
         targets: list[AgentTarget] = []
         self_target = self._resolve_target(identity.config_name, "self")
-        if self_target.path.is_file():
+        if self._registry(self_target).get_source(self_target.name) is not None:
             targets.append(self_target)
         if self._can_manage_authorized(identity):
             authorized_dir = self._scope_dir(identity, "authorized")
             authorized_names = self._authorized_names(identity)
             names = (
-                sorted(path.stem for path in authorized_dir.glob("*.yaml"))
+                AgentRegistry(
+                    config_context=self._context(), config_dir=authorized_dir
+                ).list_configs()
                 if authorized_names is None
                 else sorted(authorized_names)
             )
             for name in names:
+                if name == identity.config_name and authorized_dir == self_target.directory:
+                    continue
                 target = self._resolve_target(name, "authorized")
-                if target.path.is_file():
+                if self._registry(target).get_source(target.name) is not None:
                     targets.append(target)
         return targets
 
@@ -297,7 +291,7 @@ class AgentsListTool(AgentConfigToolBase):
     max_observation_chars = LIST_OBSERVATION_CHARS
     name = "agents_list"
     is_read_only = True
-    description = "列出当前 Agent 有权查看的静态 Agent YAML 配置。"
+    description = "列出当前 Agent 有权查看的有效声明及本地/内置来源。"
     inputs: dict[str, dict[str, Any]] = {}
     outputs = {"agents": {"type": "list", "description": "带作用域身份的 Agent 配置摘要"}}
 
@@ -307,8 +301,8 @@ class AgentsListTool(AgentConfigToolBase):
             viewed = self._view_target(target)
             agents.append({
                 "name": viewed["name"],
-                "source": "workspace",
-                "path": str(target.path),
+                "source": viewed["source"],
+                "path": viewed["path"],
                 **self._target_metadata(target),
             })
         return {"agents": agents}

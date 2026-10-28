@@ -30,7 +30,7 @@
 
 ## Configuration
 
-Defaults come from the SDK's `config.example.yaml`; workspace overrides are stored in `.juice/config.yaml`. Configuration commands modify only the workspace override file.
+Defaults come from the SDK's `core/config/defaults.yaml`; workspace overrides are stored in `.juice/config.yaml`. Configuration commands modify only the workspace override file.
 
 ```yaml
 memory:

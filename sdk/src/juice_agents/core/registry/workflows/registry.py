@@ -284,7 +284,11 @@ class WorkflowRegistry:
                 if normalized == "create" and path.exists() and not overwrite:
                     raise FileExistsError(f"local workflow 已存在: {path}")
                 if normalized == "edit" and not path.exists():
-                    raise FileNotFoundError(f"local workflow 不存在: {path}")
+                    # 编辑针对 Registry 的有效定义：首次编辑内置脚本时，只把通过
+                    # local 校验的完整源码保存为覆盖，不向只读包目录写入任何内容。
+                    # 无本地文件时先查内置存在性，避免 edit 意外变成 create；
+                    # 已有本地文件即使内容损坏，也应允许用户通过 edit 修复。
+                    self.get_metadata(name)
                 source = str(content or "")
                 meta = validate_workflow_source(source, path=path, local=True)
                 if meta.name != _normalize_name(name):

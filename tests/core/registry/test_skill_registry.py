@@ -72,6 +72,54 @@ class SkillRegistryTests(unittest.TestCase):
             config_path=self.config,
         )
 
+    def test_default_registry_has_no_bundled_demo_skills(self):
+        registry = SkillRegistry(local_dir=self.local, config_path=self.config)
+
+        self.assertIsNone(registry.builtin_dir)
+        self.assertEqual(registry.list(), [])
+        # 再次读取会走缓存新鲜度检查；未配置 builtin 时也应正常返回。
+        self.assertEqual(registry.list(), [])
+        self.assertEqual(registry.config_status()["skills"], [])
+        self.assertEqual(registry.category_descriptions(), {})
+        with self.assertRaises(FileNotFoundError):
+            registry.get("joke-expert")
+
+    def test_registry_without_builtin_discovers_local_and_external_skills(self):
+        external_file = self.external / "examples" / "external-skill" / "SKILL.md"
+        write_skill(external_file, "external-skill", "external desc")
+        write_skill(self.external / "shared" / "SKILL.md", "shared", "external shared")
+        write_skill(self.local / "shared" / "SKILL.md", "shared", "local shared")
+        (self.external / "examples" / "DESCRIPTION.md").write_text(
+            "# Examples\n\nExternal category skills.", encoding="utf-8",
+        )
+        registry = SkillRegistry(local_dir=self.local, config_path=self.config)
+
+        self.assertEqual({skill.name for skill in registry.list()}, {"shared", "external-skill"})
+        self.assertEqual(registry.get("shared").description, "local shared")
+        self.assertEqual(registry.get(str(external_file)).source, "external")
+        self.assertEqual(registry.instantiate("external-skill").source, "external")
+        self.assertEqual(registry.category_descriptions(), {"examples": "External category skills."})
+        self.assertEqual(registry.config_status()["count"], 2)
+
+    def test_edit_external_skill_without_builtin_copies_complete_directory(self):
+        source_file = self.external / "external-skill" / "SKILL.md"
+        write_skill(source_file, "external-skill", "external desc")
+        original = source_file.read_text(encoding="utf-8")
+        (source_file.parent / "references").mkdir()
+        (source_file.parent / "references" / "api.md").write_text("api", encoding="utf-8")
+        registry = SkillRegistry(local_dir=self.local, config_path=self.config)
+
+        result = registry.edit(name="external-skill", content=original.replace("external desc", "local desc"))
+
+        self.assertEqual(result["copied_from"], str(source_file.parent))
+        self.assertEqual(source_file.read_text(encoding="utf-8"), original)
+        self.assertEqual(registry.get("external-skill").source, "local")
+        self.assertEqual(registry.get("external-skill").description, "local desc")
+        self.assertEqual(
+            (self.local / "external-skill" / "references" / "api.md").read_text(encoding="utf-8"),
+            "api",
+        )
+
     def test_scans_local_builtin_and_external_with_precedence(self):
         write_skill(self.external / "external-skill" / "SKILL.md", "external-skill", "external desc")
         write_skill(self.builtin / "examples" / "shared" / "SKILL.md", "shared", "builtin desc")

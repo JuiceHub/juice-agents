@@ -26,7 +26,13 @@ class WebGatewayTests(unittest.TestCase):
             listed = client.get("/api/teams/configs", params={"base_dir": tmpdir})
 
             self.assertEqual(listed.status_code, 200)
-            self.assertEqual(listed.json(), {"teams": []})
+            default = next(team for team in listed.json()["teams"] if team["team_name"] == "default")
+            self.assertEqual(default["source"], "builtin")
+            self.assertIsNone(default["manifest_path"])
+            fetched = client.get("/api/teams/configs/default", params={"base_dir": tmpdir})
+            self.assertEqual(fetched.status_code, 200)
+            self.assertEqual(fetched.json()["source"], "builtin")
+            self.assertIsNone(fetched.json()["manifest_path"])
             self.assertFalse((Path(tmpdir) / ".juice").exists())
 
     def test_websocket_team_queries_are_cold_and_do_not_create_runtime(self) -> None:
@@ -37,13 +43,20 @@ class WebGatewayTests(unittest.TestCase):
             listed = connection._handle_sync_command(
                 "list_team_configs", {"base_dir": tmpdir}
             )
-            with self.assertRaises(FileNotFoundError):
-                connection._handle_sync_command(
-                    "get_team_config", {"base_dir": tmpdir, "team_name": "default"}
-                )
-
-            self.assertEqual(listed, {"teams": []})
+            manifest = connection._handle_sync_command(
+                "get_team_config", {"base_dir": tmpdir, "team_name": "default"}
+            )
+            self.assertEqual(manifest["source"], "builtin")
+            self.assertIsNone(manifest["manifest_path"])
+            self.assertEqual(listed["teams"][0]["source"], "builtin")
             self.assertIsNone(connection.runtime)
+            self.assertFalse((Path(tmpdir) / ".juice").exists())
+
+    def test_websocket_rejects_retired_mode_resource_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            connection = WebSocketRuntimeConnection(websocket=MagicMock())
+            with self.assertRaisesRegex(ValueError, "unknown websocket command: list_mode_resources"):
+                connection._handle_sync_command("list_mode_resources", {"base_dir": tmpdir})
             self.assertFalse((Path(tmpdir) / ".juice").exists())
 
     def test_team_routes_store_only_global_agent_name_references(self) -> None:
@@ -61,6 +74,8 @@ class WebGatewayTests(unittest.TestCase):
                         "agent_type": "react",
                         "max_steps": 3,
                         "tools": [],
+                        "lifecycle": "persistent",
+                        "allowed_modes": ["team"],
                     }
                 )
             client = TestClient(create_app(), base_url="http://localhost")

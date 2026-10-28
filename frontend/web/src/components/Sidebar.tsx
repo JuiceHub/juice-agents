@@ -1,7 +1,7 @@
 import React from "react";
 import { Archive, ArrowLeft, Bot, Folder, GitBranch, Search, Settings, Sparkles, SquarePen } from "lucide-react";
 import type {
-  ActorSessionsReport,
+  ActiveAgentsReport,
   SessionSummary,
 } from "@juice-agents/shared/gateway/types";
 import { LEFT_NAV_ACTIONS, buildSubactorNavItems, projectRunnerLabel } from "../lib/layout.js";
@@ -12,7 +12,7 @@ interface SidebarProps {
   sessions: SessionSummary[];
   activeRunnerId: string;
   activeActorName: string | null;
-  actorSessionsReport: ActorSessionsReport | null;
+  actorSessionsReport: ActiveAgentsReport | null;
   activeView: AppView;
   onNewRunner: () => void;
   onSelectView: (view: MainView) => void;

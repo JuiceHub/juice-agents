@@ -139,7 +139,10 @@ class ShellTool(Tool):
             run_timeout = None  # 后台任务默认无限 timeout
         else:
             run_timeout = self.default_timeout
-        cwd = Path(workdir).expanduser().resolve() if workdir else self.default_workdir
+        cwd = self.default_workdir
+        if workdir:
+            requested = Path(workdir).expanduser()
+            cwd = ((self.default_workdir or Path.cwd()) / requested).resolve()
         if cwd and not cwd.exists():
             raise ValueError(f"指定的工作目录不存在: {cwd}")
         if cwd and not cwd.is_dir():
@@ -256,9 +259,11 @@ class PythonTool(Tool):
         blocked_imports: list[str] | None = None,
         blocked_call_prefixes: list[str] | None = None,
         blocked_shell_patterns: list[str] | list[tuple[str, str]] | None = None,
+        workspace_dir: str | Path | None = None,
     ) -> None:
         super().__init__()
         self.additional_authorized_imports = additional_authorized_imports or []
+        self.workspace_dir = None if workspace_dir is None else Path(workspace_dir).expanduser().resolve()
         self._base_variables = dict(initial_variables or {})
         self.blocked_imports = list(blocked_imports or DEFAULT_BLOCKED_PYTHON_IMPORTS)
         self.blocked_call_prefixes = list(blocked_call_prefixes or DEFAULT_BLOCKED_PYTHON_CALL_PREFIXES)
@@ -274,6 +279,7 @@ class PythonTool(Tool):
             blocked_imports=self.blocked_imports,
             blocked_call_prefixes=self.blocked_call_prefixes,
             blocked_shell_patterns=self.blocked_shell_patterns,
+            workspace_dir=self.workspace_dir,
         )
         self.executor.send_tools({})
         if self._base_variables:

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import threading
+from copy import deepcopy
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -15,7 +17,7 @@ from juice_agents.core.agent.manager import (
     AgentManagerCallbacks,
     AgentStatus,
 )
-from juice_agents.core.agent.context import ActionStep, ContextTree, TaskStep
+from juice_agents.core.agent.context import ActionStep, ContextTree, TaskStep, serialize_context_tree
 
 
 class _ScriptedAgent:
@@ -92,6 +94,63 @@ def test_root_is_lazily_acquired_fresh_and_restores_session(tmp_path: Path) -> N
     assert resumed.instance is not registry.instances[0]
     assert [step.task for step in resumed.context.steps if isinstance(step, TaskStep)] == ["first request"]
     assert resumed.status is AgentStatus.READY
+
+
+@pytest.mark.parametrize("entry", ["tree", "mapping", "snapshot"])
+def test_restored_sessions_own_nested_outputs_and_metadata(tmp_path: Path, entry: str) -> None:
+    """Restoring or inheriting a session must not let either owner edit the other."""
+
+    source = ContextTree(tree_id="original", system_prompt="system")
+    source.append_step(TaskStep(task="first", attachments=[{"metadata": {"items": ["task"]}}]))
+    source.append_step(ActionStep(
+        step_num=1,
+        model_output="completed",
+        output={"items": ["output"]},
+        tool_calls=[{"name": "lookup", "args": {"items": ["argument"]}}],
+        attachments=[{"metadata": {"items": ["action"]}}],
+        usage={"provider_usage": {"items": ["usage"]}},
+    ))
+    leaf = source.get_active_leaves()[0]
+    leaf.generation_params = {"sampling": {"items": ["generation"]}}
+    leaf.annotations = {"review": {"items": ["annotation"]}}
+    path = source.create_path_from_node(leaf.node_id)
+    path.metadata = {"items": ["path"]}
+    source.all_paths.append(path)
+    source.task_metadata = {"items": ["task metadata"]}
+    source.stats["details"] = {"items": ["statistics"]}
+    payload = serialize_context_tree(source)
+    original = deepcopy(payload)
+    manager = _manager(tmp_path, _Registry())
+
+    if entry == "snapshot":
+        # Public inspection tooling accepts an existing snapshot without
+        # constructing an Agent; it needs the same ownership guarantee.
+        restored = manager.deserialize_snapshot({
+            "schema_version": 1, "agent_id": "root", "agent_name": "root",
+            "lifecycle": "persistent", "status": "idle", "session": payload,
+        })
+    else:
+        state = source if entry == "tree" else MappingProxyType(payload)
+        restored = manager.acquire_root({"name": "root"}, session_state=state).context
+
+    task, action = restored.steps
+    action.output["items"].append("restored")
+    action.tool_calls[0]["args"]["items"].append("restored")
+    task.attachments[0]["metadata"]["items"].append("restored")
+    action.attachments[0]["metadata"]["items"].append("restored")
+    action.usage["provider_usage"]["items"].append("restored")
+    restored.nodes[leaf.node_id].generation_params["sampling"]["items"].append("restored")
+    restored.nodes[leaf.node_id].annotations["review"]["items"].append("restored")
+    restored.all_paths[0].metadata["items"].append("restored")
+    restored.task_metadata["items"].append("restored")
+    restored.stats["details"]["items"].append("restored")
+
+    assert serialize_context_tree(source) == original
+    assert payload == original
+    # The caller can also keep editing its original session after transfer.
+    restored_before = deepcopy(serialize_context_tree(restored))
+    source.steps[-1].output["items"].append("caller")
+    assert serialize_context_tree(restored) == restored_before
 
 
 def test_functional_agent_is_released_but_transcript_remains_inspectable(tmp_path: Path) -> None:

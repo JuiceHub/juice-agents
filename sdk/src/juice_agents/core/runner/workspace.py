@@ -40,7 +40,8 @@ class RuntimeWorkspace:
         目录，与 ``ConfigurationContext`` 的回退口径保持一致。
 
         绝不能回退到 ``runtime_config_path`` 的父目录：默认配置来自 SDK 包内的
-        ``juice_agents._assets``，wheel 安装后位于 site-packages，属于只读包数据。
+        ``juice_agents.core.config/defaults.yaml``，wheel 安装后位于
+        site-packages，属于只读包数据。
         往那里写 team/runner 状态会污染安装目录（源码布局下则污染源码树）。
         """
 

@@ -49,7 +49,8 @@ import { useConversationStream } from "@juice-agents/shared/conversation";
 import { useCompletion } from "./hooks/useCompletion.js";
 import { useInteractiveSelector } from "./hooks/useInteractiveSelector.js";
 import { createComposerController, type ComposerController } from "./lib/composer.js";
-import { executeCommand, runtimeFromSession, type CommandResult } from "./lib/commands.js";
+import { executeCommand, modelConfigPatch, runtimeFromSession, type CommandResult } from "./lib/commands.js";
+import { openRewardModelSelector } from "./lib/rewardModelSelector.js";
 import {
   getCommandExecutionPolicy,
   getCommandToken,
@@ -838,7 +839,7 @@ export function App({
   useEffect(() => {
     const init = async () => {
       try {
-        const workspaceConfig = await client.loadWorkspaceConfig({ base_dir: baseDir });
+        const workspaceConfig = await client.loadEffectiveConfig({ base_dir: baseDir });
         const runtimeConfig = workspaceConfig.runtime || {};
         const runtimeModels = await client.listModels({ base_dir: baseDir });
         setRuntimeModels(runtimeModels);
@@ -915,7 +916,7 @@ export function App({
         : client.listModels({ base_dir: baseDir });
       const [memory, workspaceConfig, models, skillsConfig, selfEvolutionConfig, workflowsConfig] = await Promise.all([
         client.memoryStatus(),
-        client.loadWorkspaceConfig({ base_dir: baseDir }),
+        client.loadEffectiveConfig({ base_dir: baseDir }),
         modelsRequest,
         client.skillsConfigStatus({ base_dir: baseDir }),
         client.selfEvolutionConfigStatus({ base_dir: baseDir }),
@@ -1062,6 +1063,17 @@ export function App({
           }
 
           // Handle interactive actions
+          if (result.interactiveAction === "reward-model-selector") {
+            await openRewardModelSelector({
+              client,
+              baseDir,
+              models: runtimeModels,
+              selector,
+              addMessages: messagesHook.addMessages,
+            });
+            return;
+          }
+
           if (result.interactiveAction === "model-selector") {
             const models = runtimeModels;
             if (models.length === 0) {
@@ -1085,15 +1097,12 @@ export function App({
               })),
               async (item, effort) => {
                 const selectedEffort = normalizeEffortForModel(effort, item);
-                await client.saveWorkspaceConfig({
-                  base_dir: baseDir,
-                  config: {
-                    runtime: {
-                      model_name: item.value,
-                      model_effort: selectedEffort,
-                    },
-                  },
+                const patch = modelConfigPatch(session.status || pendingRuntime, {
+                  model_name: item.value, model_effort: selectedEffort,
                 });
+                if (Object.keys(patch).length > 0) {
+                  await client.saveWorkspaceConfig({ base_dir: baseDir, config: { runtime: patch } });
+                }
 
                 if (session.status) {
                   if (messagesHook.streamInFlight) {

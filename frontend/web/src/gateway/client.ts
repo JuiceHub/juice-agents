@@ -1,15 +1,15 @@
 import type {
   AskRequest,
-  ActorSessionsReport,
+  ActiveAgentsReport,
   BrowserPreview,
   ClientCommand,
   FileTreeNode,
-  InterruptActorResponse,
+  InterruptAgentResponse,
   RuntimeModelInfo,
   ServerEvent,
   SessionStatus,
   SessionSummary,
-  SendActorMessageResponse,
+  SendAgentMessageResponse,
   SkillsListResponse,
   PluginsListResponse,
   PluginViewResponse,
@@ -17,7 +17,6 @@ import type {
   AvailableAgentsResponse,
   TeamManifest,
   TeamsListResponse,
-  ModeResourcesResponse,
   WorkspaceRuntimeConfig,
   RunnerStreamEvent,
   StreamMessageResult,
@@ -26,6 +25,7 @@ import type {
 export interface BootstrapPayload {
   base_dir: string;
   workspace_config: WorkspaceRuntimeConfig;
+  effective_config: WorkspaceRuntimeConfig;
   sessions: SessionSummary[];
   models: RuntimeModelInfo[];
   memory: Record<string, unknown>;
@@ -78,6 +78,10 @@ export class WebGatewayClient {
 
   async bootstrap(baseDir: string): Promise<BootstrapPayload> {
     return this.getJson(`/api/bootstrap?base_dir=${encodeURIComponent(baseDir)}`);
+  }
+
+  loadEffectiveConfig(baseDir: string): Promise<WorkspaceRuntimeConfig> {
+    return this.getJson(`/api/effective-config?base_dir=${encodeURIComponent(baseDir)}`);
   }
 
   saveWorkspaceConfig(baseDir: string, config: WorkspaceRuntimeConfig): Promise<{ saved: boolean }> {
@@ -189,18 +193,18 @@ export class WebGatewayClient {
     });
   }
 
-  describeActorSessions(): Promise<ActorSessionsReport> {
-    return this.command<ActorSessionsReport>("describe_actor_sessions", {});
+  describeActiveAgents(): Promise<ActiveAgentsReport> {
+    return this.command<ActiveAgentsReport>("describe_agent_sessions", {});
   }
 
-  sendActorMessage(params: { actor_name: string; message: string }): Promise<SendActorMessageResponse> {
-    return this.command<SendActorMessageResponse>("send_actor_message", params);
+  sendAgentMessage(params: { agent_name: string; message: string }): Promise<SendAgentMessageResponse> {
+    return this.command<SendAgentMessageResponse>("send_agent_message", params);
   }
 
-  interruptActor(params: { actor_name: string; reason?: string }): Promise<InterruptActorResponse> {
-    return this.command<InterruptActorResponse>("interrupt_actor", {
-      actor_name: params.actor_name,
-      reason: params.reason ?? "user_actor_interrupt",
+  interruptAgent(params: { agent_name: string; reason?: string }): Promise<InterruptAgentResponse> {
+    return this.command<InterruptAgentResponse>("interrupt_agent", {
+      agent_name: params.agent_name,
+      reason: params.reason ?? "user_agent_interrupt",
     });
   }
 
@@ -299,13 +303,6 @@ export class WebGatewayClient {
 
   getTeam(params: { team_name: string; base_dir?: string }): Promise<TeamManifest> {
     return this.command<TeamManifest>("get_team_config", params);
-  }
-
-  listModeResources(baseDir: string, modeId = ""): Promise<ModeResourcesResponse> {
-    return this.command<ModeResourcesResponse>("list_mode_resources", {
-      base_dir: baseDir,
-      ...(modeId ? { mode_id: modeId } : {}),
-    });
   }
 
   viewSkill(name: string, filePath = ""): Promise<Record<string, unknown>> {

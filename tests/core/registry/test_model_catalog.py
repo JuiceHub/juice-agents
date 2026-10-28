@@ -6,25 +6,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 
-class _FakeOpenAIModel:
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
-        self.model_name = kwargs.get("model_name", "")
+class _FakeChatModel:
+    """Capture unified constructor parameters without creating SDK clients."""
 
-    def generate(self, messages, stop_sequence=None, *, cancel_event=None):
-        return {"role": "assistant", "content": self.model_name, "reasoning_content": ""}
-
-
-class _FakeDoubaoModel:
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
-        self.model_name = kwargs.get("model_name", "")
-
-    def generate(self, messages, stop_sequence=None, *, cancel_event=None):
-        return {"role": "assistant", "content": self.model_name, "reasoning_content": ""}
-
-
-class _FakeAnthropicModel:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         self.model_name = kwargs.get("model_name", "")
@@ -301,7 +285,7 @@ class RuntimeModelCatalogTests(unittest.TestCase):
                 runtime_config_path=self.catalog_path,
             )
 
-    def test_resolve_runtime_model_selects_backend_specific_model_class(self):
+    def test_resolve_runtime_model_passes_backend_to_unified_chat_model(self):
         from juice_agents.core.config.model_catalog import resolve_runtime_model
 
         self._write_catalog(
@@ -326,9 +310,7 @@ class RuntimeModelCatalogTests(unittest.TestCase):
             """
         )
 
-        with patch("juice_agents.core.config.model_catalog.OpenAIModel", _FakeOpenAIModel), patch(
-            "juice_agents.core.config.model_catalog.DoubaoModel", _FakeDoubaoModel
-        ):
+        with patch("juice_agents.core.config.model_catalog.ChatModel", _FakeChatModel):
             doubao_model = resolve_runtime_model(
                 model_name="doubao_seed",
                 runtime_config_path=self.catalog_path,
@@ -340,14 +322,16 @@ class RuntimeModelCatalogTests(unittest.TestCase):
                 dotenv_path=self.env_path,
             )
 
-        self.assertIsInstance(doubao_model, _FakeDoubaoModel)
+        self.assertIsInstance(doubao_model, _FakeChatModel)
+        self.assertEqual(doubao_model.kwargs["backend"], "doubao")
         self.assertEqual(doubao_model.kwargs["model_name"], "doubao-seed-1-6")
         self.assertEqual(doubao_model.kwargs["api_key"], "test-doubao-key")
-        self.assertIsInstance(openai_model, _FakeOpenAIModel)
+        self.assertIsInstance(openai_model, _FakeChatModel)
+        self.assertEqual(openai_model.kwargs["backend"], "openai")
         self.assertEqual(openai_model.kwargs["model_name"], "gpt-4o-mini")
         self.assertEqual(openai_model.kwargs["api_key"], "test-openai-key")
 
-    def test_resolve_runtime_model_selects_anthropic_model_class(self):
+    def test_resolve_runtime_model_passes_anthropic_backend_and_credentials(self):
         from juice_agents.core.config.model_catalog import resolve_runtime_model
 
         self._write_catalog(
@@ -362,7 +346,7 @@ class RuntimeModelCatalogTests(unittest.TestCase):
         )
         self._write_env("ANTHROPIC_AUTH_TOKEN=test-anthropic-token")
 
-        with patch("juice_agents.core.config.model_catalog.AnthropicModel", _FakeAnthropicModel), \
+        with patch("juice_agents.core.config.model_catalog.ChatModel", _FakeChatModel), \
              patch.dict("os.environ", {"ANTHROPIC_AUTH_TOKEN": ""}, clear=False):
             os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
             model = resolve_runtime_model(
@@ -371,7 +355,8 @@ class RuntimeModelCatalogTests(unittest.TestCase):
                 dotenv_path=self.env_path,
             )
 
-        self.assertIsInstance(model, _FakeAnthropicModel)
+        self.assertIsInstance(model, _FakeChatModel)
+        self.assertEqual(model.kwargs["backend"], "anthropic")
         self.assertEqual(model.kwargs["model_name"], "claude-opus-4-7")
         self.assertEqual(model.kwargs["api_base"], "https://api.anthropic.com")
         self.assertEqual(model.kwargs["api_key"], "test-anthropic-token")
@@ -423,7 +408,7 @@ class RuntimeModelCatalogTests(unittest.TestCase):
         )
         self._write_env("DOUBAO_API_KEY=test-doubao-key")
 
-        with patch("juice_agents.core.config.model_catalog.DoubaoModel", _FakeDoubaoModel):
+        with patch("juice_agents.core.config.model_catalog.ChatModel", _FakeChatModel):
             model = resolve_runtime_model(
                 model_name="doubao_seed",
                 runtime_config_path=self.catalog_path,
@@ -432,6 +417,7 @@ class RuntimeModelCatalogTests(unittest.TestCase):
             )
 
         self.assertEqual(model.kwargs["thinking"], {"type": "enabled", "effort": "high"})
+        self.assertEqual(model.kwargs["backend"], "doubao")
 
     def test_resolve_runtime_model_disables_thinking_for_disabled_effort(self):
         from juice_agents.core.config.model_catalog import resolve_runtime_model
@@ -448,7 +434,7 @@ class RuntimeModelCatalogTests(unittest.TestCase):
         )
         self._write_env("DOUBAO_API_KEY=test-doubao-key")
 
-        with patch("juice_agents.core.config.model_catalog.DoubaoModel", _FakeDoubaoModel):
+        with patch("juice_agents.core.config.model_catalog.ChatModel", _FakeChatModel):
             model = resolve_runtime_model(
                 model_name="doubao_seed",
                 runtime_config_path=self.catalog_path,
@@ -559,7 +545,7 @@ class RuntimeModelCatalogTests(unittest.TestCase):
         )
         self._write_env("ANTHROPIC_API_KEY=test-key")
 
-        with patch("juice_agents.core.config.model_catalog.AnthropicModel", _FakeAnthropicModel):
+        with patch("juice_agents.core.config.model_catalog.ChatModel", _FakeChatModel):
             model = resolve_runtime_model(
                 model_name="claude_opus",
                 runtime_config_path=self.catalog_path,
@@ -570,6 +556,36 @@ class RuntimeModelCatalogTests(unittest.TestCase):
         # Anthropic 使用 adaptive thinking + output_config effort
         self.assertEqual(model.kwargs["thinking"], {"type": "adaptive"})
         self.assertEqual(model.kwargs["effort_config"], {"effort": "xhigh"})
+        self.assertEqual(model.kwargs["backend"], "anthropic")
+
+    def test_resolve_runtime_model_reuses_cache_and_isolates_effort(self):
+        """同一目录和 effort 复用实例；不同 effort 必须得到各自的请求配置。"""
+        from juice_agents.core.config.model_catalog import resolve_runtime_model
+
+        self._write_catalog(
+            """
+            models:
+              judge:
+                backend: openai
+                api_base: https://example.test/v1
+                api_key_env: TEST_CATALOG_CACHE_API_KEY
+                provider_model_name: provider-judge
+            """
+        )
+        self._write_env("TEST_CATALOG_CACHE_API_KEY=test-key")
+        options = dict(
+            model_name="judge", runtime_config_path=self.catalog_path, dotenv_path=self.env_path,
+        )
+        with patch("juice_agents.core.config.model_catalog.ChatModel", _FakeChatModel):
+            first = resolve_runtime_model(**options, model_effort="high")
+            reused = resolve_runtime_model(**options, model_effort="high")
+            disabled = resolve_runtime_model(**options, model_effort="disabled")
+
+        self.assertIs(first, reused)
+        self.assertIsNot(first, disabled)
+        self.assertEqual(first.kwargs["backend"], "openai")
+        self.assertEqual(first.kwargs["thinking"], {"type": "enabled", "effort": "high"})
+        self.assertEqual(disabled.kwargs["thinking"], {"type": "disabled"})
 
 
 if __name__ == "__main__":

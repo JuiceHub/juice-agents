@@ -1,25 +1,39 @@
-"""`juice` 启动脚本的 workspace 交接契约。
+"""The source launcher preserves the caller's cwd and project executable PATH."""
+from __future__ import annotations
 
-CLI 包装在仓库内，启动脚本必须 `cd` 进包目录才能跑 tsx；一旦先 `cd`，
-用户真实的工作目录就丢了。resolver 侧的优先级由
-`frontend/cli/src/lib/workspace.test.ts` 覆盖，这里只锁 shell 脚本的顺序
-——它是唯一无法用 TS 测试表达的一环。
-"""
-
+import json
+import os
 from pathlib import Path
-
+import subprocess
+import sys
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 
 
-def test_juice_wrapper_exports_original_workspace_before_entering_cli_package():
-    script = (ROOT_DIR / "juice").read_text(encoding="utf-8")
-
-    workspace_line = 'WORKSPACE_DIR="$(pwd -P)"'
-    export_line = 'export JUICE_WORKSPACE_DIR="$WORKSPACE_DIR"'
-    cd_line = 'cd "$CLI_DIR"'
-
-    assert workspace_line in script
-    assert export_line in script
-    assert script.index(workspace_line) < script.index(cd_line)
-    assert script.index(export_line) < script.index(cd_line)
+def test_juice_wrapper_preserves_workspace_and_user_path(tmp_path: Path) -> None:
+    """Record what reaches Node without depending on CLI rendering details."""
+    workspace = tmp_path / "项目 workspace"
+    workspace.mkdir()
+    python = tmp_path / "python-probe"
+    python.write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+    python.chmod(0o755)
+    node = tmp_path / "node-probe"
+    node.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "if '--import' in sys.argv:\n"
+        "    print(json.dumps({'cwd': os.getcwd(), 'path': os.environ['PATH'], "
+        "'workspace': os.environ.get('JUICE_WORKSPACE_DIR'), 'args': sys.argv[1:]}))\n",
+        encoding="utf-8",
+    )
+    node.chmod(0o755)
+    caller_path = f"{workspace / '.venv' / 'bin'}:/usr/bin:/bin"
+    env = {**os.environ, "PATH": caller_path, "JUICE_PYTHON_PATH": str(python),
+           "JUICE_NODE_PATH": str(node), "JUICE_WORKSPACE_DIR": str(workspace)}
+    result = subprocess.run([str(ROOT_DIR / "juice"), "--workspace", str(workspace)],
+                            cwd=workspace, env=env, text=True, capture_output=True, check=True)
+    launched = json.loads(result.stdout)
+    assert launched["cwd"] == str(workspace)
+    assert launched["path"] == caller_path
+    assert launched["workspace"] == str(workspace)
+    assert launched["args"][-2:] == ["--workspace", str(workspace)]

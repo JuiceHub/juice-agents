@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 from urllib.error import URLError
 
+from juice_agents.core.config.context import ConfigurationContext
 from juice_agents.core.agent.tools import ApiWebSearchTool as ApiWebSearchToolExport
 from juice_agents.core.agent.tools import BrowserSearchTool as BrowserSearchToolExport
 from juice_agents.core.agent.tools.builtin.web.web_search_tools import (
@@ -169,12 +170,12 @@ class WebSearchToolTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 tool.forward(query="hello")
 
-    def test_api_web_search_default_config_path_points_to_sdk_asset(self):
+    def test_api_web_search_default_config_path_points_to_sdk_defaults(self):
         tool = ApiWebSearchTool()
         self.assertTrue(Path(tool.config_path).is_file())
         self.assertTrue(
             Path(tool.config_path).as_posix().endswith(
-                "juice_agents/_assets/config.example.yaml"
+                "juice_agents/core/config/defaults.yaml"
             )
         )
 
@@ -195,7 +196,8 @@ class WebSearchToolTests(unittest.TestCase):
                 """,
             )
             self._write_env(env_path, "TAVILY_API_KEY=tavily_key")
-            with patch("juice_agents.core.agent.tools.builtin.web.web_search_tools.DEFAULT_DOTENV_PATH", Path(env_path)):
+            with patch("juice_agents.core.agent.tools.builtin.web.web_search_tools.resolve_owner_context",
+                       return_value=ConfigurationContext.from_workspace(td, dotenv_path=env_path)):
                 tool = ApiWebSearchTool(config_path=config_path, timeout_s=0.1)
                 out = tool.forward(query="hello", max_results=1)
                 self.assertEqual(len(out["results"]), 1)
@@ -232,7 +234,8 @@ class WebSearchToolTests(unittest.TestCase):
             )
             self._write_env(env_path, "SERPAPI_API_KEY=serpapi_key")
 
-            with patch("juice_agents.core.agent.tools.builtin.web.web_search_tools.DEFAULT_DOTENV_PATH", Path(env_path)):
+            with patch("juice_agents.core.agent.tools.builtin.web.web_search_tools.resolve_owner_context",
+                       return_value=ConfigurationContext.from_workspace(td, dotenv_path=env_path)):
                 tool = ApiWebSearchTool(
                     engine="serpapi", config_path=config_path, timeout_s=0.1, max_results_cap=10
                 )
@@ -267,7 +270,8 @@ class WebSearchToolTests(unittest.TestCase):
                 """,
             )
             self._write_env(env_path, "TAVILY_API_KEY=tavily_key")
-            with patch("juice_agents.core.agent.tools.builtin.web.web_search_tools.DEFAULT_DOTENV_PATH", Path(env_path)):
+            with patch("juice_agents.core.agent.tools.builtin.web.web_search_tools.resolve_owner_context",
+                       return_value=ConfigurationContext.from_workspace(td, dotenv_path=env_path)):
                 tool = ApiWebSearchTool(config_path=config_path, timeout_s=0.1)
                 tool.forward(query="hello", max_results=1)
                 req = mock_urlopen.call_args_list[0].args[0]

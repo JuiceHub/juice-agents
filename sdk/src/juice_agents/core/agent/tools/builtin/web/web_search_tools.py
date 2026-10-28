@@ -21,16 +21,14 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote_plus, unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
+from juice_agents.core.config.context import ConfigurationContext
 from juice_agents.core.config.runtime_config import (
-    DEFAULT_DOTENV_PATH,
     DEFAULT_RUNTIME_CONFIG_PATH,
-    get_runtime_mapping,
     normalize_runtime_key,
-    resolve_env_value,
 )
-from juice_agents.core.utils import load_env_file
 
 from ...runtime.base_tools import LIST_OBSERVATION_CHARS, Tool
+from ...runtime.owner_context import resolve_owner_context
 
 logger = logging.getLogger(__name__)
 
@@ -704,6 +702,7 @@ class ApiWebSearchTool(Tool):
         max_results_cap: int = DEFAULT_MAX_RESULTS_CAP,
         engine_sections: Dict[str, str] | None = None,
         engine_base_urls: Dict[str, str] | None = None,
+        config_context: ConfigurationContext | None = None,
     ) -> None:
         super().__init__()
         self.engine = str(engine or self.DEFAULT_ENGINE).strip().lower()
@@ -711,7 +710,11 @@ class ApiWebSearchTool(Tool):
             raise ValueError(f"不支持的 engine: {self.engine}，可选值: {sorted(self.SUPPORTED_ENGINES)}")
 
         self._api_key = api_key
-        self.config_path = str(config_path) if config_path is not None else self.DEFAULT_CONFIG_PATH
+        self.config_context = config_context
+        self._explicit_config_path = config_path
+        self.config_path = str(config_path or (
+            config_context.project_config_path if config_context else self.DEFAULT_CONFIG_PATH
+        ))
         self.timeout_s = float(timeout_s)
         self.user_agent = str(user_agent or self.DEFAULT_USER_AGENT)
         self.max_results_cap = int(max_results_cap)
@@ -737,15 +740,29 @@ class ApiWebSearchTool(Tool):
             return key
         tool_config = self._read_tool_config(engine)
         env_name = str(tool_config.get("api_key_env") or "").strip()
-        env_values = load_env_file(DEFAULT_DOTENV_PATH)
-        env_key = resolve_env_value(env_name, dotenv_values=env_values)
+        context = self._context()
+        env_key = context.resolve_env(env_name)
         if env_key:
             return env_key
         raise ValueError(
             f"未配置 {engine} api_key：请在初始化 ApiWebSearchTool(api_key=...) 传入，"
             f"或在配置文件 {self.config_path} 的 tools.{normalize_runtime_key(self._resolve_section_name(engine))} 中"
-            f"配置 api_key_env，并在项目根 .env 中写入对应密钥"
+            f"配置 api_key_env（当前变量名：{env_name or '未配置'}），并设置进程环境变量，"
+            f"或在 {context.dotenv_path} / {context.global_dotenv_path} 中写入对应密钥"
         )
+
+    def _context(self) -> ConfigurationContext:
+        """Use the same workspace/config context as the owning Agent's tools."""
+        context = self.config_context or resolve_owner_context(getattr(self, "owner_agent", None))
+        if self._explicit_config_path is None:
+            return context
+        return ConfigurationContext.from_workspace(
+            context.workspace_dir, project_config_path=self._explicit_config_path,
+            dotenv_path=context.dotenv_path, overrides=context.overrides,
+        )
+
+    def bind_owner_agent(self, agent: Any) -> None:
+        self.owner_agent = agent
 
     def _resolve_section_name(self, engine: str) -> str:
         """
@@ -762,7 +779,7 @@ class ApiWebSearchTool(Tool):
         tool_name = normalize_runtime_key(self._resolve_section_name(engine))
         if not tool_name:
             return {}
-        tools = get_runtime_mapping("tools", config_path=self.config_path)
+        tools = self._context().get_mapping("tools")
         raw = tools.get(tool_name)
         return dict(raw) if isinstance(raw, dict) else {}
 

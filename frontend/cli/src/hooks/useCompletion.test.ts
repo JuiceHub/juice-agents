@@ -30,11 +30,9 @@ test("offers memory and dream commands in slash completion", () => {
     getCommandCandidates("/ag").map((item) => item.label),
     ["/agent-type", "/agents"],
   );
-  // `/resources` is the public resource command and completes only from its
-  // own prefix; no hidden compatibility alias is retained.
   assert.deepEqual(
     getCommandCandidates("/reso").map((item) => item.label),
-    ["/resources"],
+    [],
   );
   assert.deepEqual(
     getCommandCandidates("/dr").map((item) => item.label),
@@ -225,7 +223,7 @@ test("keeps top-level candidates visible until a trailing space closes the panel
   );
   assert.deepEqual(
     getCommandCandidates("/model").map((item) => item.label),
-    ["/models", "/model"],
+    [],
   );
   // 补全时补入的尾随空格会关闭面板，让 ↑/↓ 回到历史记录导航
   assert.deepEqual(getCommandCandidates("/mode "), []);

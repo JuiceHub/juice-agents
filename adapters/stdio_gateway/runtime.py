@@ -5,9 +5,9 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 from juice_agents import Juice
 from juice_agents.core.runner.types.ask import AskHandler
@@ -23,7 +23,6 @@ from juice_agents.core.config.model_catalog import (
 from juice_agents.core.runner.types.definitions import normalize_agent_mode, normalize_permission_mode
 from juice_agents.core.config.context import ConfigurationContext
 from juice_agents.core.registry import AgentRegistry
-from juice_agents.core.prebuilt import build_prebuilt_agent_declarations
 from juice_agents.core.registry.agents.types import normalize_agent_type
 from juice_agents.core.runner import Runner, RunnerBusyError, mode_registry
 from juice_agents.core.memory.config import get_memory_config, set_workspace_memory_feature
@@ -40,43 +39,12 @@ from juice_agents.core.cron import (
     list_cron_tasks,
 )
 
+if TYPE_CHECKING:
+    from juice_agents.core.models.reward_models import BaseRewardModel, GenerativeRewardModel
+
 
 logger = logging.getLogger(__name__)
 DEFAULT_RUNTIME_CONFIG_PATH = CORE_DEFAULT_RUNTIME_CONFIG_PATH
-
-
-# This is a read-only catalog for the transport.  Execution itself always
-# goes through the same declarative Runner -> Manager path.
-MODE_RESOURCE_IDS = tuple(mode_registry.configs())
-
-
-def _resource_path(base_dir: Path, path: Path) -> str:
-    try:
-        return path.resolve().relative_to(base_dir.resolve()).as_posix()
-    except Exception:
-        return str(path)
-
-
-def _agent_resource(
-    *,
-    base_dir: Path,
-    mode_id: str,
-    role: str,
-    name: str,
-    description: str,
-    source: str,
-    path: Path,
-    status: str = "available",
-) -> dict[str, Any]:
-    return {
-        "mode_id": mode_id,
-        "role": role,
-        "name": name,
-        "source": source,
-        "path": _resource_path(base_dir, path),
-        "description": description,
-        "status": status,
-    }
 
 
 @dataclass(frozen=True)
@@ -107,11 +75,11 @@ class DirectRunnerRuntime:
         *,
         base_dir: str | Path,
         runtime_config_path: str | Path | None = None,
-        model_name: str = DEFAULT_RUNTIME_MODEL_NAME,
-        model_effort: str | None = "disabled",
-        permission_mode: str = "default",
-        agent_mode: str = "agent",
-        agent_type: str = "react",
+        model_name: str | None = None,
+        model_effort: str | None = None,
+        permission_mode: str | None = None,
+        agent_mode: str | None = None,
+        agent_type: str | None = None,
         ask_handler: AskHandler | None = None,
         worktree: str | None = None,
     ) -> None:
@@ -119,15 +87,22 @@ class DirectRunnerRuntime:
         self.runtime_config_path = (
             Path(runtime_config_path).expanduser().resolve() if runtime_config_path else DEFAULT_RUNTIME_CONFIG_PATH.resolve()
         )
-        self.model_name = str(model_name or DEFAULT_RUNTIME_MODEL_NAME).strip() or DEFAULT_RUNTIME_MODEL_NAME
-        self.model_effort = normalize_runtime_model_effort(model_effort)
+        if not self.base_dir.is_dir():
+            raise ValueError(f"Workspace is missing or is not a directory: {self.base_dir}")
+        effective = ConfigurationContext.from_workspace(
+            self.base_dir, project_config_path=self.runtime_config_path
+        ).read_merged_config().get("runtime", {})
+        self.model_name = str(model_name or effective.get("model_name") or DEFAULT_RUNTIME_MODEL_NAME).strip()
+        self.model_effort = normalize_runtime_model_effort(
+            model_effort if model_effort is not None else effective.get("model_effort")
+        )
         # 两个维度互不约束：plan 只是一种 agent_mode，不再限制权限模式。
-        self.permission_mode = normalize_permission_mode(permission_mode)
-        self.agent_mode = normalize_agent_mode(agent_mode)
-        self.agent_type = normalize_agent_type(agent_type)
+        self.permission_mode = normalize_permission_mode(permission_mode or effective.get("permission_mode") or "default")
+        self.agent_mode = normalize_agent_mode(agent_mode or effective.get("agent_mode") or "agent")
+        self.agent_type = normalize_agent_type(agent_type or effective.get("agent_type") or "react")
         # Keep construction read-only. `/agents`, `/teams` and model queries
         # may create this adapter solely for a cold workspace lookup; runtime
-        # defaults are persisted only when a Runner is actually started.
+        # launch selections stay in memory even after a Runner starts.
         self._ask_handler = ask_handler
         self.worktree = None if worktree is None else str(worktree)
         self._juice = Juice(
@@ -136,6 +111,13 @@ class DirectRunnerRuntime:
             ask_handler=ask_handler,
         )
         self._runner: Any | None = None
+        # Strategy configuration is transport-local. In particular, reward
+        # model objects must never be written into the workspace configuration.
+        self._strategy: Any | None = None
+        self._strategy_params: dict[str, Any] | None = None
+        # `/rm` owns this choice independently of breadth. A linear strategy
+        # must not discard the model that a later breadth change will use.
+        self._reward_model: GenerativeRewardModel | None = None
         self._started = False
         self._resumed = False
         self._mode_before_plan = "agent"
@@ -151,6 +133,8 @@ class DirectRunnerRuntime:
 
     def start_session(self) -> SessionStatus:
         """Create a new runner for the requested permission mode and agent mode."""
+        if self.worktree is not None:
+            raise NotImplementedError(self._worktree_message())
         logger.info(
             "创建新的 Juice 会话: base_dir=%s permission_mode=%s agent_mode=%s",
             self.base_dir,
@@ -159,33 +143,30 @@ class DirectRunnerRuntime:
         )
         if self._runner is not None:
             self._close_runner(reason="runner_switch")
-        self._persist_runtime_selection()
         self._runner = self._create_declarative_runner()
-        if self.worktree is not None:
-            enter_worktree = getattr(self._runner, "enter_worktree", None)
-            if not callable(enter_worktree):
-                raise RuntimeError("当前 RunnerConfig 不支持 worktree capability")
-            enter_worktree(self.worktree or None)
+        self._install_strategy_handler()
         self._install_ask_handler()
         self._started = False
         self._resumed = False
         return self.describe_session()
 
-    def _persist_runtime_selection(self) -> None:
-        """Persist execution choices only at an explicit execution boundary."""
+    def _runtime_overrides(self) -> dict[str, Any]:
+        """Keep launch selections process-local instead of copying inherited defaults."""
+        return {"runtime": {
+            "permission_mode": self.permission_mode,
+            "agent_mode": self.agent_mode,
+            "agent_type": self.agent_type,
+            "model_name": self.model_name,
+            "model_effort": self.model_effort,
+        }}
 
-        update_workspace_config(
+    def effective_config(self) -> dict[str, Any]:
+        """Return current configuration through the same context used by execution."""
+        return ConfigurationContext.from_workspace(
             self.base_dir,
-            lambda current: {
-                **current,
-                "runtime": {
-                    **dict(current.get("runtime") or {}),
-                    "agent_type": self.agent_type,
-                    "model_name": self.model_name,
-                    "model_effort": self.model_effort,
-                },
-            },
-        )
+            project_config_path=self.runtime_config_path,
+            overrides=self._runtime_overrides(),
+        ).read_merged_config()
 
     def _create_declarative_runner(self) -> Runner:
         """Create one Runner from a serializable configuration template only."""
@@ -194,6 +175,7 @@ class DirectRunnerRuntime:
             permission_mode=self.permission_mode,
             runner_config=mode_registry.resolve(self.agent_mode),
             runtime_config_path=self.runtime_config_path,
+            runtime_overrides=self._runtime_overrides(),
         )
 
     def _close_runner(self, *, reason: str) -> None:
@@ -222,6 +204,7 @@ class DirectRunnerRuntime:
             return
         self._close_runner(reason=reason)
         self._runner = self._create_declarative_runner()
+        self._install_strategy_handler()
         self._install_ask_handler()
         self._started = True
         self._resumed = False
@@ -272,7 +255,7 @@ class DirectRunnerRuntime:
     def switch_agent_mode(
         self,
         agent_mode: str,
-        agent_type: str = "react",
+        agent_type: str | None = None,
         model_name: str | None = None,
         model_effort: str | None = None,
     ) -> SessionStatus:
@@ -283,7 +266,10 @@ class DirectRunnerRuntime:
         """
 
         normalized_agent_mode = normalize_agent_mode(agent_mode)
-        normalized_agent_type = normalize_agent_type(agent_type)
+        # A mode-only RPC leaves the current action protocol unchanged. The
+        # current value already includes configuration inheritance and any
+        # explicit launch/session choice, so do not reapply a react default.
+        normalized_agent_type = normalize_agent_type(self.agent_type if agent_type is None else agent_type)
         prospective_model_name = self.model_name
         prospective_model_effort = self.model_effort
         if str(model_name or "").strip():
@@ -301,7 +287,18 @@ class DirectRunnerRuntime:
         return_mode = self.agent_mode if normalized_agent_mode == "plan" and self.agent_mode != "plan" else None
         # Validate and apply on Runner before changing adapter fields.  On a
         # busy/error result the old mode remains completely intact.
-        self._runner.reconfigure(mode_id=normalized_agent_mode, plan_return_mode=return_mode)
+        overrides = self._runtime_overrides()
+        overrides["runtime"].update(
+            agent_mode=normalized_agent_mode,
+            agent_type=normalized_agent_type,
+            model_name=prospective_model_name,
+            model_effort=prospective_model_effort,
+        )
+        self._runner.reconfigure(
+            mode_id=normalized_agent_mode,
+            plan_return_mode=return_mode,
+            runtime_overrides=overrides,
+        )
         if return_mode is not None:
             self._mode_before_plan = return_mode
         self.agent_mode = normalized_agent_mode
@@ -324,6 +321,7 @@ class DirectRunnerRuntime:
             self._runner = self._juice.runners.resume(
                 runner_id=runner_id,
                 runtime_config_path=self.runtime_config_path,
+                runtime_overrides=self._runtime_overrides(),
             )
         except FileNotFoundError as exc:
             raise FileNotFoundError(f"runner not found: {runner_id}") from exc
@@ -331,6 +329,7 @@ class DirectRunnerRuntime:
             raise ValueError(f"failed to resume runner {runner_id}: {exc}") from exc
         self._started = True
         self._resumed = True
+        self._install_strategy_handler()
         self._install_ask_handler()
         self.permission_mode = str(
             getattr(self._runner, "permission_mode", self.permission_mode) or self.permission_mode
@@ -456,23 +455,18 @@ class DirectRunnerRuntime:
             worktree=self.worktree_status(),
         )
 
+    @staticmethod
+    def _worktree_message() -> str:
+        return "Managed worktrees are not implemented. Use git worktree add, then juice --workspace <directory>."
+
     def enter_worktree(self, name: str | None = None) -> dict[str, Any]:
-        if self._runner is None:
-            self.start_session()
-        if self._runner is None:
-            raise RuntimeError("No active session")
-        return dict(self._runner.enter_worktree(name))
+        raise NotImplementedError(self._worktree_message())
 
     def exit_worktree(self, *, discard: bool = False) -> dict[str, Any]:
-        if self._runner is None:
-            raise RuntimeError("No active session")
-        return dict(self._runner.exit_worktree(discard=discard))
+        raise NotImplementedError(self._worktree_message())
 
     def list_worktrees(self) -> dict[str, Any]:
-        if self._runner is None:
-            raise RuntimeError("No active session")
-        worktrees = list(self._runner.list_worktrees())
-        return {"worktrees": worktrees, "count": len(worktrees)}
+        raise NotImplementedError(self._worktree_message())
 
     def worktree_status(self, name: str | None = None) -> dict[str, Any]:
         if self._runner is None:
@@ -562,59 +556,7 @@ class DirectRunnerRuntime:
             name=name,
             mode_id=selected_mode,
             runner=self._runner,
-            # The endpoint stays cold-query safe: these detached values are
-            # only projected for display and are persisted later only if a
-            # Runner is explicitly created for this mode.
-            fallback_configs=build_prebuilt_agent_declarations(
-                base_dir=self.base_dir,
-                runner_config=selected_mode,
-            ),
         )
-
-    def list_mode_resources(self, *, mode_id: str | None = None) -> dict[str, Any]:
-        """Project static Agent declarations through RunnerConfig templates.
-
-        Agent YAML has one Registry namespace.  A mode does not create a
-        directory or a coordinator; it only describes the root/member
-        bindings that the Runner will later acquire through AgentManager.
-        """
-
-        context = ConfigurationContext.from_workspace(
-            self.base_dir,
-            project_config_path=self.runtime_config_path,
-        )
-        selected = (
-            [str(mode_id).strip()] if str(mode_id or "").strip() else list(MODE_RESOURCE_IDS)
-        )
-        registry = AgentRegistry(config_context=context)
-        resources: list[dict[str, Any]] = []
-        for current_mode_id in selected:
-            config = mode_registry.resolve(current_mode_id)
-            for binding in (config.root_binding, config.member_binding):
-                name = binding.agent_name
-                path = context.agents_dir / f"{name}.yaml"
-                try:
-                    declaration = registry.load_config(name)
-                    description = declaration.description
-                    source = "workspace"
-                except FileNotFoundError:
-                    # A prebuilt declaration is seeded when a Runner is
-                    # created. Before that, the template itself is still a
-                    # useful static catalog entry for the transport.
-                    description = f"RunnerConfig {current_mode_id} {binding.role} binding"
-                    source = "builtin"
-                resources.append(
-                    _agent_resource(
-                        base_dir=self.base_dir,
-                        mode_id=current_mode_id,
-                        role=binding.role,
-                        name=name,
-                        source=source,
-                        path=path,
-                    )
-                )
-        resources.sort(key=lambda item: (item["mode_id"], item["role"], item["name"], item["source"]))
-        return {"mode_ids": list(MODE_RESOURCE_IDS), "resources": resources, "count": len(resources)}
 
     def _image_generation_enabled(self) -> bool:
         """Read merged image.enabled for catalog and live runner reconfiguration."""
@@ -1068,19 +1010,27 @@ class DirectRunnerRuntime:
             runtime_config_path=self.runtime_config_path,
             workspace_dir=self.base_dir,
         )
+        # Validate the idle execution boundary before publishing any state or
+        # project override. The launch layer must follow explicit model edits.
+        if self._runner is not None:
+            overrides = self._runtime_overrides()
+            overrides["runtime"].update(model_name=normalized_name, model_effort=normalized_effort)
+            self._runner.reconfigure(runtime_overrides=overrides)
+        patch: dict[str, str] = {}
+        if normalized_name != self.model_name:
+            patch["model_name"] = normalized_name
+        if normalized_effort != self.model_effort:
+            patch["model_effort"] = normalized_effort
         self.model_name = normalized_name
         self.model_effort = normalized_effort
-        update_workspace_config(
-            self.base_dir,
-            lambda current: {
-                **current,
-                "runtime": {
-                    **dict(current.get("runtime") or {}),
-                    "model_name": self.model_name,
-                    "model_effort": self.model_effort,
+        if patch:
+            update_workspace_config(
+                self.base_dir,
+                lambda current: {
+                    **current,
+                    "runtime": {**dict(current.get("runtime") or {}), **patch},
                 },
-            },
-        )
+            )
         if self._runner is None:
             return self._preview_session_status()
 
@@ -1094,106 +1044,177 @@ class DirectRunnerRuntime:
         )
         return self.describe_session()
 
-    def switch_strategy(
-        self,
-        params: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
-        """切换 Agent 的探索策略
+    @property
+    def pending_strategy_configuration(self) -> dict[str, Any] | None:
+        """Carry explicit choices into a replacement runtime in this process."""
 
-        统一使用 breadth/depth/beam_width 参数配置策略。
+        if self._strategy_params is None:
+            return None
+        return dict(self._strategy_params)
 
-        Args:
-            params: 策略参数
-                - breadth: 每步展开分支数 (int 或 list)
-                - depth: 最大探索深度
-                - beam_width: 每步保留路径数
-                - reset: 是否重置为默认贪心策略
+    @property
+    def pending_reward_model_configuration(self) -> dict[str, Any] | None:
+        """Transfer a logical name, never provider objects or API credentials."""
+        if self._reward_model is None:
+            return None
+        return {"model_name": self._reward_model.model_name}
 
-        Returns:
-            包含策略信息的字典
+    def _current_strategy(self) -> Any | None:
+        """Inspect the live root without acquiring an Agent or a provider."""
+        root = self._resolve_root_agent()
+        return getattr(root, "exploration_strategy", None) or self._strategy
+
+    def describe_reward_model(self) -> dict[str, Any]:
+        """Report configured scoring separately from whether it is active."""
+        strategy = self._current_strategy()
+        scorer = self._reward_model or getattr(strategy, "reward_model", None)
+        breadth = getattr(strategy, "breadth", 1)
+        return {
+            "model_name": getattr(self._reward_model, "model_name", None),
+            "scorer_configured": scorer is not None,
+            "breadth": breadth,
+            "execution": "candidate_selection" if breadth > 1 and scorer is not None else "linear",
+        }
+
+    def configure_reward_model(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Query, set a catalog model, or clear scoring without changing breadth.
+
+        Catalog validation uses the same workspace and project configuration as
+        `/models`. Provider construction and scoring remain lazy; a query or a
+        failed update leaves the existing strategy untouched.
         """
-        from juice_agents.core.agent.context.strategies import (
-            GreedyStrategy,
-            TreeOfThoughtsStrategy,
-        )
+        from juice_agents.core.models.reward_models import GenerativeRewardModel
 
         params = params or {}
+        unknown = set(params) - {"model_name", "reset"}
+        if unknown:
+            raise ValueError("Unknown reward model parameters: " + ", ".join(sorted(unknown)))
+        reset = params.get("reset", False)
+        if not isinstance(reset, bool):
+            raise ValueError("reset must be a boolean")
+        if reset and "model_name" in params:
+            raise ValueError("reset cannot be combined with model_name")
+        if not reset and "model_name" not in params:
+            return self.describe_reward_model()
 
-        # 重置为贪心策略
-        if params.get("reset"):
-            strategy = GreedyStrategy()
-            strategy_info = {
-                "type": "greedy",
-                "params": {}
-            }
-        else:
-            # 解析参数
-            breadth = params.get("breadth", 1)
-            depth = params.get("depth", 1)
-            beam_width = params.get("beam_width", 1)
-
-            # 处理 breadth 可能是列表的情况
-            if isinstance(breadth, str) and breadth.startswith('['):
-                try:
-                    import json
-                    breadth = json.loads(breadth)
-                except Exception:
-                    breadth = 1
-            elif not isinstance(breadth, list):
-                breadth = int(breadth)
-
-            depth = int(depth)
-            beam_width = int(beam_width)
-
-            # 如果参数都是默认值 (1,1,1)，使用贪心策略
-            if breadth == 1 and depth == 1 and beam_width == 1:
-                strategy = GreedyStrategy()
-                strategy_info = {
-                    "type": "greedy",
-                    "params": {}
-                }
-            else:
-                # 使用探索策略
-                strategy = TreeOfThoughtsStrategy(
-                    breadth=breadth,
-                    depth_limit=depth,
-                    keep_top_k=beam_width
-                )
-                strategy_info = {
-                    "type": "exploration",
-                    "params": {
-                        "breadth": breadth,
-                        "depth": depth,
-                        "beam_width": beam_width
-                    }
-                }
-
-        # 应用策略到 root agent
-        if self._runner is None:
-            # Runner 未启动，记录策略信息待后续应用
-            logger.info("Runner 未启动，策略将在启动时应用")
-            return {
-                "status": "pending",
-                "strategy": strategy_info,
-                "message": "Strategy will be applied when session starts"
-            }
-
-        try:
-            root_agent = self._runner.agent_manager.get(self._runner.root_agent_id).instance
-            root_agent.set_exploration_strategy(strategy)
-            logger.info(
-                "探索策略已切换: runner_id=%s params=%s",
-                self._runner.runner_id,
-                params
+        scorer = None
+        if not reset:
+            model_name = params["model_name"]
+            if not isinstance(model_name, str) or not model_name.strip():
+                raise ValueError("model_name must be a non-empty catalog name")
+            model_name = model_name.strip()
+            if model_name not in {item["model_name"] for item in self.list_models()}:
+                raise ValueError(f"Unknown reward model: {model_name}. Use /models to list available models.")
+            scorer = GenerativeRewardModel.from_config(
+                model_name=model_name,
+                config_context=ConfigurationContext.from_workspace(
+                    self.base_dir, project_config_path=self.runtime_config_path,
+                ),
             )
-            return {
-                "status": "applied",
-                "strategy": strategy_info,
-                "message": "Strategy switched successfully"
-            }
-        except Exception as e:
-            logger.error("切换策略失败: %s", e)
-            raise RuntimeError(f"Failed to switch strategy: {e}")
+
+        breadth = getattr(self._current_strategy(), "breadth", 1)
+        # Publish the independent choice only after the root accepts the new
+        # strategy. This also makes reset clear an SDK-injected scorer.
+        self._apply_strategy(breadth=breadth, reward_model=scorer)
+        self._reward_model = scorer
+        logger.info("奖励模型已配置: model=%s breadth=%s", getattr(scorer, "model_name", None), breadth)
+        return self.describe_reward_model()
+
+    def _install_strategy_handler(self) -> None:
+        """Apply configuration through the Manager's existing lazy binding hook.
+
+        Creating a Runner must remain read-only with respect to Agent/model
+        construction. Composing the binder also covers fresh roots acquired
+        after a mode switch and functional roots recreated on later requests.
+        """
+
+        if self._runner is None:
+            return
+        manager = self._runner.agent_manager
+        original_bind = manager.callbacks.bind_runtime
+
+        def bind_with_strategy(managed: Any, cancel_event: threading.Event) -> None:
+            if original_bind is not None:
+                original_bind(managed, cancel_event)
+            if managed.is_root and self._strategy is not None:
+                managed.instance.set_exploration_strategy(self._strategy)
+
+        manager.callbacks = replace(manager.callbacks, bind_runtime=bind_with_strategy)
+
+    def switch_strategy(
+        self,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Set candidate count; `/rm` separately controls catalog scoring."""
+
+        params = params or {}
+        unknown = set(params) - {"breadth", "reset"}
+        if unknown:
+            raise ValueError("Unknown strategy parameters: " + ", ".join(sorted(unknown)))
+        reset = params.get("reset", False)
+        if not isinstance(reset, bool):
+            raise ValueError("reset must be a boolean")
+        if reset and "breadth" in params:
+            raise ValueError("reset cannot be combined with breadth")
+        breadth = 1 if reset else params.get("breadth", 1)
+        # bool is an int subclass, but is not a candidate count. Do not coerce
+        # strings, lists or fractional numbers into a valid configuration.
+        if type(breadth) is not int or breadth < 1:
+            raise ValueError("breadth must be a positive integer")
+
+        current_strategy = self._current_strategy()
+        # Explicit catalog choices survive breadth=1 and strategy reset. An
+        # injected SDK scorer retains the existing reset semantics instead.
+        reward_model = self._reward_model
+        if reward_model is None and not reset:
+            reward_model = getattr(current_strategy, "reward_model", None)
+        return self._apply_strategy(breadth=breadth, reward_model=reward_model, reset=reset)
+
+    def _apply_strategy(
+        self, *, breadth: int, reward_model: BaseRewardModel | None, reset: bool = False,
+    ) -> dict[str, Any]:
+        """Share root binding and pending state publication for `/rm` and `/strategy`."""
+        from juice_agents.core.agent.context.strategies import GreedyStrategy, TreeOfThoughtsStrategy
+
+        root = self._resolve_root_agent()
+        strategy = (
+            GreedyStrategy()
+            if breadth == 1
+            else TreeOfThoughtsStrategy(breadth=breadth, reward_model=reward_model)
+        )
+        selection_enabled = breadth > 1 and reward_model is not None
+        strategy_info = {
+            "type": "greedy" if breadth == 1 else "exploration",
+            "params": {} if breadth == 1 else {"breadth": breadth},
+            "execution": "candidate_selection" if selection_enabled else "linear",
+            "scorer_configured": reward_model is not None,
+        }
+        # Apply before publishing the configuration so a failing setter does
+        # not replace the previous pending choice.
+        if root is not None:
+            root.set_exploration_strategy(strategy)
+        self._strategy = strategy
+        self._strategy_params = {"reset": True} if reset else {"breadth": breadth}
+        status = "applied" if root is not None else "pending"
+        execution_message = (
+            "Per-step candidate selection enabled"
+            if selection_enabled
+            else "线性执行 (Linear execution): "
+            + ("breadth=1" if breadth == 1 else "no scorer configured")
+        )
+        logger.info(
+            "探索策略已配置: status=%s breadth=%s execution=%s",
+            status,
+            breadth,
+            strategy_info["execution"],
+        )
+        return {
+            "status": status,
+            "strategy": strategy_info,
+            "message": execution_message + (
+                "; strategy will apply when the root Agent is acquired" if status == "pending" else ""
+            ),
+        }
 
     def _workflow_registry(self) -> WorkflowRegistry:
         """Read workflow declarations without constructing a workflow runtime."""

@@ -59,6 +59,7 @@ class RunnerManager:
         runtime_config_path = options.pop(
             "runtime_config_path", self.runtime_config_path
         )
+        runtime_overrides = options.pop("runtime_overrides", None)
         team_name = options.pop("team_name", None)
         if options:
             raise TypeError("RunnerManager.create 不接受旧 Agent 注入参数: " + ", ".join(sorted(options)))
@@ -69,6 +70,7 @@ class RunnerManager:
                 base_dir=self.workspace,
                 team_name=team_name,
                 runtime_config_path=runtime_config_path,
+                runtime_overrides=runtime_overrides,
             ),
             runtime_config_path=runtime_config_path,
         )
@@ -84,6 +86,7 @@ class RunnerManager:
         runtime_config_path = options.pop(
             "runtime_config_path", self.runtime_config_path
         )
+        runtime_overrides = options.pop("runtime_overrides", None)
         if options:
             raise TypeError("RunnerManager.resume 不接受旧 Agent 注入参数: " + ", ".join(sorted(options)))
         return self._bind(
@@ -91,6 +94,7 @@ class RunnerManager:
                 runner_id=runner_id,
                 base_dir=self.workspace,
                 runtime_config_path=runtime_config_path,
+                runtime_overrides=runtime_overrides,
             ),
             runtime_config_path=runtime_config_path,
         )

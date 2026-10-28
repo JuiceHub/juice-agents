@@ -1,4 +1,7 @@
+"""聊天模型：统一 generate 接口及各 provider 的请求、重试与响应解析。"""
+
 import logging
+import math
 import time
 import threading
 from typing import Any, Dict, List, Optional
@@ -6,22 +9,9 @@ from typing import Any, Dict, List, Optional
 from juice_agents.core.runner.execution.cancellation import StreamCancelled, raise_if_cancelled
 from juice_agents.core.agent.context.content import CACHE_BOUNDARY_KEY
 
+from ..utils import normalize_token_usage
+
 logger = logging.getLogger(__name__)
-
-try:
-    from volcenginesdkarkruntime import Ark  # type: ignore
-except ImportError:  # pragma: no cover - handled at runtime
-    Ark = None  # type: ignore
-
-try:
-    from openai import OpenAI  # type: ignore
-except ImportError:  # pragma: no cover - handled at runtime
-    OpenAI = None  # type: ignore
-
-try:
-    from anthropic import Anthropic  # type: ignore
-except ImportError:  # pragma: no cover - handled at runtime
-    Anthropic = None  # type: ignore
 
 
 def _get_field(obj: Any, field: str) -> Optional[Any]:
@@ -31,88 +21,6 @@ def _get_field(obj: Any, field: str) -> Optional[Any]:
     if isinstance(obj, dict):
         return obj.get(field)
     return None
-
-
-def _to_plain_data(value: Any, *, _depth: int = 0) -> Any:
-    """把 SDK 对象安全转成可 JSON 序列化的基础结构。"""
-    if _depth > 8:
-        return str(value)
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, dict):
-        return {str(k): _to_plain_data(v, _depth=_depth + 1) for k, v in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [_to_plain_data(item, _depth=_depth + 1) for item in value]
-
-    for attr in ("model_dump", "dict"):
-        dump = getattr(value, attr, None)
-        if callable(dump):
-            try:
-                return _to_plain_data(dump(), _depth=_depth + 1)
-            except TypeError:
-                continue
-
-    public_fields: dict[str, Any] = {}
-    for name in dir(value):
-        if name.startswith("_"):
-            continue
-        try:
-            field_value = getattr(value, name)
-        except Exception:
-            continue
-        if not callable(field_value):
-            public_fields[name] = field_value
-    if public_fields:
-        return _to_plain_data(public_fields, _depth=_depth + 1)
-    return str(value)
-
-
-def _coerce_token_count(value: Any) -> int | None:
-    """将 provider 返回的 token 数转成 int；无法可靠转换时返回 None。"""
-    if isinstance(value, bool) or value is None:
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
-    if isinstance(value, str):
-        stripped = value.strip()
-        if stripped.isdigit():
-            return int(stripped)
-    return None
-
-
-def normalize_token_usage(usage: Any) -> dict[str, Any] | None:
-    """
-    归一化 provider 原始 token usage。
-
-    只使用模型引擎返回的 usage，不在本地估算 token。数值字段按 OpenAI
-    compatible 与 Anthropic Messages API 的常见命名做映射；原始 usage
-    以 provider_usage 保留，便于排查 provider 特有统计。
-    """
-    if usage is None:
-        return None
-
-    raw_input_tokens = _get_field(usage, "input_tokens")
-    if raw_input_tokens is None:
-        raw_input_tokens = _get_field(usage, "prompt_tokens")
-    raw_output_tokens = _get_field(usage, "output_tokens")
-    if raw_output_tokens is None:
-        raw_output_tokens = _get_field(usage, "completion_tokens")
-    input_tokens = _coerce_token_count(raw_input_tokens)
-    output_tokens = _coerce_token_count(raw_output_tokens)
-    total_tokens = _coerce_token_count(_get_field(usage, "total_tokens"))
-    if total_tokens is None and input_tokens is not None and output_tokens is not None:
-        total_tokens = input_tokens + output_tokens
-
-    normalized: dict[str, Any] = {"provider_usage": _to_plain_data(usage)}
-    if input_tokens is not None:
-        normalized["input_tokens"] = input_tokens
-    if output_tokens is not None:
-        normalized["output_tokens"] = output_tokens
-    if total_tokens is not None:
-        normalized["total_tokens"] = total_tokens
-    return normalized
 
 
 class _EmptyModelResponseError(RuntimeError):
@@ -126,17 +34,17 @@ class _EmptyModelResponseError(RuntimeError):
 
 class BaseChatModel:
     """
-    抽象聊天模型基类，封装公共调用、重试与响应解析逻辑。
+    聊天模型基类，封装公共调用、重试与响应解析逻辑。
     """
 
     def __init__(
         self,
-        api_base: str,
-        api_key: str,
+        api_base: str | None,
+        api_key: str | None,
         model_name: str,
         thinking: Optional[Dict[str, Any]] = None,
         max_retry_times: int = 3,
-        wait_time: int = 1,
+        wait_time: float = 1,
         client: Optional[Any] = None,
     ) -> None:
         self.api_base = api_base
@@ -274,42 +182,41 @@ class BaseChatModel:
         给请求 payload 注入 provider 特有参数。
 
         默认实现保持 provider 原生字段直传；需要通过 OpenAI SDK `extra_body`
-        传扩展字段的子类可覆写该方法。
+        传扩展字段时由 ChatModel 覆写该方法。
         """
         if self._thinking_supported:
             payload["thinking"] = self.thinking
         return payload
 
     def _is_retryable_exception(self, exc: Exception) -> bool:
-        # 参数或类型错误一般不适合重试。
-        if isinstance(exc, StreamCancelled):
+        """只重试可恢复的模型/传输失败，不从错误正文猜测 HTTP 状态。"""
+        if isinstance(exc, (StreamCancelled, TypeError, ValueError, AssertionError)):
             return False
-        if isinstance(exc, (TypeError, ValueError, AssertionError)):
-            return False
-
-        err_class = exc.__class__.__name__.lower()
-        err_msg = str(exc).lower()
-        retry_keywords = (
-            "timeout",
-            "tempor",
-            "connection",
-            "connect",
-            "rate",
-            "429",
-            "502",
-            "503",
-            "504",
-            "retry",
-            "unavailable",
-            "econn",
-            "servfail",
-        )
-        if any(keyword in err_class for keyword in retry_keywords) or any(
-            keyword in err_msg for keyword in retry_keywords
-        ):
+        if isinstance(exc, _EmptyModelResponseError):
             return True
-        # 保持向后兼容，未匹配到关键词时默认重试。
-        return True
+
+        # 三个 SDK 都暴露 status_code；原生 HTTP 异常可从 response 读取。
+        # 状态优先于正文，避免 400/401 的说明包含 timeout 等词时重复请求。
+        status = getattr(exc, "status_code", None)
+        if status is None:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+        if isinstance(status, int) and not isinstance(status, bool):
+            return status in {408, 409, 429} or 500 <= status < 600
+        if isinstance(exc, (ConnectionError, TimeoutError)):
+            return True
+
+        # SDK 的连接/超时异常不继承内建 ConnectionError；只加载当前 backend，
+        # 保持模型模块冷导入不加载其他 provider 的约定。未知异常直接交给上层。
+        backend = getattr(self, "backend", None)
+        if backend == "openai":
+            from openai import APIConnectionError
+        elif backend == "anthropic":
+            from anthropic import APIConnectionError
+        elif backend == "doubao":
+            from volcenginesdkarkruntime._exceptions import ArkAPIConnectionError as APIConnectionError
+        else:
+            return False
+        return isinstance(exc, APIConnectionError)
 
     def _extract_reasoning_content(self, message: Any) -> Optional[Any]:
         return _get_field(message, "reasoning_content")
@@ -377,7 +284,8 @@ class BaseChatModel:
         }
 
     def _invoke_model_streaming_once(
-        self, payload: Dict[str, Any], cancel_event: threading.Event
+        self, payload: Dict[str, Any], cancel_event: threading.Event,
+        usage_calls: list[dict[str, Any]],
     ) -> Dict[str, Any]:
         """Call OpenAI-compatible chat completions in streaming mode."""
 
@@ -388,34 +296,48 @@ class BaseChatModel:
             stream_payload.pop("stream_options", None)
         elif stream_payload.get("stream_options") is None:
             stream_payload.setdefault("stream_options", {"include_usage": True})
-        stream = self.client.chat.completions.create(**stream_payload)
+        try:
+            stream = self.client.chat.completions.create(**stream_payload)
+        except TypeError:
+            # SDK 本地参数校验失败时尚未发送请求，由外层执行协议降级。
+            raise
+        except Exception:
+            self._append_usage(usage_calls, None)
+            raise
         stop_watching = self._watch_stream_cancel(stream, cancel_event)
         chunks: list[Any] = []
+        usage: Any = None
         try:
             for chunk in stream:
-                raise_if_cancelled(cancel_event)
+                # 已到达的 chunk 即使紧接着取消，也可能包含已发生的消耗。
                 chunks.append(chunk)
+                chunk_usage = _get_field(chunk, "usage")
+                if chunk_usage is not None:
+                    usage = chunk_usage
+                raise_if_cancelled(cancel_event)
         except StreamCancelled:
             self._close_stream_quietly(stream)
             raise
         finally:
             stop_watching()
+            self._append_usage(usage_calls, usage)
         raise_if_cancelled(cancel_event)
         return self._build_message_from_stream_chunks(chunks)
 
     def _invoke_model_once(
-        self, payload: Dict[str, Any], cancel_event: threading.Event | None = None
+        self, payload: Dict[str, Any], cancel_event: threading.Event | None = None,
+        *, usage_calls: list[dict[str, Any]],
     ) -> Any:
         """
         执行一次底层 SDK 调用。
 
-        生命周期编排放在基类中，provider 子类只需要关注客户端初始化和
-        provider 差异化的响应字段解析，不参与重试循环本身。
+        生命周期编排放在基类中，ChatModel 只在 SDK 边界分发 provider 协议，
+        不重复实现重试循环。
         """
         if cancel_event is not None:
             raise_if_cancelled(cancel_event)
             try:
-                return self._invoke_model_streaming_once(payload, cancel_event)
+                return self._invoke_model_streaming_once(payload, cancel_event, usage_calls)
             except TypeError as exc:
                 if "stream_options" in str(exc):
                     logger.warning(
@@ -426,7 +348,7 @@ class BaseChatModel:
                     streaming_payload.pop("stream_options", None)
                     streaming_payload["_disable_stream_usage_options"] = True
                     try:
-                        return self._invoke_model_streaming_once(streaming_payload, cancel_event)
+                        return self._invoke_model_streaming_once(streaming_payload, cancel_event, usage_calls)
                     except TypeError as fallback_exc:
                         exc = fallback_exc
                 logger.debug(
@@ -435,7 +357,7 @@ class BaseChatModel:
                     exc,
                 )
         try:
-            return self.client.chat.completions.create(**payload)
+            return self._call_sdk_once(self.client.chat.completions.create, payload, usage_calls)
         except TypeError as exc:
             if self._should_retry_without_thinking(exc, payload):
                 logger.warning(
@@ -445,8 +367,31 @@ class BaseChatModel:
                 self._thinking_supported = False
                 fallback_payload = dict(payload)
                 fallback_payload.pop("thinking", None)
-                return self.client.chat.completions.create(**fallback_payload)
+                return self._call_sdk_once(self.client.chat.completions.create, fallback_payload, usage_calls)
             raise
+
+    def _append_usage(self, usage_calls: list[dict[str, Any]], usage: Any) -> None:
+        """只向当前 generate 的局部列表追加用量，调用方决定如何收集与汇总。"""
+        usage_calls.append({
+            "backend": getattr(self, "backend", "unknown"),
+            "model_name": self.model_name,
+            "usage": normalize_token_usage(usage),
+        })
+
+    def _call_sdk_once(
+        self, create: Any, payload: Dict[str, Any], usage_calls: list[dict[str, Any]],
+    ) -> Any:
+        """记录响应及网络失败；解析失败或空内容重试也保留已发生的消耗。"""
+        try:
+            response = create(**payload)
+        except TypeError:
+            # thinking/stream 兼容性降级是在 SDK 本地完成，不当作计费请求。
+            raise
+        except Exception:
+            self._append_usage(usage_calls, None)
+            raise
+        self._append_usage(usage_calls, _get_field(response, "usage"))
+        return response
 
     @staticmethod
     def _should_retry_without_thinking(exc: TypeError, payload: Dict[str, Any]) -> bool:
@@ -538,6 +483,7 @@ class BaseChatModel:
         messages: List[Dict[str, Any]],
         stop_sequence: Optional[List[str]],
         cancel_event: threading.Event | None = None,
+        *, usage_calls: list[dict[str, Any]],
     ) -> Dict[str, Any]:
         """
         显式串联一次 generate 的生命周期。
@@ -550,10 +496,11 @@ class BaseChatModel:
             try:
                 raise_if_cancelled(cancel_event)
                 payload = self._build_payload(messages, stop_sequence)
-                response = self._invoke_model_once(payload, cancel_event=cancel_event)
+                response = self._invoke_model_once(payload, cancel_event=cancel_event, usage_calls=usage_calls)
                 message = response if isinstance(response, dict) else self._build_message(response)
                 raise_if_cancelled(cancel_event)
-                return self._validate_response_message(message)
+                message = self._validate_response_message(message)
+                return {**message, "usage_calls": usage_calls}
             except Exception as exc:  # pragma: no cover - runtime branch
                 last_err = exc
                 self._handle_generate_exception(exc, attempt, cancel_event)
@@ -598,135 +545,28 @@ class BaseChatModel:
         真正的调用阶段拆分到私有生命周期函数中，便于后续继续扩展公共校验和
         provider 复用逻辑。
         """
-        messages = self._validate_messages(messages)
-        stop_sequence = self._normalize_stop_sequence(stop_sequence)
-        return self._run_generate_lifecycle(messages, stop_sequence, cancel_event)
-
-
-class DoubaoModel(BaseChatModel):
-    """
-    Doubao 大模型封装，基于 volcengine-python-sdk[ark]。
-
-    参数:
-        api_base: 请求地址
-        api_key: 认证密钥
-        model_name: 模型名称或 endpoint
-        thinking: dict，控制是否开启深度推理模式
-        max_retry_times: 最大重试次数
-        wait_time: 重试等待秒数
-        client: 可注入的 Ark 客户端，便于测试
-    """
-
-    def __init__(
-        self,
-        api_base: str,
-        api_key: str,
-        model_name: str,
-        thinking: Optional[Dict[str, Any]] = None,
-        max_retry_times: int = 3,
-        wait_time: int = 1,
-        client: Optional[Any] = None,
-    ) -> None:
-        super().__init__(
-            api_base=api_base,
-            api_key=api_key,
-            model_name=model_name,
-            thinking=thinking,
-            max_retry_times=max_retry_times,
-            wait_time=wait_time,
-            client=client,
-        )
-
-    def _init_client(self) -> Any:
-        if Ark is None:
-            raise ImportError(
-                "volcengine-python-sdk[ark] 未安装，无法创建 DoubaoModel 客户端"
+        usage_calls: list[dict[str, Any]] = []
+        try:
+            messages = self._validate_messages(messages)
+            stop_sequence = self._normalize_stop_sequence(stop_sequence)
+            return self._run_generate_lifecycle(
+                messages, stop_sequence, cancel_event, usage_calls=usage_calls,
             )
-        try:
-            return Ark(api_key=self.api_key, base_url=self.api_base)
-        except TypeError:
-            # 兼容不同 SDK 版本的参数命名
-            return Ark(api_key=self.api_key, api_base=self.api_base)
-
-    def _extract_reasoning_content(self, message: Any) -> Optional[Any]:
-        return _get_field(message, "reasoning_content")
+        except Exception as exc:
+            # 保留原异常类型，调用方即使在取消或失败时也能显式读取已发生的消耗。
+            exc.usage_calls = usage_calls
+            raise
 
 
-class OpenAIModel(BaseChatModel):
-    """
-    OpenAI 兼容模型封装，适配 OpenAI SDK 风格的接口。
+class ChatModel(BaseChatModel):
+    """统一聊天模型：backend 选择原生 SDK，共享生成、重试和取消生命周期。
 
-    参数:
-        api_base: 请求地址
-        api_key: 认证密钥
-        model_name: 模型名称
-        thinking: dict，控制是否开启深度推理模式（兼容字段）
-        max_retry_times: 最大重试次数
-        wait_time: 重试等待秒数
-        client: 可注入的 OpenAI 客户端，便于测试
+    连接参数可直接传入，也可注入与 backend 对应的原生 client。OpenAI/Ark
+    共用 Chat Completions 协议；Anthropic 的 system、缓存、thinking 和流式
+    事件在私有转换方法中处理，不向调用方暴露不同的模型类型。
     """
 
-    def __init__(
-        self,
-        api_base: str,
-        api_key: str,
-        model_name: str,
-        thinking: Optional[Dict[str, Any]] = None,
-        max_retry_times: int = 3,
-        wait_time: int = 1,
-        client: Optional[Any] = None,
-    ) -> None:
-        super().__init__(
-            api_base=api_base,
-            api_key=api_key,
-            model_name=model_name,
-            thinking=thinking,
-            max_retry_times=max_retry_times,
-            wait_time=wait_time,
-            client=client,
-        )
-
-    def _init_client(self) -> Any:
-        if OpenAI is None:
-            raise ImportError("openai 未安装，无法创建 OpenAIModel 客户端")
-        try:
-            return OpenAI(api_key=self.api_key, base_url=self.api_base)
-        except TypeError:
-            # 兼容不同 SDK 版本的参数命名
-            return OpenAI(api_key=self.api_key, api_base=self.api_base)
-
-    def _build_message(self, response: Any) -> Dict[str, Any]:
-        return super()._build_message(response)
-
-    def _inject_provider_payload_options(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        OpenAI Python SDK 不接受顶层 thinking 参数。
-
-        对兼容 provider（如 Ark）的扩展字段，统一走 extra_body 透传。
-        """
-        extra_body = dict(payload.get("extra_body") or {})
-        extra_body["thinking"] = self.thinking
-        payload["extra_body"] = extra_body
-        payload.pop("thinking", None)
-        return payload
-
-    def _extract_reasoning_content(self, message: Any) -> Optional[Any]:
-        return _get_field(message, "reasoning_content") or _get_field(message, "reasoning")
-
-
-class AnthropicModel(BaseChatModel):
-    """
-    Anthropic/Claude 模型封装，基于官方 anthropic SDK。
-
-    Anthropic Messages API 使用顶层 system 字段和 messages.create(...)，
-    与 OpenAI/Ark 的 chat.completions.create(...) 不同，因此只覆写
-    provider 边界：payload 构造、SDK 调用和响应解析；重试与空响应校验
-    仍复用 BaseChatModel 生命周期。
-
-    effort 通过 output_config 传递（官方推荐方式），thinking 使用 adaptive 模式。
-    """
-
-    # 不同 effort 级别对应的最小 max_tokens，避免高 effort 时 token 空间不足
+    # Anthropic 高 effort 需要足够输出空间，沿用原有 token 下限。
     _EFFORT_MIN_MAX_TOKENS: Dict[str, int] = {
         "low": 4096,
         "medium": 8192,
@@ -734,39 +574,122 @@ class AnthropicModel(BaseChatModel):
         "xhigh": 64000,
         "max": 64000,
     }
+    # 部分 Opus 在当前 SDK 中只允许最多 8192 个非流式输出 token；采用该
+    # 保守阈值也覆盖通用的长请求限制，不依赖 SDK 私有模型表或超时计算器。
+    _ANTHROPIC_STREAM_TOKEN_THRESHOLD = 8192
 
     def __init__(
         self,
-        api_base: str,
-        api_key: str,
         model_name: str,
+        *,
+        backend: str = "openai",
+        api_base: str | None = None,
+        api_key: str | None = None,
         thinking: Optional[Dict[str, Any]] = None,
         max_retry_times: int = 3,
-        wait_time: int = 1,
+        wait_time: float = 1,
         client: Optional[Any] = None,
         max_tokens: int = 4096,
         effort_config: Optional[Dict[str, Any]] = None,
     ) -> None:
+        if not isinstance(model_name, str) or not model_name.strip():
+            raise ValueError("聊天模型名称必须为非空字符串")
+        if not isinstance(backend, str) or backend not in {"openai", "doubao", "anthropic"}:
+            raise ValueError("聊天模型 backend 必须为 openai、doubao 或 anthropic")
+        for name, value in (("max_retry_times", max_retry_times), ("max_tokens", max_tokens)):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} 必须为正整数")
+        if (
+            isinstance(wait_time, bool)
+            or not isinstance(wait_time, (int, float))
+            or not math.isfinite(wait_time)
+            or wait_time < 0
+        ):
+            raise ValueError("wait_time 必须为非负有限数值")
+        if effort_config is not None and not isinstance(effort_config, dict):
+            raise TypeError("effort_config 必须为 dict")
+        self.backend = backend
         self.max_tokens = max_tokens
-        self.effort_config = effort_config
+        self.effort_config = dict(effort_config) if effort_config is not None else None
+        if client is not None:
+            self._validate_client(client)
         super().__init__(
             api_base=api_base,
             api_key=api_key,
-            model_name=model_name,
+            model_name=model_name.strip(),
             thinking=thinking,
             max_retry_times=max_retry_times,
             wait_time=wait_time,
             client=client,
         )
 
+    def _validate_client(self, client: Any) -> None:
+        """在创建连接时检查 SDK 入口，避免错误 client 到请求时才失败。"""
+        if self.backend == "anthropic":
+            endpoint = getattr(client, "messages", None)
+        else:
+            endpoint = getattr(getattr(client, "chat", None), "completions", None)
+        if not callable(getattr(endpoint, "create", None)):
+            raise TypeError(f"client 必须提供 {self.backend} SDK 的可调用 create 接口")
+
     def _init_client(self) -> Any:
-        if Anthropic is None:
-            raise ImportError("anthropic 未安装，无法创建 AnthropicModel 客户端")
-        try:
-            return Anthropic(auth_token=self.api_key, base_url=self.api_base)
-        except TypeError:
-            # 兼容旧 SDK 或只支持 API key 的第三方环境。
-            return Anthropic(api_key=self.api_key, base_url=self.api_base)
+        """仅加载选中的 SDK；注入 client 时不读取凭证或创建新连接。"""
+        options: Dict[str, Any] = {}
+        if self.api_base is not None:
+            options["base_url"] = self.api_base
+        if self.api_key is not None:
+            # 保留项目现有的 Anthropic bearer token 约定；其他认证可注入 client。
+            options["auth_token" if self.backend == "anthropic" else "api_key"] = self.api_key
+        if self.backend == "openai":
+            from openai import OpenAI
+
+            client = OpenAI(**options)
+        elif self.backend == "doubao":
+            from volcenginesdkarkruntime import Ark
+
+            client = Ark(**options)
+        else:
+            from anthropic import Anthropic
+
+            client = Anthropic(**options)
+        self._validate_client(client)
+        logger.debug("创建聊天模型客户端: backend=%s model=%s", self.backend, self.model_name)
+        return client
+
+    def _inject_provider_payload_options(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """OpenAI SDK 扩展参数放入 extra_body，Ark 使用原生 thinking 字段。"""
+        if self.backend == "openai":
+            extra_body = dict(payload.get("extra_body") or {})
+            extra_body["thinking"] = self.thinking
+            payload["extra_body"] = extra_body
+            return payload
+        return super()._inject_provider_payload_options(payload)
+
+    def _extract_reasoning_content(self, message: Any) -> Optional[Any]:
+        reasoning = _get_field(message, "reasoning_content")
+        if self.backend == "openai":
+            return reasoning or _get_field(message, "reasoning")
+        return reasoning
+
+    def _build_payload(
+        self, messages: List[Dict[str, Any]], stop_sequence: Optional[List[str]]
+    ) -> Dict[str, Any]:
+        if self.backend == "anthropic":
+            return self._build_anthropic_payload(messages, stop_sequence)
+        return super()._build_payload(messages, stop_sequence)
+
+    def _invoke_model_once(
+        self, payload: Dict[str, Any], cancel_event: threading.Event | None = None,
+        *, usage_calls: list[dict[str, Any]],
+    ) -> Any:
+        if self.backend == "anthropic":
+            return self._invoke_anthropic_once(payload, cancel_event, usage_calls=usage_calls)
+        return super()._invoke_model_once(payload, cancel_event, usage_calls=usage_calls)
+
+    def _build_message(self, response: Any) -> Dict[str, Any]:
+        if self.backend == "anthropic":
+            return self._build_anthropic_message(response)
+        return super()._build_message(response)
 
     def _content_to_text(self, content: Any) -> str:
         """把框架内部 content block 收敛为 Anthropic system 可接受的纯文本。"""
@@ -837,7 +760,7 @@ class AnthropicModel(BaseChatModel):
             blocks.append(out_block)
         return blocks
 
-    def _build_payload(
+    def _build_anthropic_payload(
         self, messages: List[Dict[str, Any]], stop_sequence: Optional[List[str]]
     ) -> Dict[str, Any]:
         system_field: Any = None
@@ -897,74 +820,106 @@ class AnthropicModel(BaseChatModel):
         addition_blocks = addition if isinstance(addition, list) else [{"type": "text", "text": str(addition)}]
         return [*existing_blocks, *addition_blocks]
 
-    def _invoke_model_once(
-        self, payload: Dict[str, Any], cancel_event: threading.Event | None = None
+    def _invoke_anthropic_streaming_once(
+        self, stream_method: Any, payload: Dict[str, Any],
+        cancel_event: threading.Event | None, usage_calls: list[dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """读取原生事件或官方 SDK 最终消息的 usage，快照字段覆盖而不相加。"""
+        text_parts: list[str] = []
+        thinking_parts: list[str] = []
+        raw_usage: dict[str, Any] = {}
+        stream_cm = stream = None
+        stop_watching = None
+        request_started = False
+
+        def merge_usage(usage: Any) -> None:
+            normalized = normalize_token_usage(usage)
+            if normalized is not None and isinstance(normalized["provider_usage"], dict):
+                raw_usage.update(normalized["provider_usage"])
+
+        try:
+            stream_cm = stream_method(**payload)
+            request_started = True
+            with stream_cm as stream:
+                # 高输出预算即使没有取消令牌也必须流式；只有可取消请求需要
+                # 后台 watcher，事件聚合和用量记录始终复用同一条执行路径。
+                if cancel_event is not None:
+                    stop_watching = self._watch_stream_cancel(stream, cancel_event)
+                for event in stream:
+                    event_type = _get_field(event, "type")
+                    if event_type == "message_start":
+                        merge_usage(_get_field(_get_field(event, "message"), "usage"))
+                    elif event_type == "message_delta":
+                        merge_usage(_get_field(event, "usage"))
+                    # 取消发生时仍保留刚到达的 usage，不读取 final message 阻塞退出。
+                    raise_if_cancelled(cancel_event)
+                    if event_type == "content_block_delta":
+                        delta = _get_field(event, "delta")
+                        delta_type = _get_field(delta, "type")
+                        if delta_type == "text_delta":
+                            text_parts.append(str(_get_field(delta, "text") or ""))
+                        elif delta_type == "thinking_delta":
+                            thinking_parts.append(str(_get_field(delta, "thinking") or ""))
+                raise_if_cancelled(cancel_event)
+                get_final_message = getattr(stream, "get_final_message", None)
+                if callable(get_final_message):
+                    merge_usage(_get_field(get_final_message(), "usage"))
+            return {
+                "role": "assistant", "content": "".join(text_parts),
+                "reasoning_content": "".join(thinking_parts),
+                "usage": normalize_token_usage(raw_usage) if raw_usage else None,
+            }
+        except StreamCancelled:
+            self._close_stream_quietly(stream if stream is not None else stream_cm)
+            raise
+        except TypeError:
+            # SDK 在创建/进入流时拒绝参数，不是一次真实模型请求。
+            if stream is None:
+                request_started = False
+            raise
+        except Exception:
+            request_started = True
+            raise
+        finally:
+            if stop_watching is not None:
+                stop_watching()
+            if request_started:
+                self._append_usage(usage_calls, raw_usage if raw_usage else None)
+
+    def _invoke_anthropic_once(
+        self, payload: Dict[str, Any], cancel_event: threading.Event | None = None,
+        *, usage_calls: list[dict[str, Any]],
     ) -> Any:
-        if cancel_event is not None:
-            raise_if_cancelled(cancel_event)
+        raise_if_cancelled(cancel_event)
+        if cancel_event is not None or payload["max_tokens"] > self._ANTHROPIC_STREAM_TOKEN_THRESHOLD:
             stream_method = getattr(self.client.messages, "stream", None)
             if callable(stream_method):
-                text_parts: list[str] = []
-                thinking_parts: list[str] = []
-                stream_cm = None
-                stop_watching = None
                 try:
-                    stream_cm = stream_method(**payload)
-                    stop_watching = self._watch_stream_cancel(stream_cm, cancel_event)
-                    with stream_cm as stream:
-                        for event in stream:
-                            raise_if_cancelled(cancel_event)
-                            # 处理不同事件类型
-                            event_type = getattr(event, "type", None)
-                            if event_type == "content_block_delta":
-                                delta = getattr(event, "delta", None)
-                                delta_type = getattr(delta, "type", None)
-                                if delta_type == "text_delta":
-                                    text_parts.append(str(getattr(delta, "text", "")))
-                                elif delta_type == "thinking_delta":
-                                    thinking_parts.append(str(getattr(delta, "thinking", "")))
-                    raise_if_cancelled(cancel_event)
-                    return {
-                        "role": "assistant",
-                        "content": "".join(text_parts),
-                        "reasoning_content": "".join(thinking_parts),
-                        "usage": None,
-                    }
-                except StreamCancelled:
-                    self._close_stream_quietly(stream_cm)
-                    raise
+                    return self._invoke_anthropic_streaming_once(
+                        stream_method, payload, cancel_event, usage_calls,
+                    )
                 except TypeError as exc:
                     if self._should_retry_without_thinking(exc, payload):
-                        logger.warning(
-                            "%s 客户端不支持 thinking 参数，自动降级",
-                            self.__class__.__name__,
-                        )
+                        logger.warning("%s 客户端不支持 thinking 参数，自动降级", self.__class__.__name__)
                         self._thinking_supported = False
                         fallback_payload = dict(payload)
                         fallback_payload.pop("thinking", None)
-                        return self._invoke_model_once(fallback_payload, cancel_event)
-                    logger.debug(
-                        "%s streaming unsupported, falling back to blocking call",
-                        self.__class__.__name__,
-                    )
-                finally:
-                    if stop_watching is not None:
-                        stop_watching()
+                        return self._invoke_anthropic_once(
+                            fallback_payload, cancel_event, usage_calls=usage_calls,
+                        )
+                    logger.debug("%s streaming unsupported, falling back to blocking call", self.__class__.__name__)
         try:
-            return self.client.messages.create(**payload)
+            return self._call_sdk_once(self.client.messages.create, payload, usage_calls)
         except TypeError as exc:
             if self._should_retry_without_thinking(exc, payload):
-                logger.warning(
-                    "%s 客户端不支持 thinking 参数，自动降级",
-                    self.__class__.__name__,
-                )
+                logger.warning("%s 客户端不支持 thinking 参数，自动降级", self.__class__.__name__)
                 self._thinking_supported = False
                 fallback_payload = dict(payload)
                 fallback_payload.pop("thinking", None)
-                return self.client.messages.create(**fallback_payload)
+                return self._call_sdk_once(self.client.messages.create, fallback_payload, usage_calls)
             raise
 
-    def _build_message(self, response: Any) -> Dict[str, Any]:
+    def _build_anthropic_message(self, response: Any) -> Dict[str, Any]:
         blocks = _get_field(response, "content")
         if not blocks:
             raise ValueError("返回结果缺少 content")
@@ -988,4 +943,5 @@ class AnthropicModel(BaseChatModel):
         }
 
 
-__all__ = ["AnthropicModel", "BaseChatModel", "DoubaoModel", "OpenAIModel", "normalize_token_usage"]
+
+__all__ = ["BaseChatModel", "ChatModel", "normalize_token_usage"]

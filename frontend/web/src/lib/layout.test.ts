@@ -14,7 +14,7 @@ import {
   syncBrowserTabsForRunner,
   syncBrowserTabsFromPreview,
 } from "./layout.js";
-import type { ActionStep, ActorSessionsReport, RunnerStreamEvent } from "@juice-agents/shared/gateway/types";
+import type { ActionStep, ActiveAgentsReport, RunnerStreamEvent } from "@juice-agents/shared/gateway/types";
 
 test("layout keeps controls on the left and separates right-panel features", () => {
   assert.deepEqual([...LEFT_NAV_ACTIONS], ["New chat", "Search", "Skills"]);
@@ -124,14 +124,14 @@ test("runner label treats runners as agent task threads", () => {
 });
 
 test("subactor nav items are built under the active root runner", () => {
-  const report: ActorSessionsReport = {
+  const report: ActiveAgentsReport = {
     runner_id: "run-1",
     permission_mode: "default",
     agent_mode: "team",
-    root_actor_name: "teamlead",
-    actors: [
-      makeActor({ actor_name: "teamlead", is_root: true }),
-      makeActor({ actor_name: "researcher", actor_kind: "teammate", status: "active" }),
+    root_agent_name: "teamlead",
+    agents: [
+      makeActor({ agent_name: "teamlead", is_root: true }),
+      makeActor({ agent_name: "researcher", agent_kind: "teammate", status: "active" }),
     ],
   };
 
@@ -193,10 +193,10 @@ test("stream events keep deriving workspace file preview intents", () => {
 
 function makeActor(overrides: Record<string, unknown> = {}) {
   return {
-    actor_id: String(overrides.actor_name || "actor"),
-    actor_name: "actor",
-    actor_kind: "agent",
-    actor_role: "worker",
+    agent_id: String(overrides.agent_name || "actor"),
+    agent_name: "actor",
+    agent_kind: "agent",
+    agent_role: "worker",
     status: "idle",
     is_root: false,
     current_async_task_id: "",
@@ -213,8 +213,8 @@ function makeEvent(overrides: Partial<RunnerStreamEvent>): RunnerStreamEvent {
     permission_mode: "default",
     agent_mode: "agent",
     runner_id: "run-1",
-    actor_name: "root",
-    actor_role: "root",
+    agent_name: "root",
+    agent_role: "root",
     step_num: 1,
     action_step: makeStep({}),
     team_event: null,

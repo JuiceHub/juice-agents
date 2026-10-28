@@ -26,7 +26,7 @@ Runner ── 持有 ──► AgentManager      session · snapshot · stream �
 
 内置的 `agent`、`plan`、`group`、`team` 共用同一条 `Runner.stream()` 路径，只在 binding、能力、并发和策略等数据上不同。`plan` 增加规划能力和只读工具策略。自定义 mode 通过 `RunnerConfig` 注册，不能安装改变执行流程的动态 factory 或 callback。
 
-运行时 root 始终是内存中的 `AgentConfig(name="root")`，任何 mode 都不会解析 root YAML。mode 切换保留 Runner ID 和 root session snapshot，并在空闲边界刷新有效 root 配置。Plan Mode 由 root 管理：唯一正式计划文件是 `plans/root.md`，只有经 Manager 验证的 root 可以写入或申请审批。Team Mode 由 `TeamManager` 管理所选 Team 的任务板、消息、成员和完成状态。新 Team 不自动添加成员；再次选择已有 Team 时复用成员定义，但使用新的任务板。Runner 通过 `AsyncTaskManager` 调度资格符合且依赖已满足的成员轮次；`team_finish` 释放成员 session 前，`AgentManager` 持有这些 session。
+Runner 通过 AgentRegistry 读取 root 与成员，按本地声明优先、内置定义兜底解析。创建或恢复 Runner 不生成默认 Agent YAML 或 default Team manifest；首次成功编辑才保存完整本地覆盖，删除覆盖即恢复内置定义。Plan/Team 配置仅应用于内存副本；root 仍不参与子 Agent 发现和分发。mode 切换保留 Runner ID 和 root session snapshot，并在空闲边界刷新有效 root 配置。Plan Mode 由 root 管理：唯一正式计划文件是 `plans/root.md`，只有经 Manager 验证的 root 可以写入或申请审批。Team Mode 由 `TeamManager` 管理所选 Team 的任务板、消息、成员和完成状态。新 Team 不自动添加成员；再次选择已有 Team 时复用成员定义，但使用新的任务板。Runner 通过 `AsyncTaskManager` 调度资格符合且依赖已满足的成员轮次；`team_finish` 释放成员 session 前，`AgentManager` 持有这些 session。
 
 ```python
 from juice_agents.core.runner import AgentBinding, Runner, RunnerConfig
@@ -45,6 +45,26 @@ for event in runner.stream("Review this change"):
 
 ## Agent 与 Tool 调用路径
 
+workspace 是 `base_dir`，不能传框架仓库或 `.juice` 目录。`ConfigurationContext`
+统一提供项目路径、合并配置和凭据；`runtime_config_path` 选择基础配置，
+`runtime_overrides` 只添加本次启动覆盖。`reconfigure(runtime_overrides=...)` 在空闲
+边界重新获取 Agent，保留会话、Runner ID 与 Team 任务板。Registry 在工具实例化时
+绑定 workspace，包括运行时新增工具；可复用 Agent 声明不保存注入的机器绝对路径。
+
+```text
+~/.juice/AGENTS[.override].md
+             ↓
+Git 根目录 → 各级中间目录 → base_dir
+             ↓
+根 / 子 Agent / Team / Workflow 的 system prompt
+```
+
+`project_rules.py` 每层优先读取非空 override；非 Git 项目只读取 `base_dir` 本层。
+含来源、作用目录标签的合并文本上限为 32 KiB，截断时记录受影响来源。
+自定义角色提示词保留；新建或恢复时重新读取规则，并在恢复 transcript 后替换
+system prompt。Agent 修改更深目录前需先读取其规则；不递归扫描，也不拦截工具。
+已有 Git worktree 使用其自身项目根。
+
 Agent 不拥有 executor 或 `ToolManager`。获取 Agent 时，`AgentManager` 会提供受限的 `RunnerContext`；每个 action 都经此上下文返回 Runner 所有的 ToolManager。
 
 ```text
@@ -56,6 +76,12 @@ MultiStepAgent
 
 这样可以复用 Agent，并避免工具调用绕过 Runner 的权限与取消边界。Manager 可以通过私有辅助类执行工作，但不能另行持有持久状态或暴露第二套 executor API。
 
+`RunnerContext.list_available_agents()` 为 root 读取当前 Registry 可用性投影，
+普通子 Agent 再与显式托管关系取交集。`agent_tool` 在调用时查询该视图，启动时的
+名称快照不会阻挡新增 Agent。Agent 在下一次模型请求前刷新变化的子 Agent 名称
+和描述；查询、提示词和调度共用模式策略、Team 成员范围及当前 Runner／模式的
+卸载限制。
+
 ## 生命周期与持久化
 
 `AgentManager.acquire()` 是唯一初始化路径：读取或创建 Agent snapshot，通过 `AgentRegistry.instantiate()` 获取新对象，恢复 session，绑定运行时上下文，再保存 checkpoint。
@@ -63,9 +89,45 @@ MultiStepAgent
 - `persistent` Agent 保留 live 实例和 session，直到被释放。
 - `functional` Agent 在请求结束后保存 checkpoint 并释放。
 - `stop()` 协作式取消 Managers；`close()` 释放资源。
-- `resume()` 只接受当前 Runner manifest schema。不会迁移或恢复旧 `.juice/runners/` 数据。
+- `resume()` 只接受当前 Runner manifest schema，不迁移或恢复旧 Runner manifest schema。
 
 Runner 状态根目录为 `.juice/runners/<runner_id>/`。manifest 保存序列化后的 `RunnerConfig`、所选 Team 和 mode 内禁用的 Agent；Agent 运行快照位于 `agents/`。正式计划文件始终是 `plans/root.md`。对应的 Manager 持有任务、Workflow 和工具运行记录。
+
+## Token 统计
+
+```python
+usage = runner.token_usage()
+print(usage["generation"])
+print(usage["reward"])
+print(usage["total"])
+records = runner.agent_manager.model_usage_records()
+```
+
+每组包含：
+
+| 字段 | 含义 |
+| --- | --- |
+| `requests` | 已记录的可观测 SDK 调用数 |
+| `input_tokens`、`output_tokens`、`total_tokens` | 已报告的已知 token 数之和 |
+| `missing_usage_requests` | 用量缺失或不完整的调用数 |
+
+`Runner.token_usage()` 仅代理 `AgentManager`，由后者唯一负责用量收集、持久化及汇总。
+Agent 和策略显式上报模型返回值或异常中的明细，写入
+`.juice/runners/<runner_id>/agents/model_usage.jsonl`，不含 prompt 或 transcript。
+每条记录包含 `kind`、`backend`、`model_name`、`agent_id`、`agent_name`、`usage`、`request_id`。
+
+同一 Runner 使用一个活跃 Manager，并发工作 Agent 共享它；冷恢复在 Manager 初始化时
+重新加载用量记录。
+
+淘汰候选、空响应重试、评分失败及取消前已知用量均计入，批量评分只计一次。
+摘要生成及 functional/ephemeral 调用即使不保存 session，也保存 token 元数据。
+压缩和恢复不丢账。`ContextTree` 不承担用量统计，`ActionStep.usage` 仅用于追踪
+和窗口校准，不能重复累计。
+
+未知用量不代表零消耗或零账单；汇总同时保留已知量合计和缺失调用数，不估算 token
+或费用。SDK 内部透明网络重试、服务端未报告的消耗均无法准确还原。
+直接使用模型时，读取返回值或异常携带的
+[`usage_calls`](../models/README.zh-CN.md#返回契约)，Models 本身不累计用量。
 
 ## 模块索引
 
