@@ -87,23 +87,22 @@ runner.run("Continue with the implementation")
 ### Plan Mode
 
 ```python
-runner = juice.runners.create(
-    runner_config="plan",
-    permission_mode="default"
-)
+def ask_handler(request):
+    # Present the question and options to the user and return their answer.
+    print(request["question"])
+    options = request.get("options", [])
+    for option in options:
+        print(f"{option['value']}: {option['label']}")
+    answer = input("Enter an option value or feedback: ").strip()
+    selected = [option for option in options if option["value"] == answer]
+    return {"status": "answered", "selected": selected, "custom_response": "" if selected else answer}
 
-# Investigate and plan
+juice = Juice(workspace=".", ask_handler=ask_handler)
+runner = juice.runners.create(runner_config="plan")
 runner.run("Refactor the authentication module")
-# Agent creates plans/root.md
-
-# Review and approve
-plan = runner.get_plan()
-print(plan)
-runner.approve_plan()
-
-# Execute approved plan
-runner.run("Execute the plan")
 ```
+
+The agent writes `plans/root.md` under the Runner state directory and requests approval through `exit_plan`. The `ask_handler` also handles agent questions and permission requests; applications should display the request options and return the user's choice.
 
 ### Group Coordination
 
@@ -147,23 +146,16 @@ All modes use the same `Runner` execution path and share tool, permission, and p
 
 ## Tools
 
-Agents have access to 20+ built-in tools:
+Agents have access to built-in tools, including:
 
-**Filesystem:** `read_file`, `write_file`, `edit_file`, `list_directory`, `search_files`
+- Filesystem: `read`, `write`, `edit`, `glob`, `grep`
+- Execution: `shell`, `python`
+- Web: `web_search`, `browser_open_url`, `browser_screenshot`
+- Memory: `memory_read`, `memory_write`, `memory_search`, `memory_forget`
+- Collaboration: `agent_tool`, `team_task_create`, `send_message`
+- Workflows and interaction: `workflow_run`, `submit_output`, `ask`
 
-**Execution:** `shell`, `python_repl`, `python_script`
-
-**Web:** `web_search`, `web_fetch`, `browser_navigate`, `browser_screenshot`
-
-**Memory:** `memory_create`, `memory_update`, `memory_search`, `memory_list`
-
-**Collaboration:** `agent_spawn`, `agent_message`, `task_create`, `team_broadcast`
-
-**Workflows:** `workflow_call` (inner agents via `ctx.agent()`)
-
-**Output:** `submit_output`, `ask_user`
-
-Tools are dynamically available based on agent capabilities and runner policy.
+Tools are dynamically available based on agent capabilities and Runner policy.
 
 ## Workflows
 
@@ -184,11 +176,13 @@ def run(ctx, args):
     # Call inner agents
     search_result = ctx.agent(
         task=f"Search: {query}",
+        instructions="Find relevant sources and summarize the findings.",
         phase="search"
     )
     
     analysis = ctx.agent(
         task=f"Analyze: {search_result}",
+        instructions="Analyze the findings and write a report.",
         phase="analyze"
     )
     
@@ -198,29 +192,25 @@ def run(ctx, args):
     return {"report": analysis, "sources": search_result}
 ```
 
-Call workflows from agents:
+Call a workflow through the Runner (or use `$workflow:research` in an agent prompt):
 
 ```python
-from juice_agents.core.managers.workflows import WorkflowRunManager
-
-result = workflow_manager.call("research", {"query": "AI trends 2024"})
+result = runner.workflow_manager.call("research", {"query": "AI trends 2024"})
 ```
 
 ## Permission Modes
 
 | Mode | Behavior |
 | --- | --- |
-| `default` | Prompt for destructive/external actions |
-| `auto` | Auto-approve all actions |
-| `read_only` | Block write operations |
-| `strict` | Prompt for every tool call |
+| `default` | Request user approval for tools that require it |
+| `accept` | Automatically approve those tools, subject to permission rules and Runner policy |
 
 Configure at runner creation:
 
 ```python
 runner = juice.runners.create(
     runner_config="agent",
-    permission_mode="read_only"
+    permission_mode="accept"
 )
 ```
 
@@ -232,7 +222,8 @@ Schedule recurring tasks:
 # UI owns the clock; SDK provides tick primitives
 juice.cron.tick()
 
-# Cron jobs are configured via workspace .juice/config.yaml
+# Create a job with juice.cron.create(cron="0 9 * * *", prompt="Write a daily report")
+# Jobs are stored in workspace .juice/scheduled_tasks.json
 ```
 
 ## API Reference
@@ -240,19 +231,18 @@ juice.cron.tick()
 ### Juice Client
 
 ```python
-juice = Juice(workspace=".", config_path=None)
+juice = Juice(workspace=".", runtime_config_path=None)
 ```
 
 - `workspace`: Working directory for `.juice/` state
-- `config_path`: Optional path to `config.yaml`
+- `runtime_config_path`: Optional path to the runtime configuration file
 
 ### Runner Creation
 
 ```python
 runner = juice.runners.create(
     runner_config="agent",  # or "plan", "group", "team", or custom config
-    permission_mode="default",
-    model=None  # Optional model override
+    permission_mode="default"
 )
 ```
 
@@ -267,8 +257,7 @@ runner = juice.runners.resume(runner_id="run_abc123")
 ```python
 # Streaming
 for event in runner.stream("Task description"):
-    if event.type == "agent_message":
-        print(event.content)
+    print(event)  # Events are dictionaries
 
 # Blocking (consumes stream internally)
 result = runner.run("Task description")

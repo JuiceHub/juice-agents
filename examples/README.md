@@ -30,9 +30,9 @@ python examples/agent_tot/__main__.py
 Configure `.juice/config.yaml` separately for each example; `--model <model_name>`
 selects a model from that example's catalog. All examples can reuse the repository
 root `.env`, without copying keys into every example. Credentials resolve in this
-order: process environment, example `.env`, repository root `.env`. The paths are
-fixed relative to the example and repository, so another current directory or an
-IDE launch does not change credential lookup. These are real model runs and
+order: process environment, example `.env`, repository root `.env`, then
+`~/.juice/.env`. The example and repository paths are fixed, so another current
+directory or an IDE launch does not change credential lookup. These are real model runs and
 require usable provider credentials.
 Research uses local sources by default, so its built-in task needs no search API key.
 

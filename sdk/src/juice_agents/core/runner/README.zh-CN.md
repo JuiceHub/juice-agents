@@ -13,7 +13,7 @@ Agent / Tool / Workflow 声明
               ▼
 Runner ── 持有 ──► AgentManager      session · snapshot · stream · cancel · release
   │                ToolManager        runtime binding · permissions · audit
-  │                WorkflowRunManager    workflow call · checkpoint · recovery
+  │                WorkflowRunManager    workflow call · artifacts
   └──────────────► AsyncTaskManager   task state · workers · notification · recovery
 ```
 
@@ -91,7 +91,7 @@ MultiStepAgent
 - `stop()` 协作式取消 Managers；`close()` 释放资源。
 - `resume()` 只接受当前 Runner manifest schema，不迁移或恢复旧 Runner manifest schema。
 
-Runner 状态根目录为 `.juice/runners/<runner_id>/`。manifest 保存序列化后的 `RunnerConfig`、所选 Team 和 mode 内禁用的 Agent；Agent 运行快照位于 `agents/`。正式计划文件始终是 `plans/root.md`。对应的 Manager 持有任务、Workflow 和工具运行记录。
+Runner 状态根目录为 `.juice/runners/<runner_id>/`。manifest 保存序列化后的 `RunnerConfig`、所选 Team 和 mode 内禁用的 Agent；Agent 运行快照位于 `agents/`。正式计划文件始终是 `plans/root.md`。对应的 Manager 持有任务和工具运行记录及 Workflow 产物；Workflow 调用没有可恢复的运行状态。
 
 ## Token 统计
 

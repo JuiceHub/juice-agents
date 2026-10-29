@@ -82,7 +82,7 @@ Architecture informed by [Open Deep Research](https://github.com/langchain-ai/op
 
 ## Calling Workflows
 
-Workflows are called as functions through `WorkflowRunManager.call()`:
+After saving the `counter` example above to `.juice/workflows/counter.py`, call it through the Runner’s `WorkflowRunManager`:
 
 ```python
 from juice_agents import Juice
@@ -90,20 +90,15 @@ from juice_agents import Juice
 juice = Juice(workspace=".")
 runner = juice.runners.create(runner_config="agent")
 
-# Direct call
-result = juice.workflows.call(
-    workflow="deep_research",
-    args={"question": "AI trends 2024", "source_mode": "web"},
-    config={"max_research_rounds": 2}
-)
-
-# Returns: {"result": {...}, "artifacts_dir": Path, "stats": {...}}
+result = runner.workflow_manager.call("counter", {"value": 1})
+print(result["result"])  # {"result": 2}
+# artifacts_dir is a string path, or "" if no artifact was written.
 ```
 
-From an agent:
+To invoke a workflow through an agent:
 
-```text
-$workflow:deep_research Research recent AI breakthroughs
+```python
+result = runner.run("$workflow:deep_research Research recent AI breakthroughs using web sources")
 ```
 
 Users invoke workflows explicitly via `$workflow:<name>` syntax. The agent receives the workflow's metadata and can execute it via the `workflow_run` tool. The agent will gather required parameters (like `source_mode`) through conversation.
@@ -116,7 +111,7 @@ Workflows write artifacts via `ctx.artifact(name, content)`:
 def run(ctx: WorkflowContext, args: dict[str, Any]) -> dict[str, Any]:
     report = "# Research Report\n..."
     ctx.artifact("report.md", report)
-    ctx.artifact("sources.json", json.dumps(sources))
+    ctx.artifact("sources.json", [{"title": "Example source"}])
     return {"summary": "Complete"}
 ```
 
@@ -137,16 +132,17 @@ Workflows spawn temporary agents via `ctx.agent()`:
 ```python
 result = ctx.agent(
     task="Search for recent AI breakthroughs",
-    agent="researcher",           # Optional agent config name
-    instructions="Focus on 2024", # Optional custom instructions
+    instructions="Find and summarize reliable sources.",
     tools=["web_search", "browser_open_url"],  # Tool restrictions
-    schema={"findings": "list"},  # Structured output schema
+    schema={"type": "object", "properties": {"findings": {"type": "array", "items": {"type": "string"}}}},
     max_steps=10,                 # Step limit
     phase="Research",             # Lifecycle phase label
     label="AI trends"             # Agent label for logging
 )
-# Returns: {"output": ..., "steps": int, "tokens": int}
+# Returns the agent output; with schema, this is a dict.
 ```
+
+Specify `agent` (a registered agent configuration) or nonempty `instructions`. Tools must be declared in `WORKFLOW_METADATA.tools`; read-only workflows can use only read-only tools.
 
 Inner agents:
 - Do not persist beyond the workflow call

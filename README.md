@@ -10,12 +10,12 @@ A lightweight Python agent framework for building ReAct and CodeAct agents with 
 
 | Feature | Description |
 | --- | --- |
-| 🔄 **Session Resume** | Resume agents, workflows, and tasks after process restart |
+| 🔄 **Session Resume** | Resume agent sessions after process restart |
 | 🎯 **Multiple Agent Modes** | `agent`, `plan`, `group`, `team` — one runtime, four collaboration patterns |
 | 🧠 **Per-step Candidate Selection** | Generate multiple outputs, score valid candidates, and execute one |
-| 🌐 **Workflow Orchestration** | Branch, parallelize, loop, and checkpoint complex workflows |
+| 🌐 **Workflow Orchestration** | Run Python workflows with inner agents and saved artifacts |
 | 🛠️ **Rich Toolset** | Shell, Python, file, web, browser, image, MCP, and custom tools |
-| 💾 **Persistent State** | Sessions, workflows, background tasks, and team boards survive restarts |
+| 💾 **Persistent State** | Sessions, workflow artifacts, background task records, and team boards survive restarts |
 | 🚀 **Multiple Interfaces** | Python SDK, terminal CLI, and local web workbench |
 
 ```text
@@ -142,7 +142,7 @@ python examples/agent_tot/__main__.py "Design a caching strategy" --reward-model
 
 The example directory stays its workspace regardless of the current directory.
 Credentials resolve in this order: process environment, example `.env`, repository
-root `.env`. This also applies when launched from another directory. Model settings
+root `.env`, then `~/.juice/.env`. This also applies when launched from another directory. Model settings
 remain separate for each example; `--model <model_name>` selects a configured model.
 `python -m examples.<name>` also works from the repository root. Runs show the
 task, Runner ID, tool activity, and result; ToT also shows candidate scores and

@@ -87,23 +87,22 @@ runner.run("继续实现")
 ### 计划模式
 
 ```python
-runner = juice.runners.create(
-    runner_config="plan",
-    permission_mode="default"
-)
+def ask_handler(request):
+    # 将问题和选项呈现给用户，并返回用户选择。
+    print(request["question"])
+    options = request.get("options", [])
+    for option in options:
+        print(f"{option['value']}: {option['label']}")
+    answer = input("输入选项值或反馈：").strip()
+    selected = [option for option in options if option["value"] == answer]
+    return {"status": "answered", "selected": selected, "custom_response": "" if selected else answer}
 
-# 调研和规划
+juice = Juice(workspace=".", ask_handler=ask_handler)
+runner = juice.runners.create(runner_config="plan")
 runner.run("重构身份验证模块")
-# 智能体创建 plans/root.md
-
-# 审查和批准
-plan = runner.get_plan()
-print(plan)
-runner.approve_plan()
-
-# 执行已批准的计划
-runner.run("执行计划")
 ```
+
+智能体将计划写入 Runner 状态目录的 `plans/root.md`，并通过 `exit_plan` 请求审批。`ask_handler` 同时处理智能体的问题和权限审批；实际应用应根据请求展示选项并返回用户的选择。
 
 ### 组协调
 
@@ -147,23 +146,16 @@ runner.run("添加任务：设计模式、实现爬虫、测试")
 
 ## 工具
 
-智能体可访问 20+ 内置工具：
+智能体可使用多种内置工具，例如：
 
-**文件系统：** `read_file`, `write_file`, `edit_file`, `list_directory`, `search_files`
+- 文件系统：`read`、`write`、`edit`、`glob`、`grep`
+- 执行：`shell`、`python`
+- Web：`web_search`、`browser_open_url`、`browser_screenshot`
+- 记忆：`memory_read`、`memory_write`、`memory_search`、`memory_forget`
+- 协作：`agent_tool`、`team_task_create`、`send_message`
+- 工作流和交互：`workflow_run`、`submit_output`、`ask`
 
-**执行：** `shell`, `python_repl`, `python_script`
-
-**Web：** `web_search`, `web_fetch`, `browser_navigate`, `browser_screenshot`
-
-**记忆：** `memory_create`, `memory_update`, `memory_search`, `memory_list`
-
-**协作：** `agent_spawn`, `agent_message`, `task_create`, `team_broadcast`
-
-**工作流：** `workflow_call`（通过 `ctx.agent()` 调用内部智能体）
-
-**输出：** `submit_output`, `ask_user`
-
-工具根据智能体能力和 runner 策略动态可用。
+工具根据智能体能力和 Runner 策略动态可用。
 
 ## 工作流
 
@@ -184,11 +176,13 @@ def run(ctx, args):
     # 调用内部智能体
     search_result = ctx.agent(
         task=f"搜索：{query}",
+        instructions="查找相关来源并总结发现。",
         phase="search"
     )
     
     analysis = ctx.agent(
         task=f"分析：{search_result}",
+        instructions="分析发现并撰写报告。",
         phase="analyze"
     )
     
@@ -198,29 +192,25 @@ def run(ctx, args):
     return {"report": analysis, "sources": search_result}
 ```
 
-从智能体调用工作流：
+通过 Runner 调用工作流（也可在智能体提示中使用 `$workflow:research`）：
 
 ```python
-from juice_agents.core.managers.workflows import WorkflowRunManager
-
-result = workflow_manager.call("research", {"query": "AI trends 2024"})
+result = runner.workflow_manager.call("research", {"query": "AI trends 2024"})
 ```
 
 ## 权限模式
 
 | 模式 | 行为 |
 | --- | --- |
-| `default` | 提示破坏性/外部操作 |
-| `auto` | 自动批准所有操作 |
-| `read_only` | 阻止写操作 |
-| `strict` | 提示每个工具调用 |
+| `default` | 需要审批的工具通过用户交互请求批准 |
+| `accept` | 自动批准需要审批的工具，仍受权限规则和 Runner 策略约束 |
 
 在 runner 创建时配置：
 
 ```python
 runner = juice.runners.create(
     runner_config="agent",
-    permission_mode="read_only"
+    permission_mode="accept"
 )
 ```
 
@@ -232,7 +222,8 @@ runner = juice.runners.create(
 # UI 拥有时钟；SDK 提供 tick 原语
 juice.cron.tick()
 
-# Cron 作业通过工作区 .juice/config.yaml 配置
+# 用 juice.cron.create(cron="0 9 * * *", prompt="生成日报") 创建作业
+# 作业保存在工作区 .juice/scheduled_tasks.json
 ```
 
 ## API 参考
@@ -240,19 +231,18 @@ juice.cron.tick()
 ### Juice 客户端
 
 ```python
-juice = Juice(workspace=".", config_path=None)
+juice = Juice(workspace=".", runtime_config_path=None)
 ```
 
 - `workspace`：`.juice/` 状态的工作目录
-- `config_path`：可选的 `config.yaml` 路径
+- `runtime_config_path`：可选的运行时配置文件路径
 
 ### Runner 创建
 
 ```python
 runner = juice.runners.create(
     runner_config="agent",  # 或 "plan", "group", "team", 或自定义配置
-    permission_mode="default",
-    model=None  # 可选模型覆盖
+    permission_mode="default"
 )
 ```
 
@@ -267,8 +257,7 @@ runner = juice.runners.resume(runner_id="run_abc123")
 ```python
 # 流式
 for event in runner.stream("任务描述"):
-    if event.type == "agent_message":
-        print(event.content)
+    print(event)  # 事件是字典
 
 # 阻塞（内部消费流）
 result = runner.run("任务描述")

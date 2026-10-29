@@ -43,7 +43,7 @@ Registry（静态配置） → Manager（运行时状态） ← Runner（执行�
 | 模块 | 职责 |
 | --- | --- |
 | [Models](models/README.zh-CN.md) | LLM 提供商集成、流式输出、结构化生成 |
-| [Memory](memory/README.zh-CN.md) | 持久知识库、语义搜索、检索 |
+| [Memory](memory/README.zh-CN.md) | 持久知识库、不区分大小写的文本搜索、检索 |
 | [Workflow](workflow/README.zh-CN.md) | Python 工作流脚本、内部 agent、产物存储 |
 | [Cron](cron/README.zh-CN.md) | 定时任务、周期作业、后台执行 |
 

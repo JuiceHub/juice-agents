@@ -4,8 +4,6 @@
 
 `sdk/src/juice_agents/core/memory` provides workspace-local persistent memory. It manages `.juice/memory/` in the current workspace and stores project conventions, user preferences, and facts that remain useful across sessions.
 
-> [Chinese](README.zh-CN.md)
-
 ## Scope
 
 | Module | Responsibility |

@@ -13,7 +13,7 @@ Agent / Tool / Workflow declarations
               ▼
 Runner ── owns ──► AgentManager      session · snapshot · stream · cancel · release
   │               ToolManager        runtime binding · permissions · audit
-  │               WorkflowRunManager    workflow call · checkpoint · recovery
+  │               WorkflowRunManager    workflow call · artifacts
   └──────────────► AsyncTaskManager  task state · workers · notification · recovery
 ```
 
@@ -128,7 +128,8 @@ Runner state is rooted at `.juice/runners/<runner_id>/`. The manifest stores
 the serialized `RunnerConfig`, selected Team and mode-local disabled Agents;
 Agent runtime snapshots live under `agents/`. The formal plan artifact is
 always `plans/root.md`.
-Managers own their corresponding task, workflow and tool runtime records.
+Managers own task and tool runtime records and workflow artifacts; workflow calls
+do not have resumable run state.
 
 ## Token usage
 

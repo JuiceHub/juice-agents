@@ -82,7 +82,7 @@ flowchart TD
 
 ## 调用 Workflow
 
-Workflow 通过 `WorkflowRunManager.call()` 作为函数调用：
+将上面的 `counter` 示例保存到 `.juice/workflows/counter.py` 后，可以通过 Runner 的 `WorkflowRunManager` 调用：
 
 ```python
 from juice_agents import Juice
@@ -90,20 +90,15 @@ from juice_agents import Juice
 juice = Juice(workspace=".")
 runner = juice.runners.create(runner_config="agent")
 
-# 直接调用
-result = juice.workflows.call(
-    workflow="deep_research",
-    args={"question": "AI trends 2024", "source_mode": "web"},
-    config={"max_research_rounds": 2}
-)
-
-# 返回：{"result": {...}, "artifacts_dir": Path, "stats": {...}}
+result = runner.workflow_manager.call("counter", {"value": 1})
+print(result["result"])  # {"result": 2}
+# artifacts_dir 是字符串路径；未写入产物时为空字符串。
 ```
 
-从 agent 调用：
+通过 agent 调用 workflow：
 
-```text
-$workflow:deep_research 研究最新的 AI 突破
+```python
+result = runner.run("$workflow:deep_research 使用网络来源研究最新的 AI 突破")
 ```
 
 用户使用 `$workflow:<name>` 语法显式调用 workflow，agent 获得该 workflow 的元数据并可通过 `workflow_run` 工具执行。Agent 会通过对话获取所需的参数（如 `source_mode`）。
@@ -116,7 +111,7 @@ Workflow 通过 `ctx.artifact(name, content)` 写产物：
 def run(ctx: WorkflowContext, args: dict[str, Any]) -> dict[str, Any]:
     report = "# 研究报告\n..."
     ctx.artifact("report.md", report)
-    ctx.artifact("sources.json", json.dumps(sources))
+    ctx.artifact("sources.json", [{"title": "示例来源"}])
     return {"summary": "完成"}
 ```
 
@@ -137,16 +132,17 @@ Workflow 通过 `ctx.agent()` 生成临时 agent：
 ```python
 result = ctx.agent(
     task="搜索最新 AI 突破",
-    agent="researcher",           # 可选 agent 配置名
-    instructions="关注 2024",      # 可选自定义 instructions
+    instructions="查找并总结可靠来源。",
     tools=["web_search", "browser_open_url"],  # 工具限制
-    schema={"findings": "list"},  # 结构化输出 schema
+    schema={"type": "object", "properties": {"findings": {"type": "array", "items": {"type": "string"}}}},
     max_steps=10,                 # 步数限制
     phase="Research",             # 生命周期阶段标签
     label="AI trends"             # Agent 标签用于日志
 )
-# 返回：{"output": ..., "steps": int, "tokens": int}
+# 直接返回 agent 输出；指定 schema 时返回 dict。
 ```
+
+必须指定 `agent`（已注册的 agent 配置）或非空 `instructions`。工具必须在 `WORKFLOW_METADATA.tools` 中声明；只读 workflow 只能使用只读工具。
 
 内部 agent：
 - 不在 workflow 调用之外持久化

@@ -43,7 +43,7 @@ Registry (static config) → Manager (runtime state) ← Runner (execution)
 | Module | Responsibility |
 | --- | --- |
 | [Models](models/README.md) | LLM provider integration, streaming, structured output |
-| [Memory](memory/README.md) | Persistent knowledge base, semantic search, retrieval |
+| [Memory](memory/README.md) | Persistent knowledge base, case-insensitive text search, retrieval |
 | [Workflow](workflow/README.md) | Python workflow scripts, inner agents, artifact storage |
 | [Cron](cron/README.md) | Scheduled tasks, recurring jobs, background execution |
 
