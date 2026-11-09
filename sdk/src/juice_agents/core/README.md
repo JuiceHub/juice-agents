@@ -4,6 +4,21 @@
 
 The core runtime provides the foundation for building, executing, and managing intelligent agents with persistent state and controlled execution.
 
+
+`AgentManager.post` persists all input in per-Agent inboxes and schedules serial rounds.
+TeamManager owns business messages/tasks; AsyncTaskManager owns independent background jobs.
+Recovery binds listeners and Ask before `activate()`; session writes include context,
+committed message IDs and the round checkpoint in one atomic file.
+
+## Unified execution boundary
+
+Agent instances use `idle/running/released`; round results independently use
+`completed/failed/cancelled`. AgentManager owns execution and durable terminal
+commits; Inbox owns messages and scheduling. Runner, Gateway, CLI and Web share
+the [result/event contract](../../../README.md#round-results-and-event-contract).
+Current recovery formats are Runner v6, Agent v2 and Context v3; unsupported
+files are retained and rejected before any recovery writes.
+
 ## Architecture
 
 ```text
@@ -26,7 +41,7 @@ Registry (static config) → Manager (runtime state) ← Runner (execution)
 | --- | --- |
 | [Agent](agent/README.md) | ReAct/CodeAct protocols, session management, context compression |
 | [Runner](runner/README.md) | Unified request entry point, mode orchestration, manager composition |
-| [Managers](managers/README.md) | Tool/Workflow/Task lifecycle ownership, persistence, cancellation |
+| [Managers](managers/README.md) | Agent/Model/Tool/Workflow/Task lifecycle ownership, persistence, cancellation |
 | [Permissions](permissions/README.md) | Authorization, policy enforcement, approval flows |
 
 ### Declaration Layer
@@ -34,7 +49,6 @@ Registry (static config) → Manager (runtime state) ← Runner (execution)
 | Module | Responsibility |
 | --- | --- |
 | [Registry](registry/README.md) | Static declarations, validation, instantiation |
-| [Prebuilt](prebuilt/README.md) | Built-in agent, tool, and workflow configurations |
 | [Group](group/README.md) | Multi-agent group declarations and coordination |
 | [Team](team/README.md) | Persistent team boards, task management, member collaboration |
 
@@ -43,13 +57,26 @@ Registry (static config) → Manager (runtime state) ← Runner (execution)
 | Module | Responsibility |
 | --- | --- |
 | [Models](models/README.md) | LLM provider integration, streaming, structured output |
+| [Configuration](config/README.md) | Shared providers, language/image catalogs, layered settings and credentials |
 | [Memory](memory/README.md) | Persistent knowledge base, case-insensitive text search, retrieval |
 | [Workflow](workflow/README.md) | Python workflow scripts, inner agents, artifact storage |
-| [Cron](cron/README.md) | Scheduled tasks, recurring jobs, background execution |
+| [Cron](cron/README.md) | Scheduled task storage, due-task claiming and execution |
 
 ## Execution Flow
 
 ```text
+providers → models       → chat / GRM (independent selections)
+          → image_models → image.model_name (Ark generation/editing)
+```
+
+Both model catalogs reference the same connection configuration. GRM selection
+stays process-local; image generation is off by default and excluded in Plan
+mode. `Runner.reconfigure(reload_config=True)` refreshes clients at an idle
+boundary while retaining the Runner ID, history and exploration choices.
+
+```text
+Runner.create(base_dir=...) / Runner.resume(base_dir=..., runner_id=...)
+  ↓
 User request
   ↓
 Runner.stream()
@@ -87,7 +114,7 @@ Runtime state lives in `.juice/` within the workspace:
 ```text
 .juice/
 ├── config.yaml           # Workspace configuration
-├── runners/              # Runner sessions
+├── sessions/              # Runner sessions
 │   └── <runner_id>/
 │       ├── manifest.json # RunnerConfig, mode, state
 │       ├── agents/       # Agent session snapshots
@@ -161,7 +188,7 @@ Capabilities are agent powers; policies are runner-enforced constraints.
 
 - One runner handles one request at a time
 - Agents are reentrant: same Agent instance never executes concurrently
-- Tools may run in parallel (within runner concurrency limit)
+- ReAct actions in one step run concurrently by default (8 workers per Agent); dependent calls belong in later steps
 - Background tasks run in dedicated workers
 - Workflows can parallelize inner agents
 
@@ -191,3 +218,5 @@ Add tests in the corresponding `tests/core/<module>/` directory when changing bo
 - **Custom Modes**: Register `RunnerConfig` with capabilities and policies
 
 See module READMEs for detailed extension guides.
+
+Execution is coroutine-based: ModelManager owns calls/usage/clients; TeamManager owns member dispatch and reconciliation. Sync SDK methods adapt complete async operations.

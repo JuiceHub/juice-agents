@@ -76,6 +76,11 @@ WRONG: `<actions>[...]</actions>extra text` (text after closing tag)
 WRONG: `<actions>{"name": "tool"}</actions>` (not a JSON array)
 CORRECT: `<actions>[{"name": "tool", "args": {}}]</actions>` (ends with </actions>)
 
+## Action Scheduling
+- Actions in the same step execute concurrently by default. Only group independent actions that can safely overlap; list order does not express a dependency.
+- Put dependent actions or conflicting operations in different steps. Wait for the earlier step's observations before constructing the next action, such as reading a file before editing it or editing it before running a check.
+- The next model step waits for all foreground actions to finish. Observations follow the original action order even when tools finish in a different order.
+
 ## Async Tasks and Notifications
 - If you see `<attachments>`, runtime injected external information such as background async task notifications or inbox messages. Treat attachments like observations and include them in later reasoning.
 - Background async tasks are truly asynchronous: they return a receipt immediately and do not block. Task completion is pushed via `<attachments>` as `async_task_notification` in a later step.
@@ -135,6 +140,11 @@ REACT_PROTOCOL_SECTION_ZH = PromptSection(
 错误：`<actions>[...]</actions>额外文本` (闭合标签后有文本)
 错误：`<actions>{"name": "tool"}</actions>` (不是 JSON 数组)
 正确：`<actions>[{"name": "tool", "args": {}}]</actions>` (以 </actions> 结束)
+
+## Action 调度
+- 同一 step 的 actions 默认并发执行。只合并彼此独立、可以安全重叠执行的动作；数组顺序不表示先后依赖。
+- 有依赖或操作冲突的动作必须拆到不同 step。先等待前一步的 observations，再构造下一步 action，例如先读取再编辑文件，或先修改再执行检查。
+- 下一次模型调用会等待本步全部前台 action 完成。即使工具完成顺序不同，observations 仍按原 action 顺序返回。
 
 ## 异步任务和通知
 - 如果看到 `<attachments>`，表示 runtime 注入了外部信息，例如后台 async task 通知或 inbox 消息；它们和 observations 一样都要纳入后续推理。

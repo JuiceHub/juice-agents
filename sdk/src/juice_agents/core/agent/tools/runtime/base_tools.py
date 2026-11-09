@@ -45,10 +45,10 @@ class Tool(ABC):
     # 若为 True，工具不会修改项目文件、执行任意代码或启动子 agent。
     # plan mode 默认只允许只读工具，少数流程工具由 plan mode 显式特许。
     is_read_only: bool = False
-    # Conservative defaults. Built-in/domain classes are marked as audited in
-    # __init_subclass__; user-defined Tools must override execution_policy
-    # before strict ToolManager scheduling.
-    _execution_mode: Any = "serial"
+    # Actions in one step are independent and run concurrently by default.
+    # Stateful tools declare resource keys; request-thread tools use a barrier.
+    # Strict registration still requires custom Tools to declare their policy.
+    _execution_mode: Any = "foreground"
     _execution_thread_affinity: str = "any"
     _execution_resource_keys: tuple[str, ...] = ()
     _execution_policy_declared: bool = False
@@ -66,8 +66,8 @@ class Tool(ABC):
             or module.startswith("juice_agents.core.team")
             or module.startswith("juice_agents.core.registry.tools")
         ):
-            # These modules are framework-owned and audited below through
-            # conservative defaults when a class does not need a dynamic rule.
+            # Framework-owned tools inherit the audited foreground default
+            # unless their domain or arguments require additional constraints.
             cls._execution_policy_declared = True
         if module.startswith("juice_agents.core.team") or module.startswith(
             "juice_agents.core.agent.tools.builtin.evolution"
@@ -103,11 +103,9 @@ class Tool(ABC):
     ) -> Any:
         """Return the tool's scheduling policy.
 
-        Runtime-owned tools should override this method with an explicit
-        ``ToolExecutionPolicy``.  The conservative serial fallback keeps old
-        third-party tools usable during the migration; callers that register
-        tools in strict mode can use :meth:`validate_execution_policy` to
-        reject classes that did not declare a policy.
+        Ordinary tools inherit foreground execution. Override this method for
+        argument-dependent resource locks or background launches. Strict
+        registration additionally requires an explicit policy declaration.
         """
 
         del context
@@ -127,7 +125,7 @@ class Tool(ABC):
 
     @classmethod
     def has_explicit_execution_policy(cls) -> bool:
-        """Whether ``cls`` overrides the conservative base policy."""
+        """Whether ``cls`` explicitly declares its scheduling constraints."""
 
         # Inspect the class itself instead of an inherited marker. A custom
         # subclass must make its own scheduling choice; inheriting a policy
@@ -153,9 +151,9 @@ class Tool(ABC):
     ) -> Any:
         """Validate and return this tool's policy.
 
-        ``strict=True`` is intended for registry/initialisation boundaries;
-        direct ``Tool`` calls remain backwards compatible until all external
-        tools have migrated to an explicit declaration.
+        ``strict=True`` additionally requires an explicit declaration at the
+        registration boundary. Regular Agent bindings use the inherited
+        foreground default when a custom tool needs no extra constraints.
         """
 
         if strict and not type(self).has_explicit_execution_policy():

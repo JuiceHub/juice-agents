@@ -12,7 +12,8 @@ from typing import Any, Callable
 
 from juice_agents.core.agent.tools.runtime.base_tools import Tool
 from juice_agents.core.config.context import ConfigurationContext
-from juice_agents.core.config.model_catalog import DEFAULT_RUNTIME_MODEL_NAME, load_runtime_model_config
+from juice_agents.core.config.model_catalog import DEFAULT_RUNTIME_MODEL_NAME
+from juice_agents.core.config.image_model_catalog import load_runtime_image_model_config
 from juice_agents.core.registry.tools.defaults import (
     get_builtin_tool_context_defaults,
     get_builtin_tool_context_requirements,
@@ -87,12 +88,12 @@ def create_dynamic_tool_class(config: dict[str, Any] | ToolConfig) -> type[Tool]
             setattr(self, key, value)
 
     def execution_policy(self, args: dict[str, Any], context: Any) -> Any:
-        """Dynamic YAML tools are conservative until explicitly classified."""
+        """Configured tools follow the same foreground default as Python tools."""
 
         del args, context
-        from juice_agents.core.agent.tools.runtime import ToolExecutionMode, ToolExecutionPolicy
+        from juice_agents.core.agent.tools.runtime import ToolExecutionPolicy
 
-        return ToolExecutionPolicy(mode=ToolExecutionMode.SERIAL)
+        return ToolExecutionPolicy()
 
     attrs = {
         "name": tool_name,
@@ -221,22 +222,18 @@ class ToolRegistry:
             prepared.setdefault("config_context", context)
         if tool_name == "api_web_search":
             prepared.setdefault("config_context", context)
-        if tool_name == "generate_edit_image" and not str(prepared.get("api_key") or "").strip():
-            try:
-                model_cfg = load_runtime_model_config(
-                    model_name=model_config_name or DEFAULT_RUNTIME_MODEL_NAME,
-                    runtime_config_path=context.project_config_path,
-                    workspace_dir=context.workspace_dir,
-                    dotenv_path=context.dotenv_path,
-                    runtime_overrides=context.overrides,
-                )
-            except ValueError:
-                model_cfg = None
-            if model_cfg is not None:
-                for key in ("api_key", "api_base"):
-                    value = getattr(model_cfg, key, None)
-                    if value:
-                        prepared.setdefault(key, value)
+        if tool_name == "generate_edit_image" and prepared.get("client") is None:
+            # Images have their own catalog selection. Never inherit a chat
+            # provider's credentials or endpoint, even if chat uses Ark too.
+            model_cfg = load_runtime_image_model_config(
+                runtime_config_path=context.project_config_path,
+                workspace_dir=context.workspace_dir,
+                dotenv_path=context.dotenv_path,
+                runtime_overrides=context.overrides,
+            )
+            prepared.setdefault("api_key", model_cfg.api_key)
+            prepared.setdefault("api_base", model_cfg.api_base)
+            prepared.setdefault("model_name", model_cfg.provider_model_name)
         missing = [
             name
             for name in get_builtin_tool_context_requirements().get(tool_name, tuple())

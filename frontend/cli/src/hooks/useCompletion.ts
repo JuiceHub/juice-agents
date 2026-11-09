@@ -4,528 +4,457 @@
  * The drawer still only covers slash commands, but the replacement logic now
  * preserves multiline drafts instead of collapsing everything into plain words.
  */
-
 import { useState, useCallback } from "react";
-
 export interface CandidateItem {
-  label: string;
-  description: string;
+    label: string;
+    description: string;
 }
-
 const SLASH_COMMANDS: CandidateItem[] = [
-  { label: "/help", description: "Show available commands" },
-  { label: "/status", description: "Show the current session" },
-  { label: "/mode", description: "Switch agent mode" },
-  { label: "/team", description: "Run one task with the team mode" },
-  { label: "/group", description: "Run one task with the group mode" },
-  { label: "/agent-type", description: "Save the default Agent type" },
-  { label: "/models", description: "List available models" },
-  { label: "/model", description: "Show or switch runtime model" },
-  { label: "/rm", description: "Select or reset the reward model" },
-  { label: "/strategy", description: "Configure per-step candidate selection" },
-  { label: "/config", description: "Edit runtime and memory config" },
-  { label: "/agents", description: "List or view available agents" },
-  { label: "/teams", description: "List or view Team manifests" },
-  { label: "/memory", description: "Inspect workspace memory" },
-  { label: "/dream", description: "Run memory consolidation" },
-  { label: "/goal", description: "Set or inspect the active goal" },
-  { label: "/loop", description: "Schedule a recurring prompt" },
-  { label: "/cron", description: "Manage scheduled prompts" },
-  { label: "/worktree", description: "Reserved; launch from an existing Git worktree" },
-  { label: "/skills", description: "List or view local skills" },
-  { label: "/plugins", description: "List or view installed plugins" },
-  { label: "/permissions", description: "Switch permission mode or inspect rules" },
-  { label: "/tasks", description: "Inspect background async tasks (Ctrl+T)" },
-  { label: "/active", description: "View and switch active agents (Ctrl+S)" },
-  { label: "/resume", description: "Resume an existing session" },
-  { label: "/sessions", description: "List saved sessions" },
-  { label: "/clear", description: "Clear the transcript" },
-  { label: "/exit", description: "Exit the application" },
+    { label: "/help", description: "Show available commands" },
+    { label: "/status", description: "Show the current session" },
+    { label: "/mode", description: "Switch agent mode" },
+    { label: "/team", description: "Run one task with the team mode" },
+    { label: "/group", description: "Run one task with the group mode" },
+    { label: "/agent-type", description: "Save the default Agent type" },
+    { label: "/models", description: "List available models" },
+    { label: "/model", description: "Show or switch runtime model" },
+    { label: "/rm", description: "Select or reset the reward model" },
+    { label: "/image_model", description: "Select an image model; enable images in /config" },
+    { label: "/strategy", description: "Configure per-step candidate selection" },
+    { label: "/config", description: "Edit runtime and memory config" },
+    { label: "/agents", description: "List or view available agents" },
+    { label: "/teams", description: "List or view Team manifests" },
+    { label: "/memory", description: "Inspect workspace memory" },
+    { label: "/dream", description: "Run memory consolidation" },
+    { label: "/goal", description: "Set or inspect the active goal" },
+    { label: "/loop", description: "Schedule a recurring prompt" },
+    { label: "/cron", description: "Manage scheduled prompts" },
+    { label: "/worktree", description: "Reserved; launch from an existing Git worktree" },
+    { label: "/skills", description: "List or view local skills" },
+    { label: "/plugins", description: "List or view installed plugins" },
+    { label: "/permissions", description: "Switch permission mode or inspect rules" },
+    { label: "/tasks", description: "Inspect background async tasks (Ctrl+T)" },
+    { label: "/active", description: "View and switch active agents (Ctrl+S)" },
+    { label: "/resume", description: "Resume an existing session" },
+    { label: "/sessions", description: "List saved sessions" },
+    { label: "/clear", description: "Start a new session with current settings" },
+    { label: "/exit", description: "Exit the application" },
 ];
-
 // 两个维度各自独立补全：/mode 走执行模式，/permissions 走审批策略。
 const MODE_OPTIONS: CandidateItem[] = [
-  { label: "agent", description: "Single agent" },
-  { label: "plan", description: "Read-only planning" },
-  { label: "team", description: "Team" },
-  { label: "group", description: "Group" },
+    { label: "agent", description: "Single agent" },
+    { label: "plan", description: "Read-only planning" },
+    { label: "team", description: "Team" },
+    { label: "group", description: "Group" },
 ];
-
 const PERMISSION_OPTIONS: CandidateItem[] = [
-  { label: "default", description: "Ask before mutations" },
-  { label: "accept", description: "Allow workspace edits" },
-  { label: "status", description: "Show permission rules" },
+    { label: "default", description: "Ask before mutations" },
+    { label: "accept", description: "Allow workspace edits" },
+    { label: "status", description: "Show permission rules" },
 ];
-
 const STRATEGY_OPTIONS: CandidateItem[] = [
-  // Use a valid count so accepting completion produces an executable command;
-  // the shared completion helper appends a space after the selected token.
-  { label: "breadth=3", description: "Set candidates per step; no scorer stays linear" },
-  { label: "reset", description: "Restore linear execution" },
+    // Use a valid count so accepting completion produces an executable command;
+    // the shared completion helper appends a space after the selected token.
+    { label: "breadth=3", description: "Set candidates per step; no scorer stays linear" },
+    { label: "reset", description: "Restore linear execution" },
 ];
-
 const MEMORY_OPTIONS: CandidateItem[] = [
-  { label: "status", description: "Show memory status" },
-  { label: "search", description: "Search memory topics" },
-  { label: "view", description: "Read memory index or topic" },
+    { label: "status", description: "Show memory status" },
+    { label: "search", description: "Search memory topics" },
+    { label: "view", description: "Read memory index or topic" },
 ];
-
 const GOAL_OPTIONS: CandidateItem[] = [
-  { label: "pause", description: "Pause the active goal" },
-  { label: "resume", description: "Resume the active goal" },
-  { label: "clear", description: "Clear the active goal" },
+    { label: "pause", description: "Pause the active goal" },
+    { label: "resume", description: "Resume the active goal" },
+    { label: "clear", description: "Clear the active goal" },
 ];
-
 const CRON_OPTIONS: CandidateItem[] = [
-  { label: "list", description: "List scheduled prompts" },
-  { label: "delete", description: "Delete a scheduled prompt" },
-  { label: "status", description: "Show cron scheduler state" },
+    { label: "list", description: "List scheduled prompts" },
+    { label: "delete", description: "Delete a scheduled prompt" },
+    { label: "status", description: "Show cron scheduler state" },
 ];
-
 const WORKTREE_OPTIONS: CandidateItem[] = [
-  { label: "enter", description: "Create or switch to a worktree" },
-  { label: "exit", description: "Exit the active worktree" },
-  { label: "list", description: "List managed worktrees" },
-  { label: "status", description: "Show worktree status" },
+    { label: "enter", description: "Create or switch to a worktree" },
+    { label: "exit", description: "Exit the active worktree" },
+    { label: "list", description: "List managed worktrees" },
+    { label: "status", description: "Show worktree status" },
 ];
-
 const WORKTREE_EXIT_OPTIONS: CandidateItem[] = [
-  { label: "--discard", description: "Force cleanup dirty or ahead worktree" },
+    { label: "--discard", description: "Force cleanup dirty or ahead worktree" },
 ];
-
-
 function normalizeCommandInput(input: string): string {
-  return input.replace(/\s+/g, " ").trim();
+    return input.replace(/\s+/g, " ").trim();
 }
-
 interface CursorToken {
-  token: string;
-  start: number;
-  end: number;
+    token: string;
+    start: number;
+    end: number;
 }
-
 function clampCompletionCursor(input: string, cursor?: number): number {
-  return Math.max(0, Math.min(cursor ?? input.length, input.length));
+    return Math.max(0, Math.min(cursor ?? input.length, input.length));
 }
-
 function getCursorToken(input: string, cursor?: number): CursorToken {
-  const position = clampCompletionCursor(input, cursor);
-  let start = position;
-  while (start > 0 && !/\s/.test(input[start - 1] || "")) {
-    start -= 1;
-  }
-
-  let end = position;
-  while (end < input.length && !/\s/.test(input[end] || "")) {
-    end += 1;
-  }
-
-  return {
-    token: input.slice(start, end),
-    start,
-    end,
-  };
+    const position = clampCompletionCursor(input, cursor);
+    let start = position;
+    while (start > 0 && !/\s/.test(input[start - 1] || "")) {
+        start -= 1;
+    }
+    let end = position;
+    while (end < input.length && !/\s/.test(input[end] || "")) {
+        end += 1;
+    }
+    return {
+        token: input.slice(start, end),
+        start,
+        end
+    };
 }
-
 function getUniqueNames(names: string[]): string[] {
-  return [...new Set(names.filter(Boolean))];
+    return [...new Set(names.filter(Boolean))];
 }
-
 function prefixFilter(candidates: CandidateItem[], prefix: string): CandidateItem[] {
-  const normalized = prefix.toLowerCase();
-  return candidates.filter((candidate) => {
-    const label = candidate.label.toLowerCase();
-    return label.startsWith(normalized) && label !== normalized;
-  });
+    const normalized = prefix.toLowerCase();
+    return candidates.filter((candidate) => {
+        const label = candidate.label.toLowerCase();
+        return label.startsWith(normalized) && label !== normalized;
+    });
 }
-
-export function getCommandCandidates(
-  input: string,
-  runtimeModelNames: string[] = [],
-  skillNames: string[] = [],
-  cursor?: number,
-  pluginNames: string[] = [],
-  availableAgentNames: string[] = [],
-): CandidateItem[] {
-  const tokenAtCursor = getCursorToken(input, cursor);
-  const context = input.slice(0, clampCompletionCursor(input, cursor));
-  const firstTokenStart = input.search(/\S|$/);
-  if (tokenAtCursor.start === firstTokenStart && tokenAtCursor.token.startsWith("$")) {
-    const prefix = tokenAtCursor.token.toLowerCase();
-    const workflowCandidates = [{ label: "$workflow:deep_research", description: "Workflow" }];
-    if (prefix.startsWith("$workflow:")) {
-      return prefixFilter(workflowCandidates, prefix);
+export function getCommandCandidates(input: string, runtimeModelNames: string[] = [], skillNames: string[] = [], cursor?: number, pluginNames: string[] = [], availableAgentNames: string[] = [], imageModelNames: string[] = []): CandidateItem[] {
+    const tokenAtCursor = getCursorToken(input, cursor);
+    const context = input.slice(0, clampCompletionCursor(input, cursor));
+    const firstTokenStart = input.search(/\S|$/);
+    if (tokenAtCursor.start === firstTokenStart && tokenAtCursor.token.startsWith("$")) {
+        const prefix = tokenAtCursor.token.toLowerCase();
+        const workflowCandidates = [{ label: "$workflow:deep_research", description: "Workflow" }];
+        if (prefix.startsWith("$workflow:")) {
+            return prefixFilter(workflowCandidates, prefix);
+        }
+        const skillCandidates = getUniqueNames(skillNames).map((name) => ({
+            label: `$${name}`,
+            description: "Skill"
+        }));
+        const skillLabels = new Set(skillCandidates.map((item) => item.label.toLowerCase()));
+        const pluginCandidates = getUniqueNames(pluginNames)
+            .map((name) => ({ label: `$${name}`, description: "Plugin" }))
+            .filter((item) => !skillLabels.has(item.label.toLowerCase()));
+        return prefixFilter([...skillCandidates, ...pluginCandidates, ...workflowCandidates], prefix);
     }
-    const skillCandidates = getUniqueNames(skillNames).map((name) => ({
-      label: `$${name}`,
-      description: "Skill",
-    }));
-    const skillLabels = new Set(skillCandidates.map((item) => item.label.toLowerCase()));
-    const pluginCandidates = getUniqueNames(pluginNames)
-      .map((name) => ({ label: `$${name}`, description: "Plugin" }))
-      .filter((item) => !skillLabels.has(item.label.toLowerCase()));
-    return prefixFilter([...skillCandidates, ...pluginCandidates, ...workflowCandidates], prefix);
-  }
-  const normalized = tokenAtCursor.token.startsWith("/")
-    ? tokenAtCursor.token
-    : normalizeCommandInput(context);
-  if (!normalized.startsWith("/")) {
+    const normalized = tokenAtCursor.token.startsWith("/")
+        ? tokenAtCursor.token
+        : normalizeCommandInput(context);
+    if (!normalized.startsWith("/")) {
+        return [];
+    }
+    const parts = normalized.split(/\s+/);
+    const uniqueSkillNames = getUniqueNames(skillNames);
+    const uniquePluginNames = getUniqueNames(pluginNames);
+    const hasTrailingWhitespace = /\s$/.test(context);
+    // 无参数命令列表：输入完整后不再显示候选，允许历史导航
+    const COMMANDS_WITHOUT_PARAMS = new Set([
+        "/help", "/status", "/models", "/model", "/rm", "/image_model", "/config", "/dream", "/clear", "/exit",
+        "/tasks", "/active", "/resume", "/sessions",
+    ]);
+    if (parts.length === 1 && !hasTrailingWhitespace) {
+        const prefix = parts[0].toLowerCase();
+        // 对于无参数命令，完全匹配时关闭候选列表，让用户可以使用方向键切换历史
+        if (COMMANDS_WITHOUT_PARAMS.has(prefix)) {
+            return [];
+        }
+        // 对于有参数命令或部分匹配，继续显示候选列表
+        return SLASH_COMMANDS.filter((candidate) => candidate.label.toLowerCase().startsWith(prefix));
+    }
+    if (parts[0] === "/mode") {
+        if (parts.length === 2) {
+            return prefixFilter(MODE_OPTIONS, parts[1]);
+        }
+    }
+    if (parts[0] === "/permissions") {
+        if (parts.length === 2) {
+            return prefixFilter(PERMISSION_OPTIONS, parts[1]);
+        }
+    }
+    if (parts[0] === "/strategy") {
+        // The command accepts exactly one argument. Offer both choices after the
+        // command's whitespace, but close the list after a complete argument so
+        // arrow keys can return to history navigation without suggesting extras.
+        const awaitingArgument = parts.length === 1 && hasTrailingWhitespace;
+        const editingArgument = parts.length === 2 && !hasTrailingWhitespace;
+        return awaitingArgument || editingArgument
+            ? prefixFilter(STRATEGY_OPTIONS, parts[1] || "")
+            : [];
+    }
+    if (parts[0] === "/image_model") {
+        // Images use their own catalog; language model names and reasoning effort
+        // options must never leak into this single-argument command's completion.
+        const awaitingArgument = parts.length === 1 && hasTrailingWhitespace;
+        const editingArgument = parts.length === 2 && !hasTrailingWhitespace;
+        return awaitingArgument || editingArgument
+            ? prefixFilter(getUniqueNames(imageModelNames).map((label) => ({ label, description: "Image model" })), parts[1] || "")
+            : [];
+    }
+    if (parts[0] === "/rm") {
+        // Reward models come from the runtime catalog, with one reserved reset
+        // action. Accept exactly one argument and close completed suggestions.
+        const awaitingArgument = parts.length === 1 && hasTrailingWhitespace;
+        const editingArgument = parts.length === 2 && !hasTrailingWhitespace;
+        const options = getUniqueNames(runtimeModelNames)
+            .filter((name) => name !== "reset")
+            .map((label) => ({ label, description: "Reward model" }));
+        return awaitingArgument || editingArgument
+            ? prefixFilter([...options, { label: "reset", description: "Clear the reward model" }], parts[1] || "")
+            : [];
+    }
+    if (parts[0] === "/model") {
+        // /model 无参数时直接执行，显示当前模型
+        if (parts.length === 1 && hasTrailingWhitespace) {
+            const prefix = "";
+            return runtimeModelNames
+                .filter((name) => {
+                const label = name.toLowerCase();
+                return label.startsWith(prefix);
+            })
+                .map((name) => ({
+                label: name,
+                description: "Runtime model"
+            }));
+        }
+        // /model <partial> 时补全，完全匹配后关闭候选列表
+        if (parts.length === 2 && !hasTrailingWhitespace) {
+            const prefix = parts[1].toLowerCase();
+            return runtimeModelNames
+                .filter((name) => {
+                const label = name.toLowerCase();
+                return label.startsWith(prefix) && label !== prefix;
+            })
+                .map((name) => ({
+                label: name,
+                description: "Runtime model"
+            }));
+        }
+    }
+    if (parts[0] === "/agents" && parts.length === 2) {
+        return prefixFilter(getUniqueNames(availableAgentNames).map((label) => ({ label, description: "Available agent" })), parts[1]);
+    }
+    if (parts[0] === "/memory" && parts.length === 2) {
+        return prefixFilter(MEMORY_OPTIONS, parts[1]);
+    }
+    if (parts[0] === "/goal" && parts.length === 2) {
+        return prefixFilter(GOAL_OPTIONS, parts[1]);
+    }
+    if ((parts[0] === "/cron" || parts[0] === "/loop") && parts.length === 2) {
+        return prefixFilter(CRON_OPTIONS, parts[1]);
+    }
+    if (parts[0] === "/worktree") {
+        if (parts.length === 2) {
+            return prefixFilter(WORKTREE_OPTIONS, parts[1]);
+        }
+        if (parts[1] === "exit" && parts.length === 3) {
+            return prefixFilter(WORKTREE_EXIT_OPTIONS, parts[2]);
+        }
+    }
+    if (parts[0] === "/skills") {
+        if (parts.length === 2) {
+            const prefix = parts[1].toLowerCase();
+            return uniqueSkillNames
+                .filter((name) => {
+                const label = name.toLowerCase();
+                return label.startsWith(prefix) && label !== prefix;
+            })
+                .map((name) => ({
+                label: name,
+                description: "Skill name"
+            }));
+        }
+    }
+    if (parts[0] === "/plugins" && parts.length === 2) {
+        return prefixFilter(uniquePluginNames.map((label) => ({ label, description: "Plugin name" })), parts[1]);
+    }
     return [];
-  }
-
-  const parts = normalized.split(/\s+/);
-  const uniqueSkillNames = getUniqueNames(skillNames);
-  const uniquePluginNames = getUniqueNames(pluginNames);
-  const hasTrailingWhitespace = /\s$/.test(context);
-
-  // 无参数命令列表：输入完整后不再显示候选，允许历史导航
-  const COMMANDS_WITHOUT_PARAMS = new Set([
-    "/help", "/status", "/models", "/model", "/rm", "/config", "/dream", "/clear", "/exit",
-    "/tasks", "/active", "/resume", "/sessions",
-  ]);
-
-  if (parts.length === 1 && !hasTrailingWhitespace) {
-    const prefix = parts[0].toLowerCase();
-    // 对于无参数命令，完全匹配时关闭候选列表，让用户可以使用方向键切换历史
-    if (COMMANDS_WITHOUT_PARAMS.has(prefix)) {
-      return [];
-    }
-    // 对于有参数命令或部分匹配，继续显示候选列表
-    return SLASH_COMMANDS.filter((candidate) =>
-      candidate.label.toLowerCase().startsWith(prefix),
-    );
-  }
-
-  if (parts[0] === "/mode") {
-    if (parts.length === 2) {
-      return prefixFilter(MODE_OPTIONS, parts[1]);
-    }
-  }
-
-  if (parts[0] === "/permissions") {
-    if (parts.length === 2) {
-      return prefixFilter(PERMISSION_OPTIONS, parts[1]);
-    }
-  }
-
-  if (parts[0] === "/strategy") {
-    // The command accepts exactly one argument. Offer both choices after the
-    // command's whitespace, but close the list after a complete argument so
-    // arrow keys can return to history navigation without suggesting extras.
-    const awaitingArgument = parts.length === 1 && hasTrailingWhitespace;
-    const editingArgument = parts.length === 2 && !hasTrailingWhitespace;
-    return awaitingArgument || editingArgument
-      ? prefixFilter(STRATEGY_OPTIONS, parts[1] || "")
-      : [];
-  }
-
-  if (parts[0] === "/rm") {
-    // Reward models come from the runtime catalog, with one reserved reset
-    // action. Accept exactly one argument and close completed suggestions.
-    const awaitingArgument = parts.length === 1 && hasTrailingWhitespace;
-    const editingArgument = parts.length === 2 && !hasTrailingWhitespace;
-    const options = getUniqueNames(runtimeModelNames)
-      .filter((name) => name !== "reset")
-      .map((label) => ({ label, description: "Reward model" }));
-    return awaitingArgument || editingArgument
-      ? prefixFilter([...options, { label: "reset", description: "Clear the reward model" }], parts[1] || "")
-      : [];
-  }
-
-  if (parts[0] === "/model") {
-    // /model 无参数时直接执行，显示当前模型
-    if (parts.length === 1 && hasTrailingWhitespace) {
-      const prefix = "";
-      return runtimeModelNames
-        .filter((name) => {
-          const label = name.toLowerCase();
-          return label.startsWith(prefix);
-        })
-        .map((name) => ({
-          label: name,
-          description: "Runtime model",
-        }));
-    }
-    // /model <partial> 时补全，完全匹配后关闭候选列表
-    if (parts.length === 2 && !hasTrailingWhitespace) {
-      const prefix = parts[1].toLowerCase();
-      return runtimeModelNames
-        .filter((name) => {
-          const label = name.toLowerCase();
-          return label.startsWith(prefix) && label !== prefix;
-        })
-        .map((name) => ({
-          label: name,
-          description: "Runtime model",
-        }));
-    }
-  }
-
-  if (parts[0] === "/agents" && parts.length === 2) {
-    return prefixFilter(
-      getUniqueNames(availableAgentNames).map((label) => ({ label, description: "Available agent" })),
-      parts[1],
-    );
-  }
-
-  if (parts[0] === "/memory" && parts.length === 2) {
-    return prefixFilter(MEMORY_OPTIONS, parts[1]);
-  }
-
-  if (parts[0] === "/goal" && parts.length === 2) {
-    return prefixFilter(GOAL_OPTIONS, parts[1]);
-  }
-
-  if ((parts[0] === "/cron" || parts[0] === "/loop") && parts.length === 2) {
-    return prefixFilter(CRON_OPTIONS, parts[1]);
-  }
-
-  if (parts[0] === "/worktree") {
-    if (parts.length === 2) {
-      return prefixFilter(WORKTREE_OPTIONS, parts[1]);
-    }
-    if (parts[1] === "exit" && parts.length === 3) {
-      return prefixFilter(WORKTREE_EXIT_OPTIONS, parts[2]);
-    }
-  }
-
-  if (parts[0] === "/skills") {
-    if (parts.length === 2) {
-      const prefix = parts[1].toLowerCase();
-      return uniqueSkillNames
-        .filter((name) => {
-          const label = name.toLowerCase();
-          return label.startsWith(prefix) && label !== prefix;
-        })
-        .map((name) => ({
-          label: name,
-          description: "Skill name",
-        }));
-    }
-  }
-
-  if (parts[0] === "/plugins" && parts.length === 2) {
-    return prefixFilter(
-      uniquePluginNames.map((label) => ({ label, description: "Plugin name" })),
-      parts[1],
-    );
-  }
-
-  return [];
 }
-
 /**
  * 构建内联提示文本 - 当命令后输入空格时显示所有可选参数
  * 例如: /mode  -> <default|accept|plan>
  */
 export function buildInlineHint(params: {
-  input: string;
-  cursor?: number;
-  candidates: CandidateItem[];
+    input: string;
+    cursor?: number;
+    candidates: CandidateItem[];
 }): string | null {
-  const position = clampCompletionCursor(params.input, params.cursor);
-
-  // 只在光标位于输入末尾时显示内联提示
-  if (position !== params.input.length) {
+    const position = clampCompletionCursor(params.input, params.cursor);
+    // 只在光标位于输入末尾时显示内联提示
+    if (position !== params.input.length) {
+        return null;
+    }
+    // 必须以 / 开头
+    if (!params.input.startsWith("/")) {
+        return null;
+    }
+    // 必须以空格结尾（表示命令已输入完成，等待参数）
+    if (!/\s$/.test(params.input)) {
+        return null;
+    }
+    const normalized = normalizeCommandInput(params.input);
+    const parts = normalized.split(/\s+/);
+    // 根据命令类型返回对应的选项提示
+    if (parts.length === 1) {
+        // 一级命令后的空格，显示子命令或参数选项
+        if (parts[0] === "/mode") {
+            return "<agent|plan|team|group>";
+        }
+        if (parts[0] === "/permissions") {
+            return "<default|accept|status>";
+        }
+        if (parts[0] === "/strategy") {
+            return "<breadth=N|reset>";
+        }
+        if (parts[0] === "/rm") {
+            return "<model_name|reset>";
+        }
+        if (parts[0] === "/image_model") {
+            return "<model_name>";
+        }
+        if (parts[0] === "/memory") {
+            return "<status|search|view>";
+        }
+        if (parts[0] === "/goal") {
+            return "<pause|resume|clear>";
+        }
+        if (parts[0] === "/cron" || parts[0] === "/loop") {
+            return "<list|delete|status>";
+        }
+        if (parts[0] === "/worktree") {
+            return "<enter|exit|list|status>";
+        }
+        if (parts[0] === "/agents") {
+            return "<agent-name>";
+        }
+    }
+    else if (parts.length === 2) {
+        // 二级命令后的空格
+        if (parts[0] === "/worktree" && parts[1] === "exit") {
+            return "<--discard>";
+        }
+    }
     return null;
-  }
-
-  // 必须以 / 开头
-  if (!params.input.startsWith("/")) {
-    return null;
-  }
-
-  // 必须以空格结尾（表示命令已输入完成，等待参数）
-  if (!/\s$/.test(params.input)) {
-    return null;
-  }
-
-  const normalized = normalizeCommandInput(params.input);
-  const parts = normalized.split(/\s+/);
-
-  // 根据命令类型返回对应的选项提示
-  if (parts.length === 1) {
-    // 一级命令后的空格，显示子命令或参数选项
-    if (parts[0] === "/mode") {
-      return "<agent|plan|team|group>";
-    }
-    if (parts[0] === "/permissions") {
-      return "<default|accept|status>";
-    }
-    if (parts[0] === "/strategy") {
-      return "<breadth=N|reset>";
-    }
-    if (parts[0] === "/rm") {
-      return "<model_name|reset>";
-    }
-    if (parts[0] === "/memory") {
-      return "<status|search|view>";
-    }
-    if (parts[0] === "/goal") {
-      return "<pause|resume|clear>";
-    }
-    if (parts[0] === "/cron" || parts[0] === "/loop") {
-      return "<list|delete|status>";
-    }
-    if (parts[0] === "/worktree") {
-      return "<enter|exit|list|status>";
-    }
-    if (parts[0] === "/agents") {
-      return "<agent-name>";
-    }
-  } else if (parts.length === 2) {
-    // 二级命令后的空格
-    if (parts[0] === "/worktree" && parts[1] === "exit") {
-      return "<--discard>";
-    }
-  }
-
-  return null;
 }
-
 export function buildGhostText(params: {
-  input: string;
-  cursor?: number;
-  candidates: CandidateItem[];
-  selectedIndex: number;
-  visible: boolean;
+    input: string;
+    cursor?: number;
+    candidates: CandidateItem[];
+    selectedIndex: number;
+    visible: boolean;
 }): string | null {
-  if (!params.visible || params.candidates.length === 0) {
-    return null;
-  }
-
-  const selected = params.candidates[params.selectedIndex];
-  if (!selected) {
-    return null;
-  }
-
-  const tokenAtCursor = getCursorToken(params.input, params.cursor);
-  if (!tokenAtCursor.token || clampCompletionCursor(params.input, params.cursor) !== tokenAtCursor.end) {
-    return null;
-  }
-
-  if (!selected.label.toLowerCase().startsWith(tokenAtCursor.token.toLowerCase())) {
-    return null;
-  }
-
-  const suffix = selected.label.slice(tokenAtCursor.token.length);
-  return suffix || null;
+    if (!params.visible || params.candidates.length === 0) {
+        return null;
+    }
+    const selected = params.candidates[params.selectedIndex];
+    if (!selected) {
+        return null;
+    }
+    const tokenAtCursor = getCursorToken(params.input, params.cursor);
+    if (!tokenAtCursor.token || clampCompletionCursor(params.input, params.cursor) !== tokenAtCursor.end) {
+        return null;
+    }
+    if (!selected.label.toLowerCase().startsWith(tokenAtCursor.token.toLowerCase())) {
+        return null;
+    }
+    const suffix = selected.label.slice(tokenAtCursor.token.length);
+    return suffix || null;
 }
-
 export function acceptCommandCompletion(params: {
-  input: string;
-  cursor?: number;
-  candidate: CandidateItem;
-}): { input: string; cursor: number } {
-  const tokenAtCursor = getCursorToken(params.input, params.cursor);
-  const rest = params.input.slice(tokenAtCursor.end);
-  // Append a trailing space so the candidate panel closes after completion and
-  // ↑/↓ recall history instead of cycling candidates. Skip it when the next
-  // character is already whitespace to avoid doubling spaces mid-line.
-  const suffix = /^\s/.test(rest) ? "" : " ";
-  const completed = params.candidate.label + suffix;
-  const nextInput =
-    params.input.slice(0, tokenAtCursor.start) + completed + rest;
-
-  return {
-    input: nextInput,
-    cursor: tokenAtCursor.start + completed.length,
-  };
+    input: string;
+    cursor?: number;
+    candidate: CandidateItem;
+}): {
+    input: string;
+    cursor: number;
+} {
+    const tokenAtCursor = getCursorToken(params.input, params.cursor);
+    const rest = params.input.slice(tokenAtCursor.end);
+    // Append a trailing space so the candidate panel closes after completion and
+    // ↑/↓ recall history instead of cycling candidates. Skip it when the next
+    // character is already whitespace to avoid doubling spaces mid-line.
+    const suffix = /^\s/.test(rest) ? "" : " ";
+    const completed = params.candidate.label + suffix;
+    const nextInput = params.input.slice(0, tokenAtCursor.start) + completed + rest;
+    return {
+        input: nextInput,
+        cursor: tokenAtCursor.start + completed.length
+    };
 }
-
-export function useCompletion(
-  runtimeModelNames: string[] = [],
-  skillNames: string[] = [],
-  pluginNames: string[] = [],
-  availableAgentNames: string[] = [],
-) {
-  const [candidates, setCandidates] = useState<CandidateItem[]>([]);
-  const [selectedIndex, setSelectedIndex] = useState(0);
-  const [visible, setVisible] = useState(false);
-  const [currentInput, setCurrentInput] = useState("");
-  const [currentCursor, setCurrentCursor] = useState(0);
-
-  const updateCandidates = useCallback((input: string, cursor?: number) => {
-    const nextCursor = clampCompletionCursor(input, cursor);
-    setCurrentInput(input);
-    setCurrentCursor(nextCursor);
-    const matches = getCommandCandidates(
-      input,
-      runtimeModelNames,
-      skillNames,
-      nextCursor,
-      pluginNames,
-      availableAgentNames,
-    );
-    setCandidates(matches);
-    setSelectedIndex(0);
-    setVisible(matches.length > 0);
-  }, [runtimeModelNames, skillNames, pluginNames, availableAgentNames]);
-
-  const selectNext = useCallback(() => {
-    setCandidates((current) => {
-      if (current.length === 0) return current;
-      setSelectedIndex((prev) => (prev + 1) % current.length);
-      return current;
+export function useCompletion(runtimeModelNames: string[] = [], skillNames: string[] = [], pluginNames: string[] = [], availableAgentNames: string[] = [], imageModelNames: string[] = []) {
+    const [candidates, setCandidates] = useState<CandidateItem[]>([]);
+    const [selectedIndex, setSelectedIndex] = useState(0);
+    const [visible, setVisible] = useState(false);
+    const [currentInput, setCurrentInput] = useState("");
+    const [currentCursor, setCurrentCursor] = useState(0);
+    const updateCandidates = useCallback((input: string, cursor?: number) => {
+        const nextCursor = clampCompletionCursor(input, cursor);
+        setCurrentInput(input);
+        setCurrentCursor(nextCursor);
+        const matches = getCommandCandidates(input, runtimeModelNames, skillNames, nextCursor, pluginNames, availableAgentNames, imageModelNames);
+        setCandidates(matches);
+        setSelectedIndex(0);
+        setVisible(matches.length > 0);
+    }, [runtimeModelNames, skillNames, pluginNames, availableAgentNames, imageModelNames]);
+    const selectNext = useCallback(() => {
+        setCandidates((current) => {
+            if (current.length === 0)
+                return current;
+            setSelectedIndex((prev) => (prev + 1) % current.length);
+            return current;
+        });
+    }, []);
+    const selectPrev = useCallback(() => {
+        setCandidates((current) => {
+            if (current.length === 0)
+                return current;
+            setSelectedIndex((prev) => (prev - 1 + current.length) % current.length);
+            return current;
+        });
+    }, []);
+    const accept = useCallback((input: string, cursor?: number): {
+        input: string;
+        cursor: number;
+    } | null => {
+        if (candidates.length === 0 || !visible)
+            return null;
+        const selected = candidates[selectedIndex];
+        if (!selected)
+            return null;
+        const result = acceptCommandCompletion({ input, cursor, candidate: selected });
+        setCandidates([]);
+        setVisible(false);
+        setSelectedIndex(0);
+        return result;
+    }, [candidates, selectedIndex, visible]);
+    const dismiss = useCallback(() => {
+        setCandidates([]);
+        setVisible(false);
+        setSelectedIndex(0);
+    }, []);
+    const ghostText = buildGhostText({
+        input: currentInput,
+        cursor: currentCursor,
+        candidates,
+        selectedIndex,
+        visible
     });
-  }, []);
-
-  const selectPrev = useCallback(() => {
-    setCandidates((current) => {
-      if (current.length === 0) return current;
-      setSelectedIndex((prev) => (prev - 1 + current.length) % current.length);
-      return current;
+    const inlineHint = buildInlineHint({
+        input: currentInput,
+        cursor: currentCursor,
+        candidates
     });
-  }, []);
-
-  const accept = useCallback(
-    (input: string, cursor?: number): { input: string; cursor: number } | null => {
-      if (candidates.length === 0 || !visible) return null;
-
-      const selected = candidates[selectedIndex];
-      if (!selected) return null;
-
-      const result = acceptCommandCompletion({ input, cursor, candidate: selected });
-
-      setCandidates([]);
-      setVisible(false);
-      setSelectedIndex(0);
-
-      return result;
-    },
-    [candidates, selectedIndex, visible]
-  );
-
-  const dismiss = useCallback(() => {
-    setCandidates([]);
-    setVisible(false);
-    setSelectedIndex(0);
-  }, []);
-
-  const ghostText = buildGhostText({
-    input: currentInput,
-    cursor: currentCursor,
-    candidates,
-    selectedIndex,
-    visible,
-  });
-
-  const inlineHint = buildInlineHint({
-    input: currentInput,
-    cursor: currentCursor,
-    candidates,
-  });
-
-  return {
-    candidates,
-    selectedIndex,
-    visible,
-    ghostText,
-    inlineHint,
-    updateCandidates,
-    selectNext,
-    selectPrev,
-    accept,
-    dismiss,
-  };
+    return {
+        candidates,
+        selectedIndex,
+        visible,
+        ghostText,
+        inlineHint,
+        updateCandidates,
+        selectNext,
+        selectPrev,
+        accept,
+        dismiss
+    };
 }

@@ -55,8 +55,10 @@ def _round(runner: Runner, message: str) -> tuple[list[Any], dict[str, Any]]:
     """跑完一轮，返回 (action steps, round_end 事件)。"""
 
     events = list(runner.stream(message))
-    steps = [event["action_step"] for event in events if event["kind"] == "action_step"]
-    end = next(event for event in events if event["kind"] == "round_end")
+    from juice_agents.core.agent.context.serialization import _deserialize_step
+
+    steps = [_deserialize_step(event["data"]["step"]) for event in events if event["kind"] == "step_end"]
+    end = next(event["data"]["result"] for event in events if event["kind"] == "round_end")
     return steps, end
 
 
@@ -67,7 +69,7 @@ def test_empty_actions_continue_to_next_step_until_submit(harness) -> None:
     steps, end = _round(runner, "hi")
 
     assert [step.round_outcome for step in steps] == ["continue", "submitted"]
-    assert end["outcome"] == "submitted"
+    assert end["status"] == "completed"
     assert end["output"] == "done"
     # 空步与普通步一致：带回一条 observation，下一次请求才不会以 assistant 消息结尾（prefill）。
     assert steps[0].observations == ["本步未执行任何动作。"]
@@ -83,5 +85,5 @@ def test_consecutive_empty_actions_keep_continuing(harness) -> None:
     steps, end = _round(runner, "hi")
 
     assert [step.round_outcome for step in steps] == ["continue", "continue", "submitted"]
-    assert end["outcome"] == "submitted"
+    assert end["status"] == "completed"
     assert model.calls == 3

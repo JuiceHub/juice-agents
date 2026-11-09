@@ -187,7 +187,6 @@ _META = 'WORKFLOW_METADATA = {"name": "counter"}\n'
         ("WORKFLOW_METADATA = ['counter']\n" + _RUN, "必须是 object"),
         ('WORKFLOW_METADATA = {"name": "counter", "tools": "read"}\n' + _RUN, "WORKFLOW_METADATA.tools"),
         ('WORKFLOW_METADATA = {"name": "other"}\n' + _RUN, "必须与文件名一致"),
-        (_META + "\nasync def run(ctx, args):\n    return {}\n", "必须是同步函数"),
         ("def run(ctx, args:\n", "语法错误"),
         # AST lint：副作用必须经 ctx.agent / ctx.artifact
         ("import os\n" + _META + _RUN, "禁止直接导入副作用模块"),

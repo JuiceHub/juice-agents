@@ -5,12 +5,15 @@
 from __future__ import annotations
 
 import base64
-import io
 import logging
-from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
-from juice_agents.core.agent.agent_type import DEFAULT_OBSERVATION_IMAGE_CACHE_DIR, ObservationImage
+from juice_agents.core.agent.agent_type import (
+    DEFAULT_OBSERVATION_IMAGE_CACHE_DIR,
+    ObservationImage,
+    image_to_api_source,
+    image_url_to_bytes,
+)
 
 from ...runtime.base_tools import Tool
 
@@ -56,55 +59,16 @@ def _strip_data_url(value: str) -> str:
 
 
 def _decode_base64_image(value: str) -> bytes:
-    return base64.b64decode(_strip_data_url(value))
-
-
-def _download_image(url: str, timeout_s: float) -> bytes:
-    from urllib.request import urlopen
-
-    with urlopen(url, timeout=timeout_s) as response:  # noqa: S310 - 受控下载
-        return response.read()
-
-
-def _coerce_image_bytes(image: Any, timeout_s: float = 60.0) -> bytes:
-    if ObservationImage is not None and isinstance(image, ObservationImage):
-        return image.to_bytes(timeout_s=timeout_s)
-
-    if isinstance(image, bytes):
-        return image
-    if isinstance(image, bytearray):
-        return bytes(image)
-
-    if isinstance(image, str):
-        if image.startswith("http://") or image.startswith("https://"):
-            return _download_image(image, timeout_s)
-        path = Path(image).expanduser()
-        if path.exists():
-            return path.read_bytes()
-        raise ValueError("image 字符串必须是有效的网络 URL 或本地文件路径")
-
-    try:
-        from PIL import Image  # type: ignore
-
-        if isinstance(image, Image.Image):
-            buf = io.BytesIO()
-            image.save(buf, format="PNG")
-            return buf.getvalue()
-    except Exception:
-        pass
-
-    raise TypeError(
-        "image 必须为 ObservationImage / PIL.Image / bytes / 可读本地文件路径 / 网络 URL"
-    )
+    return base64.b64decode(_strip_data_url(value), validate=True)
 
 
 class GenerateEditImageTool(Tool):
     """
-    使用火山引擎 doubao-seedream-4-0-250828 模型生成或编辑图片。
+    使用配置的火山引擎 Ark 图片模型生成或编辑图片。
     """
 
     name = "generate_edit_image"
-    description = "基于火山引擎 doubao-seedream-4-0-250828 生成或编辑图片"
+    description = "基于配置的火山引擎 Ark 图片模型生成或编辑图片"
     inputs = {
         "description": {"type": "string", "description": "生成图片简述，仅用于输出标识"},
         "prompt": {"type": "string", "description": "用于生成/编辑图片的提示词"},
@@ -148,9 +112,8 @@ class GenerateEditImageTool(Tool):
 
         self.client = self._init_client()
         logger.info(
-            "GenerateEditImageTool 初始化完成 model=%s api_base=%s",
+            "GenerateEditImageTool 初始化完成 model=%s",
             self.model_name,
-            self.api_base,
         )
 
     def bind_owner_agent(self, agent: Any) -> None:
@@ -163,31 +126,22 @@ class GenerateEditImageTool(Tool):
     def _init_client(self) -> Any:
         if Ark is None:
             raise ImportError('未安装 volcengine-python-sdk[ark]，无法创建图像客户端')
-        try:
-            return Ark(api_key=self.api_key, base_url=self.api_base)
-        except TypeError:
-            return Ark(api_key=self.api_key, api_base=self.api_base)
+        return Ark(api_key=self.api_key, base_url=self.api_base, timeout=self.timeout_s)
 
-    def _call_images_api(self, prompt: str, image_bytes: Optional[bytes]) -> Any:
+    def _call_images_api(self, prompt: str, image_source: str | None) -> Any:
         images_client = getattr(self.client, "images", None)
         if images_client is None:
             raise AttributeError("client 不支持 images 接口")
 
-        payload: dict[str, Any] = {"model": self.model_name, "prompt": prompt}
-        method_candidates: tuple[str, ...]
-        if image_bytes is None:
-            method_candidates = ("generate", "create")
-        else:
-            payload["image"] = io.BytesIO(image_bytes)
-            method_candidates = ("edits", "edit", "generate", "create")
-
-        for name in method_candidates:
-            method = getattr(images_client, name, None)
-            if callable(method):
-                logger.info("调用 images.%s 生成/编辑图片", name)
-                return method(**payload)
-
-        raise AttributeError("client.images 缺少可用的生成/编辑方法")
+        payload: dict[str, Any] = {
+            "model": self.model_name, "prompt": prompt, "response_format": "b64_json",
+        }
+        if image_source is not None:
+            payload["image"] = image_source
+        # Ark uses the generations endpoint for both operations. Upload-style
+        # file streams are not JSON serializable and are unsupported by Ark.
+        logger.info("调用 Ark images.generate mode=%s", "edit" if image_source is not None else "generate")
+        return images_client.generate(**payload)
 
     def _extract_image_bytes(self, response: Any) -> bytes:
         if response is None:
@@ -220,9 +174,9 @@ class GenerateEditImageTool(Tool):
             url = _get_field(item, "url", "image_url", default=item_dict.get("url"))
             if isinstance(url, str) and url:
                 try:
-                    return _download_image(url, self.timeout_s)
+                    return image_url_to_bytes(url, timeout_s=self.timeout_s)
                 except Exception as exc:
-                    logger.warning("下载图片失败: %s", exc)
+                    logger.warning("下载图片失败: %s", type(exc).__name__)
                     continue
 
         return b""
@@ -243,8 +197,8 @@ class GenerateEditImageTool(Tool):
             len(description),
         )
 
-        image_bytes = _coerce_image_bytes(image, timeout_s=self.timeout_s) if is_edit else None
-        response = self._call_images_api(prompt, image_bytes)
+        image_source = image_to_api_source(image, timeout_s=self.timeout_s) if is_edit else None
+        response = self._call_images_api(prompt, image_source)
         result_bytes = self._extract_image_bytes(response)
         if not result_bytes:
             raise ValueError("未获取到有效的图片数据")

@@ -75,12 +75,12 @@ class ShowcaseTraceTests(unittest.TestCase):
         for value in (step, asdict(step)):
             lines = []
             _runtime.render_event(
-                {"kind": "action_step", "agent_name": "root", "action_step": value},
+                {"kind": "step_end", "agent_name": "root", "data": {"step": value}},
                 writer=lines.append,
             )
             rendered.append(lines)
         self.assertEqual(rendered[0], rendered[1])
-        self.assertIn("[action_step] root step=2", rendered[0][0])
+        self.assertIn("[step_end] root step=2", rendered[0][0])
         self.assertIn(step.model_output, rendered[0][0])
         self.assertIn(step.observations[0], rendered[0][0])
 
@@ -90,10 +90,9 @@ class ShowcaseTraceTests(unittest.TestCase):
             ("thinking", {"model_output": "repeated text"}),
             ("tool_start", {"tool_name": "bash", "tool_args": {"command": "pytest"}}),
             ("tool_end", {"tool_name": "bash", "observation": "3 passed", "error": None}),
-            ("step_complete", {"step": "repeated step"}),
         ):
             _runtime.render_event(
-                {"kind": "action_event", "agent_name": "root", "event_type": event_type, "data": data},
+                {"kind": event_type, "agent_name": "root", "data": data},
                 writer=lines.append,
             )
         self.assertEqual(len(lines), 2)
@@ -106,11 +105,11 @@ class ShowcaseTraceTests(unittest.TestCase):
         _runtime.render_event(
             {
                 "kind": "team_update",
-                "update": {"type": "task_completed", "task_id": "task-1", "member": "reviewer"},
+                "data": {"update": {"type": "task_completed", "task_id": "task-1", "member": "reviewer"},
                 "snapshot": {
                     "tasks": [{"task_id": "task-1", "title": "Review cache", "status": "completed"}],
                     "messages": [{"content": "private irrelevant context"}],
-                },
+                }},
             },
             writer=lines.append,
         )
@@ -122,10 +121,10 @@ class ShowcaseTraceTests(unittest.TestCase):
         large_output = "x" * 5000
         lines = []
         _runtime.render_event(
-            {"kind": "action_step", "action_step": ActionStep(1, large_output)}, writer=lines.append
+            {"kind": "step_end", "data": {"step": ActionStep(1, large_output)}}, writer=lines.append
         )
         _runtime.render_event(
-            {"kind": "round_end", "outcome": "submitted", "output": large_output}, writer=lines.append
+            {"kind": "round_end", "data": {"result": {"round_id": "r1", "status": "completed", "output": large_output}}}, writer=lines.append
         )
         self.assertLess(len(lines[0]), 1400)
         self.assertIn("[truncated]", lines[0])

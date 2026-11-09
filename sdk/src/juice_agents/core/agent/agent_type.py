@@ -7,6 +7,7 @@ Agent 特殊类型定义。
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import logging
@@ -280,4 +281,42 @@ class ObservationImage:
         )
 
 
-__all__ = ["ObservationImage", "normalize_image_url", "image_url_to_bytes"]
+def image_to_api_source(image: Any, timeout_s: float = 60.0) -> str:
+    """将图片转换为远端 API 可接收的网络 URL 或 base64 data URL。
+
+    会话中的图片仍保存为网络链接或本地路径，只在请求出站时编码。
+    网络链接优先原样返回，避免下载；本地文件按真实内容识别 MIME，
+    保留 JPEG/WebP 等原始字节，不能根据扩展名猜测或统一标为 PNG。
+    """
+    if isinstance(image, ObservationImage):
+        # 即使同时持有 raw_image，也优先读取已保存的源文件，避免 to_bytes()
+        # 将 JPEG 重新编码为 PNG；网络 ObservationImage 同样无需下载。
+        image = image.ensure_image_url()
+
+    if isinstance(image, (str, Path)):
+        source = str(image).strip()
+        if _is_http_url(source) or _is_data_url(source):
+            return source
+        data = image_url_to_bytes(source, timeout_s=timeout_s)
+    elif isinstance(image, (bytes, bytearray)):
+        data = bytes(image)
+    elif Image is not None and isinstance(image, Image.Image):
+        data = _pil_to_png_bytes(image)
+    else:
+        raise TypeError("image 必须为 ObservationImage / PIL.Image / bytes / 本地路径 / HTTP(S) URL")
+
+    if Image is None:
+        raise ImportError("未安装 Pillow，无法识别图片格式")
+    try:
+        with Image.open(io.BytesIO(data)) as parsed:
+            mime = Image.MIME.get(parsed.format or "")
+    except (OSError, ValueError) as exc:
+        raise ValueError("image 必须包含有效的图片数据") from exc
+    if not mime or not mime.startswith("image/"):
+        raise ValueError("无法识别 image 的图片格式")
+
+    logger.debug("图片已编码为 API data URL: mime=%s bytes=%d", mime, len(data))
+    return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+__all__ = ["ObservationImage", "normalize_image_url", "image_url_to_bytes", "image_to_api_source"]

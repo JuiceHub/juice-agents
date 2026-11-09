@@ -34,7 +34,11 @@ class ShellTool(Tool):
         del context
         from ...runtime.executor import ToolExecutionMode, ToolExecutionPolicy
 
-        mode = ToolExecutionMode.BACKGROUND if bool(args.get("background")) else ToolExecutionMode.SERIAL
+        mode = (
+            ToolExecutionMode.BACKGROUND
+            if bool(args.get("background"))
+            else ToolExecutionMode.FOREGROUND
+        )
         cwd = str(args.get("workdir") or "").strip()
         return ToolExecutionPolicy(mode=mode, resource_keys=(f"cwd:{cwd}",) if cwd else ())
     """
@@ -229,7 +233,6 @@ class ShellTool(Tool):
 
 
 class PythonTool(Tool):
-    _execution_mode = "serial"
     """
     使用本地安全执行器运行 Python 代码。
 
@@ -269,6 +272,14 @@ class PythonTool(Tool):
         self.blocked_call_prefixes = list(blocked_call_prefixes or DEFAULT_BLOCKED_PYTHON_CALL_PREFIXES)
         self.blocked_shell_patterns = list(blocked_shell_patterns or DEFAULT_BLOCKED_SHELL_PATTERNS)
         self.executor: "LocalPythonExecutor | None" = None
+
+    def execution_policy(self, args: dict[str, Any], context: Any) -> Any:
+        del args, context
+        from ...runtime.executor import ToolExecutionPolicy
+
+        # 一个 Tool 实例复用同一个执行器和变量空间，资源锁只防止并发修改状态。
+        # 有先后依赖的 Python 调用仍应拆成不同 step，不能依赖锁的获取顺序。
+        return ToolExecutionPolicy(resource_keys=(f"python:{id(self)}",))
 
     def _init_executor(self) -> None:
         from juice_agents.core.agent.local_python_executor import LocalPythonExecutor

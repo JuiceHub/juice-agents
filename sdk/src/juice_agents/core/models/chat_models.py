@@ -1,15 +1,16 @@
 """聊天模型：统一 generate 接口及各 provider 的请求、重试与响应解析。"""
 
+import asyncio
+import inspect
 import logging
 import math
-import time
-import threading
 from typing import Any, Dict, List, Optional
 
-from juice_agents.core.runner.execution.cancellation import StreamCancelled, raise_if_cancelled
+from juice_agents.core.agent.agent_type import image_to_api_source
 from juice_agents.core.agent.context.content import CACHE_BOUNDARY_KEY
 
 from ..utils import normalize_token_usage
+
 
 logger = logging.getLogger(__name__)
 
@@ -27,12 +28,63 @@ class _EmptyModelResponseError(RuntimeError):
     """
     模型返回空内容时的内部异常。
 
-    该异常只用于把“空响应”纳入与网络抖动同一层的重试循环，
+    模型层仅对空响应重试；网络失败由官方 SDK 重试。
     最终如何提示给 agent 由上层协议层决定。
     """
 
 
-class BaseChatModel:
+class _AsyncModelLifecycle:
+    """聊天和评分共用的异步连接生命周期，不创建线程或事件循环。
+
+    一个客户端只属于首次调用它的事件循环；并发任务可共享该连接池，
+    跨事件循环复用则明确报错。注入的客户端始终由调用方关闭。
+    """
+
+    _owns_client: bool = False
+    _client: Any = None
+    _owner_loop: asyncio.AbstractEventLoop | None = None
+    _closed = False
+
+    def _check_loop(self) -> None:
+        if self._closed:
+            raise RuntimeError("模型已经关闭")
+        loop = asyncio.get_running_loop()
+        if self._owner_loop is not None and self._owner_loop is not loop:
+            raise RuntimeError("模型客户端不能跨事件循环复用；请在同一循环使用和关闭")
+        self._owner_loop = loop
+
+    @staticmethod
+    def _validate_async_client(client: Any, backend: str) -> None:
+        endpoint = (getattr(client, "messages", None) if backend == "anthropic"
+                    else getattr(getattr(client, "chat", None), "completions", None))
+        create = getattr(endpoint, "create", None)
+        if not callable(create) or not inspect.iscoroutinefunction(inspect.unwrap(create)):
+            raise TypeError(f"client 必须提供 {backend} SDK 的异步 create 接口")
+
+    async def aclose(self) -> None:
+        """在所属循环释放模型创建的连接；重复关闭无副作用。"""
+        if self._closed:
+            return
+        self._check_loop()
+        if self._owns_client and self._client is not None:
+            await self._client.close()
+        self._closed = True
+
+    @staticmethod
+    async def _close_stream(stream: Any) -> None:
+        """SDK 流使用 close，原生异步生成器使用 aclose；两者都必须 await。"""
+        close = getattr(stream, "close", None) or stream.aclose
+        await close()
+
+    async def __aenter__(self):
+        self._check_loop()
+        return self
+
+    async def __aexit__(self, *_exc) -> None:
+        await self.aclose()
+
+
+class BaseChatModel(_AsyncModelLifecycle):
     """
     聊天模型基类，封装公共调用、重试与响应解析逻辑。
     """
@@ -54,7 +106,13 @@ class BaseChatModel:
         self._thinking_supported = True
         self.max_retry_times = max_retry_times
         self.wait_time = wait_time
-        self.client = client if client is not None else self._init_client()
+        self._owns_client = client is None
+        self._client = client if client is not None else self._init_client()
+
+    @property
+    def client(self) -> Any:
+        """原生异步 SDK 客户端；模型不包装或改写 SDK 接口。"""
+        return self._client
 
     def _init_client(self) -> Any:
         raise NotImplementedError
@@ -141,20 +199,20 @@ class BaseChatModel:
     def _build_payload(self, messages: List[Dict[str, Any]], stop_sequence: Optional[List[str]]) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "model": self.model_name,
-            "messages": self._strip_cache_boundary(messages),
+            "messages": self._prepare_messages(messages),
         }
         if stop_sequence:
             payload["stop"] = stop_sequence
         return self._inject_provider_payload_options(payload)
 
     @staticmethod
-    def _strip_cache_boundary(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """剥离框架内部的缓存边界标记，得到 provider 可直接消费的 messages。
+    def _prepare_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """在出站边界移除内部标记，并将本地图片编码为 API data URL。
 
         CACHE_BOUNDARY_KEY 是框架内部约定字段，OpenAI/Ark/Doubao 等接口不识别，
-        若原样发送可能触发参数校验错误。不识别缓存协议的 provider 直接丢弃该标记，
-        缓存语义随之退化为无缓存——功能正确，只是少了一层成本优化。
-        仅在标记存在时做浅拷贝，避免给常规消息引入额外开销。
+        需要在出站前剥离。图片使用与编辑工具共享的转换函数，HTTP(S) 链接
+        原样保留，本地文件只在这里编码。按需复制被转换的层级，不改写上下文
+        或嵌套 image_url，保证会话、日志和后续重试仍持有原始图片引用。
         """
         cleaned: List[Dict[str, Any]] = []
         for message in messages:
@@ -168,6 +226,13 @@ class BaseChatModel:
                 if isinstance(block, dict) and CACHE_BOUNDARY_KEY in block:
                     block = {k: v for k, v in block.items() if k != CACHE_BOUNDARY_KEY}
                     mutated = True
+                if isinstance(block, dict) and block.get("type") == "image_url":
+                    image_url = block.get("image_url")
+                    if isinstance(image_url, dict) and "url" in image_url:
+                        source = image_to_api_source(image_url["url"])
+                        if source != image_url["url"]:
+                            block = {**block, "image_url": {**image_url, "url": source}}
+                            mutated = True
                 new_content.append(block)
             if mutated:
                 new_message = dict(message)
@@ -188,62 +253,8 @@ class BaseChatModel:
             payload["thinking"] = self.thinking
         return payload
 
-    def _is_retryable_exception(self, exc: Exception) -> bool:
-        """只重试可恢复的模型/传输失败，不从错误正文猜测 HTTP 状态。"""
-        if isinstance(exc, (StreamCancelled, TypeError, ValueError, AssertionError)):
-            return False
-        if isinstance(exc, _EmptyModelResponseError):
-            return True
-
-        # 三个 SDK 都暴露 status_code；原生 HTTP 异常可从 response 读取。
-        # 状态优先于正文，避免 400/401 的说明包含 timeout 等词时重复请求。
-        status = getattr(exc, "status_code", None)
-        if status is None:
-            status = getattr(getattr(exc, "response", None), "status_code", None)
-        if isinstance(status, int) and not isinstance(status, bool):
-            return status in {408, 409, 429} or 500 <= status < 600
-        if isinstance(exc, (ConnectionError, TimeoutError)):
-            return True
-
-        # SDK 的连接/超时异常不继承内建 ConnectionError；只加载当前 backend，
-        # 保持模型模块冷导入不加载其他 provider 的约定。未知异常直接交给上层。
-        backend = getattr(self, "backend", None)
-        if backend == "openai":
-            from openai import APIConnectionError
-        elif backend == "anthropic":
-            from anthropic import APIConnectionError
-        elif backend == "doubao":
-            from volcenginesdkarkruntime._exceptions import ArkAPIConnectionError as APIConnectionError
-        else:
-            return False
-        return isinstance(exc, APIConnectionError)
-
     def _extract_reasoning_content(self, message: Any) -> Optional[Any]:
         return _get_field(message, "reasoning_content")
-
-    def _close_stream_quietly(self, stream: Any) -> None:
-        close = getattr(stream, "close", None)
-        if callable(close):
-            try:
-                close()
-            except Exception:
-                logger.debug("failed to close model stream", exc_info=True)
-
-    def _watch_stream_cancel(self, stream: Any, cancel_event: threading.Event) -> Any:
-        """Close a provider stream as soon as the runner cancel token is set."""
-
-        done = threading.Event()
-
-        def _watch() -> None:
-            while not done.is_set():
-                if cancel_event.wait(0.05):
-                    if not done.is_set():
-                        self._close_stream_quietly(stream)
-                    return
-
-        thread = threading.Thread(target=_watch, name="model-stream-cancel-watch", daemon=True)
-        thread.start()
-        return done.set
 
     def _build_message_from_stream_chunks(self, chunks: list[Any]) -> Dict[str, Any]:
         """Aggregate OpenAI-compatible streaming chunks into one message."""
@@ -283,92 +294,50 @@ class BaseChatModel:
             "usage": usage,
         }
 
-    def _invoke_model_streaming_once(
-        self, payload: Dict[str, Any], cancel_event: threading.Event,
-        usage_calls: list[dict[str, Any]],
+    async def _invoke_model_streaming_once(
+        self, payload: Dict[str, Any], usage_calls: list[dict[str, Any]],
     ) -> Dict[str, Any]:
-        """Call OpenAI-compatible chat completions in streaming mode."""
-
-        stream_payload = dict(payload)
-        stream_payload["stream"] = True
-        disable_usage_options = bool(stream_payload.pop("_disable_stream_usage_options", False))
-        if disable_usage_options:
-            stream_payload.pop("stream_options", None)
-        elif stream_payload.get("stream_options") is None:
+        """在当前协程读取整条原生流，取消后先关闭连接再交还调用方。"""
+        stream_payload = {**payload, "stream": True}
+        disable_usage = stream_payload.pop("_disable_stream_usage_options", False)
+        if not disable_usage:
             stream_payload.setdefault("stream_options", {"include_usage": True})
         try:
-            stream = self.client.chat.completions.create(**stream_payload)
+            stream = await self.client.chat.completions.create(**stream_payload)
         except TypeError:
-            # SDK 本地参数校验失败时尚未发送请求，由外层执行协议降级。
             raise
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             self._append_usage(usage_calls, None)
             raise
-        stop_watching = self._watch_stream_cancel(stream, cancel_event)
         chunks: list[Any] = []
         usage: Any = None
         try:
-            for chunk in stream:
-                # 已到达的 chunk 即使紧接着取消，也可能包含已发生的消耗。
+            async for chunk in stream:
                 chunks.append(chunk)
-                chunk_usage = _get_field(chunk, "usage")
-                if chunk_usage is not None:
-                    usage = chunk_usage
-                raise_if_cancelled(cancel_event)
-        except StreamCancelled:
-            self._close_stream_quietly(stream)
-            raise
+                if _get_field(chunk, "usage") is not None:
+                    usage = _get_field(chunk, "usage")
         finally:
-            stop_watching()
-            self._append_usage(usage_calls, usage)
-        raise_if_cancelled(cancel_event)
+            # asyncio 的取消只注入一次；finally 中继续等待 SDK 的关闭完成。
+            try:
+                await self._close_stream(stream)
+            finally:
+                self._append_usage(usage_calls, usage)
         return self._build_message_from_stream_chunks(chunks)
 
-    def _invoke_model_once(
-        self, payload: Dict[str, Any], cancel_event: threading.Event | None = None,
-        *, usage_calls: list[dict[str, Any]],
+    async def _invoke_model_once(
+        self, payload: Dict[str, Any], *, stream: bool,
+        usage_calls: list[dict[str, Any]],
     ) -> Any:
-        """
-        执行一次底层 SDK 调用。
-
-        生命周期编排放在基类中，ChatModel 只在 SDK 边界分发 provider 协议，
-        不重复实现重试循环。
-        """
-        if cancel_event is not None:
-            raise_if_cancelled(cancel_event)
+        if stream:
             try:
-                return self._invoke_model_streaming_once(payload, cancel_event, usage_calls)
+                return await self._invoke_model_streaming_once(payload, usage_calls)
             except TypeError as exc:
-                if "stream_options" in str(exc):
-                    logger.warning(
-                        "%s 客户端不支持 streaming usage 选项，降级为不带 stream_options",
-                        self.__class__.__name__,
-                    )
-                    streaming_payload = dict(payload)
-                    streaming_payload.pop("stream_options", None)
-                    streaming_payload["_disable_stream_usage_options"] = True
-                    try:
-                        return self._invoke_model_streaming_once(streaming_payload, cancel_event, usage_calls)
-                    except TypeError as fallback_exc:
-                        exc = fallback_exc
-                logger.debug(
-                    "%s streaming cancellation unsupported by client, falling back to blocking call: %s",
-                    self.__class__.__name__,
-                    exc,
-                )
-        try:
-            return self._call_sdk_once(self.client.chat.completions.create, payload, usage_calls)
-        except TypeError as exc:
-            if self._should_retry_without_thinking(exc, payload):
-                logger.warning(
-                    "%s 客户端不支持 thinking 参数，自动降级为不传 thinking",
-                    self.__class__.__name__,
-                )
-                self._thinking_supported = False
-                fallback_payload = dict(payload)
-                fallback_payload.pop("thinking", None)
-                return self._call_sdk_once(self.client.chat.completions.create, fallback_payload, usage_calls)
-            raise
+                if "stream_options" not in str(exc):
+                    raise
+                logger.warning("SDK 不支持 stream_options，移除该选项后重新建立流")
+                options = {**payload, "_disable_stream_usage_options": True}
+                return await self._invoke_model_streaming_once(options, usage_calls)
+        return await self._call_sdk_once(self.client.chat.completions.create, payload, usage_calls)
 
     def _append_usage(self, usage_calls: list[dict[str, Any]], usage: Any) -> None:
         """只向当前 generate 的局部列表追加用量，调用方决定如何收集与汇总。"""
@@ -378,16 +347,15 @@ class BaseChatModel:
             "usage": normalize_token_usage(usage),
         })
 
-    def _call_sdk_once(
+    async def _call_sdk_once(
         self, create: Any, payload: Dict[str, Any], usage_calls: list[dict[str, Any]],
     ) -> Any:
-        """记录响应及网络失败；解析失败或空内容重试也保留已发生的消耗。"""
+        """网络重试交给 SDK，只记录其对外可见的一次调用。"""
         try:
-            response = create(**payload)
+            response = await create(**payload)
         except TypeError:
-            # thinking/stream 兼容性降级是在 SDK 本地完成，不当作计费请求。
             raise
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             self._append_usage(usage_calls, None)
             raise
         self._append_usage(usage_calls, _get_field(response, "usage"))
@@ -418,96 +386,40 @@ class BaseChatModel:
             return message
         raise _EmptyModelResponseError("模型返回了空内容")
 
-    def _wait_before_retry(self, cancel_event: threading.Event | None) -> None:
-        if cancel_event is not None:
-            if cancel_event.wait(float(self.wait_time)):
-                raise StreamCancelled()
-            return
-        time.sleep(self.wait_time)
-
-    def _handle_generate_exception(
-        self, exc: Exception, attempt: int, cancel_event: threading.Event | None = None
-    ) -> None:
-        """
-        统一处理生命周期中的异常分流。
-
-        这里负责判断是否可重试、输出日志，以及在需要时等待后重试。
-        如果异常不该重试或已经达到最大重试次数，会直接重新抛出异常。
-        """
-        if isinstance(exc, StreamCancelled):
-            logger.info("%s 生成被用户中断：%s", self.__class__.__name__, exc.reason)
-            raise
-
-        if not self._is_retryable_exception(exc):
-            logger.error(
-                "%s 生成失败：%s",
-                self.__class__.__name__,
-                exc,
-            )
-            raise
-
-        if isinstance(exc, _EmptyModelResponseError):
-            if attempt >= self.max_retry_times:
-                logger.error(
-                    "%s 连续返回空内容，已达到最大重试次数 (%s/%s)",
-                    self.__class__.__name__,
-                    attempt,
-                    self.max_retry_times,
-                )
-                raise _EmptyModelResponseError(
-                    f"{self.__class__.__name__} 连续 {self.max_retry_times} 次返回空内容"
-                ) from exc
-
-            logger.warning(
-                "%s 返回空内容，重试中 (%s/%s)",
-                self.__class__.__name__,
-                attempt,
-                self.max_retry_times,
-            )
-            self._wait_before_retry(cancel_event)
-            return
-
-        logger.warning(
-            "%s 生成失败，重试中 (%s/%s): %s",
-            self.__class__.__name__,
-            attempt,
-            self.max_retry_times,
-            exc,
-        )
-        if attempt >= self.max_retry_times:
-            raise
-        self._wait_before_retry(cancel_event)
-
-    def _run_generate_lifecycle(
-        self,
-        messages: List[Dict[str, Any]],
-        stop_sequence: Optional[List[str]],
-        cancel_event: threading.Event | None = None,
-        *, usage_calls: list[dict[str, Any]],
+    async def _run_generate_lifecycle(
+        self, messages: List[Dict[str, Any]], stop_sequence: Optional[List[str]],
+        *, stream: bool, usage_calls: list[dict[str, Any]],
     ) -> Dict[str, Any]:
-        """
-        显式串联一次 generate 的生命周期。
-
-        流程固定为：构造请求 -> 调用模型 -> 解析响应 -> 校验响应。
-        发生异常时统一交给 _handle_generate_exception 做重试决策。
-        """
-        last_err: Optional[Exception] = None
+        """只为空响应重试；连接、限流和超时错误由 SDK 自己处理。"""
+        # 只把包含图片的出站准备移出循环；普通文本请求不额外调度工作线程。
+        has_images = any(
+            isinstance(block, dict) and block.get("type") == "image_url"
+            for message in messages if isinstance(message.get("content"), list)
+            for block in message["content"]
+        )
+        payload = (await asyncio.to_thread(self._build_payload, messages, stop_sequence)
+                   if has_images else self._build_payload(messages, stop_sequence))
         for attempt in range(1, self.max_retry_times + 1):
             try:
-                raise_if_cancelled(cancel_event)
-                payload = self._build_payload(messages, stop_sequence)
-                response = self._invoke_model_once(payload, cancel_event=cancel_event, usage_calls=usage_calls)
+                try:
+                    response = await self._invoke_model_once(payload, stream=stream, usage_calls=usage_calls)
+                except TypeError as exc:
+                    if not self._should_retry_without_thinking(exc, payload):
+                        raise
+                    logger.warning("%s SDK 不支持 thinking，移除后重试", self.__class__.__name__)
+                    self._thinking_supported = False
+                    payload = dict(payload)
+                    payload.pop("thinking", None)
+                    response = await self._invoke_model_once(payload, stream=stream, usage_calls=usage_calls)
                 message = response if isinstance(response, dict) else self._build_message(response)
-                raise_if_cancelled(cancel_event)
-                message = self._validate_response_message(message)
-                return {**message, "usage_calls": usage_calls}
-            except Exception as exc:  # pragma: no cover - runtime branch
-                last_err = exc
-                self._handle_generate_exception(exc, attempt, cancel_event)
-
-        if last_err:
-            raise last_err
-        raise RuntimeError(f"{self.__class__.__name__} 未知错误")
+                return {**self._validate_response_message(message), "usage_calls": usage_calls}
+            except _EmptyModelResponseError:
+                if attempt == self.max_retry_times:
+                    logger.error("%s 连续 %s 次返回空内容", self.__class__.__name__, attempt)
+                    raise
+                logger.warning("%s 返回空内容，重试中 (%s/%s)", self.__class__.__name__, attempt, self.max_retry_times)
+                await asyncio.sleep(self.wait_time)
+        raise AssertionError("max_retry_times 必须为正数")
 
     def _build_message(self, response: Any) -> Dict[str, Any]:
         choices = getattr(response, "choices", None)
@@ -532,29 +444,25 @@ class BaseChatModel:
             "usage": normalize_token_usage(_get_field(response, "usage")),
         }
 
-    def generate(
-        self,
-        messages: List[Dict[str, Any]],
-        stop_sequence: Optional[List[str]] = None,
-        *,
-        cancel_event: threading.Event | None = None,
+    async def generate(
+        self, messages: List[Dict[str, Any]], stop_sequence: Optional[List[str]] = None,
+        *, stream: bool = False,
     ) -> Dict[str, Any]:
-        """
-        generate() 只负责输入归一化和生命周期编排。
-
-        真正的调用阶段拆分到私有生命周期函数中，便于后续继续扩展公共校验和
-        provider 复用逻辑。
-        """
+        """生成完整结果；stream 只控制 SDK 传输，用任务取消中断本次调用。"""
         usage_calls: list[dict[str, Any]] = []
         try:
+            self._check_loop()
             messages = self._validate_messages(messages)
             stop_sequence = self._normalize_stop_sequence(stop_sequence)
-            return self._run_generate_lifecycle(
-                messages, stop_sequence, cancel_event, usage_calls=usage_calls,
+            return await self._run_generate_lifecycle(
+                messages, stop_sequence, stream=stream, usage_calls=usage_calls,
             )
-        except Exception as exc:
-            # 保留原异常类型，调用方即使在取消或失败时也能显式读取已发生的消耗。
+        except (Exception, asyncio.CancelledError) as exc:
             exc.usage_calls = usage_calls
+            if isinstance(exc, asyncio.CancelledError):
+                logger.info("聊天模型调用已取消: model=%s", self.model_name)
+            else:
+                logger.error("聊天模型调用失败: model=%s error=%s", self.model_name, exc)
             raise
 
 
@@ -624,13 +532,7 @@ class ChatModel(BaseChatModel):
         )
 
     def _validate_client(self, client: Any) -> None:
-        """在创建连接时检查 SDK 入口，避免错误 client 到请求时才失败。"""
-        if self.backend == "anthropic":
-            endpoint = getattr(client, "messages", None)
-        else:
-            endpoint = getattr(getattr(client, "chat", None), "completions", None)
-        if not callable(getattr(endpoint, "create", None)):
-            raise TypeError(f"client 必须提供 {self.backend} SDK 的可调用 create 接口")
+        self._validate_async_client(client, self.backend)
 
     def _init_client(self) -> Any:
         """仅加载选中的 SDK；注入 client 时不读取凭证或创建新连接。"""
@@ -641,17 +543,17 @@ class ChatModel(BaseChatModel):
             # 保留项目现有的 Anthropic bearer token 约定；其他认证可注入 client。
             options["auth_token" if self.backend == "anthropic" else "api_key"] = self.api_key
         if self.backend == "openai":
-            from openai import OpenAI
+            from openai import AsyncOpenAI
 
-            client = OpenAI(**options)
+            client = AsyncOpenAI(**options)
         elif self.backend == "doubao":
-            from volcenginesdkarkruntime import Ark
+            from volcenginesdkarkruntime import AsyncArk
 
-            client = Ark(**options)
+            client = AsyncArk(**options)
         else:
-            from anthropic import Anthropic
+            from anthropic import AsyncAnthropic
 
-            client = Anthropic(**options)
+            client = AsyncAnthropic(**options)
         self._validate_client(client)
         logger.debug("创建聊天模型客户端: backend=%s model=%s", self.backend, self.model_name)
         return client
@@ -678,13 +580,13 @@ class ChatModel(BaseChatModel):
             return self._build_anthropic_payload(messages, stop_sequence)
         return super()._build_payload(messages, stop_sequence)
 
-    def _invoke_model_once(
-        self, payload: Dict[str, Any], cancel_event: threading.Event | None = None,
-        *, usage_calls: list[dict[str, Any]],
+    async def _invoke_model_once(
+        self, payload: Dict[str, Any], *, stream: bool,
+        usage_calls: list[dict[str, Any]],
     ) -> Any:
         if self.backend == "anthropic":
-            return self._invoke_anthropic_once(payload, cancel_event, usage_calls=usage_calls)
-        return super()._invoke_model_once(payload, cancel_event, usage_calls=usage_calls)
+            return await self._invoke_anthropic_once(payload, stream=stream, usage_calls=usage_calls)
+        return await super()._invoke_model_once(payload, stream=stream, usage_calls=usage_calls)
 
     def _build_message(self, response: Any) -> Dict[str, Any]:
         if self.backend == "anthropic":
@@ -820,104 +722,59 @@ class ChatModel(BaseChatModel):
         addition_blocks = addition if isinstance(addition, list) else [{"type": "text", "text": str(addition)}]
         return [*existing_blocks, *addition_blocks]
 
-    def _invoke_anthropic_streaming_once(
-        self, stream_method: Any, payload: Dict[str, Any],
-        cancel_event: threading.Event | None, usage_calls: list[dict[str, Any]],
+    async def _invoke_anthropic_streaming_once(
+        self, payload: Dict[str, Any], usage_calls: list[dict[str, Any]],
     ) -> Dict[str, Any]:
-        """读取原生事件或官方 SDK 最终消息的 usage，快照字段覆盖而不相加。"""
+        """用原生异步上下文管理器读流，合并分阶段上报的 usage。"""
         text_parts: list[str] = []
         thinking_parts: list[str] = []
         raw_usage: dict[str, Any] = {}
-        stream_cm = stream = None
-        stop_watching = None
-        request_started = False
+        entered = False
 
-        def merge_usage(usage: Any) -> None:
-            normalized = normalize_token_usage(usage)
-            if normalized is not None and isinstance(normalized["provider_usage"], dict):
+        def merge_usage(source: Any) -> None:
+            normalized = normalize_token_usage(source)
+            if normalized is not None:
                 raw_usage.update(normalized["provider_usage"])
 
         try:
-            stream_cm = stream_method(**payload)
-            request_started = True
-            with stream_cm as stream:
-                # 高输出预算即使没有取消令牌也必须流式；只有可取消请求需要
-                # 后台 watcher，事件聚合和用量记录始终复用同一条执行路径。
-                if cancel_event is not None:
-                    stop_watching = self._watch_stream_cancel(stream, cancel_event)
-                for event in stream:
-                    event_type = _get_field(event, "type")
-                    if event_type == "message_start":
+            async with self.client.messages.stream(**payload) as response:
+                entered = True
+                async for event in response:
+                    kind = _get_field(event, "type")
+                    if kind == "message_start":
                         merge_usage(_get_field(_get_field(event, "message"), "usage"))
-                    elif event_type == "message_delta":
+                    elif kind == "message_delta":
                         merge_usage(_get_field(event, "usage"))
-                    # 取消发生时仍保留刚到达的 usage，不读取 final message 阻塞退出。
-                    raise_if_cancelled(cancel_event)
-                    if event_type == "content_block_delta":
+                    elif kind == "content_block_delta":
                         delta = _get_field(event, "delta")
-                        delta_type = _get_field(delta, "type")
-                        if delta_type == "text_delta":
+                        if _get_field(delta, "type") == "text_delta":
                             text_parts.append(str(_get_field(delta, "text") or ""))
-                        elif delta_type == "thinking_delta":
+                        elif _get_field(delta, "type") == "thinking_delta":
                             thinking_parts.append(str(_get_field(delta, "thinking") or ""))
-                raise_if_cancelled(cancel_event)
-                get_final_message = getattr(stream, "get_final_message", None)
-                if callable(get_final_message):
-                    merge_usage(_get_field(get_final_message(), "usage"))
-            return {
-                "role": "assistant", "content": "".join(text_parts),
-                "reasoning_content": "".join(thinking_parts),
-                "usage": normalize_token_usage(raw_usage) if raw_usage else None,
-            }
-        except StreamCancelled:
-            self._close_stream_quietly(stream if stream is not None else stream_cm)
-            raise
+                merge_usage(_get_field(await response.get_final_message(), "usage"))
         except TypeError:
-            # SDK 在创建/进入流时拒绝参数，不是一次真实模型请求。
-            if stream is None:
-                request_started = False
+            # 本地参数校验失败不产生一条计费请求记录。
+            if entered:
+                self._append_usage(usage_calls, raw_usage or None)
             raise
-        except Exception:
-            request_started = True
+        except (Exception, asyncio.CancelledError):
+            self._append_usage(usage_calls, raw_usage or None)
             raise
-        finally:
-            if stop_watching is not None:
-                stop_watching()
-            if request_started:
-                self._append_usage(usage_calls, raw_usage if raw_usage else None)
+        else:
+            self._append_usage(usage_calls, raw_usage or None)
+        return {
+            "role": "assistant", "content": "".join(text_parts),
+            "reasoning_content": "".join(thinking_parts),
+            "usage": normalize_token_usage(raw_usage) if raw_usage else None,
+        }
 
-    def _invoke_anthropic_once(
-        self, payload: Dict[str, Any], cancel_event: threading.Event | None = None,
-        *, usage_calls: list[dict[str, Any]],
+    async def _invoke_anthropic_once(
+        self, payload: Dict[str, Any], *, stream: bool,
+        usage_calls: list[dict[str, Any]],
     ) -> Any:
-        raise_if_cancelled(cancel_event)
-        if cancel_event is not None or payload["max_tokens"] > self._ANTHROPIC_STREAM_TOKEN_THRESHOLD:
-            stream_method = getattr(self.client.messages, "stream", None)
-            if callable(stream_method):
-                try:
-                    return self._invoke_anthropic_streaming_once(
-                        stream_method, payload, cancel_event, usage_calls,
-                    )
-                except TypeError as exc:
-                    if self._should_retry_without_thinking(exc, payload):
-                        logger.warning("%s 客户端不支持 thinking 参数，自动降级", self.__class__.__name__)
-                        self._thinking_supported = False
-                        fallback_payload = dict(payload)
-                        fallback_payload.pop("thinking", None)
-                        return self._invoke_anthropic_once(
-                            fallback_payload, cancel_event, usage_calls=usage_calls,
-                        )
-                    logger.debug("%s streaming unsupported, falling back to blocking call", self.__class__.__name__)
-        try:
-            return self._call_sdk_once(self.client.messages.create, payload, usage_calls)
-        except TypeError as exc:
-            if self._should_retry_without_thinking(exc, payload):
-                logger.warning("%s 客户端不支持 thinking 参数，自动降级", self.__class__.__name__)
-                self._thinking_supported = False
-                fallback_payload = dict(payload)
-                fallback_payload.pop("thinking", None)
-                return self._call_sdk_once(self.client.messages.create, fallback_payload, usage_calls)
-            raise
+        if stream or payload["max_tokens"] > self._ANTHROPIC_STREAM_TOKEN_THRESHOLD:
+            return await self._invoke_anthropic_streaming_once(payload, usage_calls)
+        return await self._call_sdk_once(self.client.messages.create, payload, usage_calls)
 
     def _build_anthropic_message(self, response: Any) -> Dict[str, Any]:
         blocks = _get_field(response, "content")

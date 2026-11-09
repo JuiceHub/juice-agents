@@ -3,6 +3,12 @@
 from .execution.context import RunnerContext
 from .execution.cancellation import StreamCancelled, raise_if_cancelled
 from .errors import RunnerBusyError
+from juice_agents.core.agent.contracts import (
+    RoundCancelledError,
+    RoundExecutionError,
+    RoundFailedError,
+    RoundResult,
+)
 from .config import (
     AgentBinding,
     Capability,
@@ -34,6 +40,10 @@ def __getattr__(name: str):
 
 
 __all__ = [
+    "RoundResult",
+    "RoundExecutionError",
+    "RoundFailedError",
+    "RoundCancelledError",
     "AsyncTaskState",
     "AsyncTaskType",
     "Attachment",

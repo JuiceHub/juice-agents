@@ -19,8 +19,8 @@ from ..types.definitions import RunnerState
 
 logger = logging.getLogger(__name__)
 
-RUNNER_SCHEMA_VERSION = 5
-_RUNNER_STATUSES = frozenset({"idle", "running", "waiting", "paused", "failed"})
+RUNNER_SCHEMA_VERSION = 6
+_RUNNER_STATUSES = frozenset({"idle", "running"})
 
 
 def _write_json(path: Path, payload: Any) -> Any:
@@ -95,7 +95,7 @@ def build_layout(
     resolved_root = (
         Path(root_dir).expanduser().resolve()
         if root_dir is not None
-        else resolved_base / ".juice" / "runners" / str(runner_id)
+        else resolved_base / ".juice" / "sessions" / str(runner_id)
     )
     return RunnerLayout(
         root_dir=resolved_root,
@@ -152,6 +152,8 @@ def blank_runner_state(
 def load_runner_state(path: str | Path) -> RunnerState:
     """Read only current-schema manifests; old state is never migrated."""
 
+    if not Path(path).is_file():
+        raise FileNotFoundError(f"runner manifest not found: {path}")
     payload = _read_json(Path(path), default={})
     if not isinstance(payload, dict):
         raise ValueError(f"runner manifest 非法: {path}")

@@ -1,27 +1,4 @@
-import type {
-  AskRequest,
-  ActiveAgentsReport,
-  BrowserPreview,
-  ClientCommand,
-  FileTreeNode,
-  InterruptAgentResponse,
-  RuntimeModelInfo,
-  ServerEvent,
-  SessionStatus,
-  SessionSummary,
-  SendAgentMessageResponse,
-  SkillsListResponse,
-  PluginsListResponse,
-  PluginViewResponse,
-  SkillsConfigStatusResponse,
-  AvailableAgentsResponse,
-  TeamManifest,
-  TeamsListResponse,
-  WorkspaceRuntimeConfig,
-  RunnerStreamEvent,
-  StreamMessageResult,
-} from "@juice-agents/shared/gateway/types";
-
+import type { AskRequest, ActiveAgentsReport, BrowserPreview, ClientCommand, FileTreeNode, InterruptAgentResponse, RuntimeModelInfo, ImageConfigResponse, ImageModelsResponse, ServerEvent, SessionStatus, SessionSummary, SendAgentMessageResponse, SkillsListResponse, PluginsListResponse, PluginViewResponse, SkillsConfigStatusResponse, AvailableAgentsResponse, TeamManifest, TeamsListResponse, WorkspaceRuntimeConfig, RunnerStreamEvent, StreamMessageResult, } from "@juice-agents/shared/gateway/types";
 export interface BootstrapPayload {
   base_dir: string;
   workspace_config: WorkspaceRuntimeConfig;
@@ -30,7 +7,6 @@ export interface BootstrapPayload {
   models: RuntimeModelInfo[];
   memory: Record<string, unknown>;
 }
-
 export interface FileReadPayload {
   path: string;
   content: string;
@@ -39,27 +15,23 @@ export interface FileReadPayload {
   image_url?: string;
   media_type?: string;
 }
-
 type ResultHandler = {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
 };
-
 export class WebGatewayClient {
   private socket: WebSocket | null = null;
   private requestId = 0;
   private pending = new Map<string, ResultHandler>();
   private streamHandlers = new Map<string, (event: RunnerStreamEvent) => void>();
   private askHandlers = new Map<string, (request: AskRequest) => void>();
+  private transportErrorHandler: ((error: Error) => void) | null = null;
   private ambientStreamHandler: ((event: RunnerStreamEvent) => void) | null = null;
   private ambientAskHandler: ((request: AskRequest) => void) | null = null;
-
-  constructor(private readonly httpBase = "http://127.0.0.1:8003") {}
-
+  constructor(private readonly httpBase = "http://127.0.0.1:8003") { }
   get wsBase(): string {
     return this.httpBase.replace(/^http/, "ws");
   }
-
   browserLiveSocketUrl(baseDir: string, runnerId = ""): string {
     const params = new URLSearchParams({ base_dir: baseDir });
     if (runnerId) {
@@ -67,7 +39,6 @@ export class WebGatewayClient {
     }
     return `${this.wsBase}/ws/browser/live?${params.toString()}`;
   }
-
   browserExternalSocketUrl(baseDir: string, runnerId = ""): string {
     const params = new URLSearchParams({ base_dir: baseDir, stream: "0" });
     if (runnerId) {
@@ -75,29 +46,26 @@ export class WebGatewayClient {
     }
     return `${this.wsBase}/ws/browser/live?${params.toString()}`;
   }
-
   async bootstrap(baseDir: string): Promise<BootstrapPayload> {
     return this.getJson(`/api/bootstrap?base_dir=${encodeURIComponent(baseDir)}`);
   }
-
   loadEffectiveConfig(baseDir: string): Promise<WorkspaceRuntimeConfig> {
     return this.getJson(`/api/effective-config?base_dir=${encodeURIComponent(baseDir)}`);
   }
-
-  saveWorkspaceConfig(baseDir: string, config: WorkspaceRuntimeConfig): Promise<{ saved: boolean }> {
+  saveWorkspaceConfig(baseDir: string, config: WorkspaceRuntimeConfig): Promise<{
+    saved: boolean;
+  }> {
     return this.putJson("/api/workspace-config", { base_dir: baseDir, config });
   }
-
-  async fileTree(baseDir: string): Promise<{ base_dir: string; tree: FileTreeNode }> {
+  async fileTree(baseDir: string): Promise<{
+    base_dir: string;
+    tree: FileTreeNode;
+  }> {
     return this.getJson(`/api/files/tree?base_dir=${encodeURIComponent(baseDir)}`);
   }
-
   async readFile(baseDir: string, path: string): Promise<FileReadPayload> {
-    return this.getJson(
-      `/api/files/read?base_dir=${encodeURIComponent(baseDir)}&path=${encodeURIComponent(path)}`
-    );
+    return this.getJson(`/api/files/read?base_dir=${encodeURIComponent(baseDir)}&path=${encodeURIComponent(path)}`);
   }
-
   async browserLivePreview(baseDir: string, runnerId = ""): Promise<BrowserPreview> {
     const params = new URLSearchParams({ base_dir: baseDir });
     if (runnerId) {
@@ -105,37 +73,37 @@ export class WebGatewayClient {
     }
     return this.getJson(`/api/browser/live/preview?${params.toString()}`);
   }
-
   async browserLiveOpenExternal(baseDir: string, runnerId = "", url = ""): Promise<BrowserPreview> {
     return this.postJson("/api/browser/live/open-external", { base_dir: baseDir, runner_id: runnerId, url });
   }
-
   async browserLiveNewTab(baseDir: string, runnerId: string, url = "", makeActive = true): Promise<BrowserPreview> {
     return this.postJson("/api/browser/live/new-tab", {
       base_dir: baseDir,
       runner_id: runnerId,
       url,
-      make_active: makeActive,
+      make_active: makeActive
     });
   }
-
   browserAssetUrl(path: string): string {
-    if (!path) return "";
-    if (/^https?:\/\//.test(path)) return path;
+    if (!path)
+      return "";
+    if (/^https?:\/\//.test(path))
+      return path;
     return `${this.httpBase}${path}`;
   }
-
   fileAssetUrl(path: string): string {
-    if (!path) return "";
-    if (/^https?:\/\//.test(path)) return path;
+    if (!path)
+      return "";
+    if (/^https?:\/\//.test(path))
+      return path;
     return `${this.httpBase}${path}`;
   }
-
   async connect(params?: {
     onStream: (event: ServerEvent) => void;
     onAsk: (request: AskRequest) => void;
   }): Promise<void> {
-    if (this.socket?.readyState === WebSocket.OPEN) return;
+    if (this.socket?.readyState === WebSocket.OPEN)
+      return;
     if (params) {
       this.setAmbientStreamHandler((event) => params.onStream({ id: "", type: "stream_step", payload: event }));
       this.setAmbientAskHandler(params.onAsk);
@@ -143,7 +111,8 @@ export class WebGatewayClient {
     this.socket = new WebSocket(`${this.wsBase}/ws`);
     this.socket.onmessage = (event) => this.handleMessage(event.data);
     await new Promise<void>((resolve, reject) => {
-      if (!this.socket) return reject(new Error("socket missing"));
+      if (!this.socket)
+        return reject(new Error("socket missing"));
       let settled = false;
       const fail = (error: Error) => {
         this.handleDisconnect(error);
@@ -164,24 +133,20 @@ export class WebGatewayClient {
       this.socket.onclose = () => fail(new Error("web gateway socket closed"));
     });
   }
+  setTransportErrorHandler(handler: ((error: Error) => void) | null): void {
+    this.transportErrorHandler = handler;
+  }
 
   setAmbientStreamHandler(handler: ((event: RunnerStreamEvent) => void) | null): void {
     this.ambientStreamHandler = handler;
   }
-
   setAmbientAskHandler(handler: ((request: AskRequest) => void) | null): void {
     this.ambientAskHandler = handler;
   }
-
   command<T = unknown>(type: ClientCommand["type"], payload: Record<string, unknown> = {}): Promise<T> {
     return this.sendCommand(type, payload);
   }
-
-  private sendCommand<T = unknown>(
-    type: ClientCommand["type"],
-    payload: Record<string, unknown>,
-    reservedId?: string,
-  ): Promise<T> {
+  private sendCommand<T = unknown>(type: ClientCommand["type"], payload: Record<string, unknown>, reservedId?: string): Promise<T> {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
       return Promise.reject(new Error("web gateway is not connected"));
     }
@@ -192,219 +157,228 @@ export class WebGatewayClient {
       this.socket?.send(JSON.stringify(command));
     });
   }
-
-  describeActiveAgents(): Promise<ActiveAgentsReport> {
-    return this.command<ActiveAgentsReport>("describe_agent_sessions", {});
+  describeActiveAgents(agentId?: string): Promise<ActiveAgentsReport> {
+    return this.command<ActiveAgentsReport>("describe_agent_sessions", agentId ? { agent_id: agentId } : {});
   }
-
-  sendAgentMessage(params: { agent_name: string; message: string }): Promise<SendAgentMessageResponse> {
+  sendAgentMessage(params: {
+    agent_name: string;
+    message: string;
+  }): Promise<SendAgentMessageResponse> {
     return this.command<SendAgentMessageResponse>("send_agent_message", params);
   }
-
-  interruptAgent(params: { agent_name: string; reason?: string }): Promise<InterruptAgentResponse> {
+  interruptAgent(params: {
+    agent_name: string;
+    reason?: string;
+  }): Promise<InterruptAgentResponse> {
     return this.command<InterruptAgentResponse>("interrupt_agent", {
       agent_name: params.agent_name,
-      reason: params.reason ?? "user_agent_interrupt",
+      reason: params.reason ?? "user_agent_interrupt"
     });
   }
-
+  activateSession(runnerId: string): Promise<{
+    activated: boolean;
+  }> {
+    return this.command("activate_session", { runner_id: runnerId });
+  }
   describeSession(): Promise<SessionStatus> {
     return this.command<SessionStatus>("describe_session", {});
   }
-
-  archiveRunner(baseDir: string, runnerId: string): Promise<{ archived: boolean; runner_id: string }> {
+  archiveRunner(baseDir: string, runnerId: string): Promise<{
+    archived: boolean;
+    runner_id: string;
+  }> {
     return this.command("archive_runner", { base_dir: baseDir, runner_id: runnerId });
   }
-
-  restoreRunner(baseDir: string, runnerId: string): Promise<{ restored: boolean; runner_id: string }> {
+  restoreRunner(baseDir: string, runnerId: string): Promise<{
+    restored: boolean;
+    runner_id: string;
+  }> {
     return this.command("restore_runner", { base_dir: baseDir, runner_id: runnerId });
   }
-
   listArchivedSessions(baseDir: string): Promise<SessionSummary[]> {
     return this.command<SessionSummary[]>("list_archived_sessions", { base_dir: baseDir });
   }
-
-  stopSession(): Promise<{ stopped: boolean }> {
+  stopSession(): Promise<{
+    stopped: boolean;
+  }> {
     return this.command("stop_session", {});
   }
-
   // 中断当前 stream_message; 后端在下一 step 边界协作退出，
   // 不影响 session 持久化、可立即继续后续对话。
-  cancelStream(): Promise<{ cancelled: boolean }> {
+  cancelStream(target?: {
+    runner_id: string;
+    round_id: string;
+  }): Promise<{
+    cancelled: boolean;
+  }> {
+    if (target)
+      return this.command("cancel_stream", target);
     const requestIds = [...this.streamHandlers.keys()];
     const requestId = requestIds.length > 0
       ? requestIds.reduce((latest, current) => Number(current) > Number(latest) ? current : latest)
       : "";
     return this.command("cancel_stream", requestId ? { request_id: requestId } : {});
   }
-
-  async streamMessage(
-    message: string,
-    onEvent: (event: RunnerStreamEvent) => void,
-    onAsk?: (request: AskRequest) => void,
-    agentModeOverride?: string,
-  ): Promise<StreamMessageResult> {
+  async streamMessage(message: string, onEvent: (event: RunnerStreamEvent) => void, onAsk?: (request: AskRequest) => void, agentModeOverride?: string): Promise<StreamMessageResult> {
     const id = String(++this.requestId);
     this.streamHandlers.set(id, onEvent);
-    if (onAsk) this.askHandlers.set(id, onAsk);
+    if (onAsk)
+      this.askHandlers.set(id, onAsk);
     try {
       return await this.sendCommand<StreamMessageResult>("stream_message", {
-        message,
         ...(agentModeOverride ? { agent_mode_override: agentModeOverride } : {}),
+        message
       }, id);
-    } finally {
+    }
+    finally {
       this.streamHandlers.delete(id);
       this.askHandlers.delete(id);
     }
   }
-
   listModels(baseDir: string): Promise<RuntimeModelInfo[]> {
     return this.command<RuntimeModelInfo[]>("list_models", { base_dir: baseDir });
   }
-
+  listImageModels(baseDir: string): Promise<ImageModelsResponse> {
+    return this.command<ImageModelsResponse>("list_image_models", { base_dir: baseDir });
+  }
   listSessions(baseDir: string): Promise<SessionSummary[]> {
     return this.command<SessionSummary[]>("list_sessions", { base_dir: baseDir });
   }
-
   permissionStatus(baseDir: string): Promise<Record<string, unknown>> {
     return this.command("permission_status", { base_dir: baseDir });
   }
-
   /** 切换审批策略；不重建 root agent。 */
   switchPermissionMode(permissionMode: string): Promise<SessionStatus> {
     return this.command<SessionStatus>("switch_permission_mode", {
-      permission_mode: permissionMode,
+      permission_mode: permissionMode
     });
   }
-
   /** 切换执行模式；同一 Runner 在空闲边界刷新 root 的有效配置。 */
   switchAgentMode(agentMode: string, agentType = "react"): Promise<SessionStatus> {
     return this.command<SessionStatus>("switch_agent_mode", {
       agent_mode: agentMode,
-      agent_type: agentType,
+      agent_type: agentType
     });
   }
-
-  listSkills(params: { category?: string } = {}): Promise<SkillsListResponse> {
+  listSkills(params: {
+    category?: string;
+  } = {}): Promise<SkillsListResponse> {
     return this.command<SkillsListResponse>("list_skills", params);
   }
-
   listPlugins(): Promise<PluginsListResponse> {
     return this.command<PluginsListResponse>("list_plugins", {});
   }
-
-  listAvailableAgents(params: { name?: string; mode_id?: string } = {}): Promise<AvailableAgentsResponse> {
+  listAvailableAgents(params: {
+    name?: string;
+    mode_id?: string;
+  } = {}): Promise<AvailableAgentsResponse> {
     return this.command<AvailableAgentsResponse>("list_available_agents", params);
   }
-
-  listTeams(params: { base_dir?: string } = {}): Promise<TeamsListResponse> {
+  listTeams(params: {
+    base_dir?: string;
+  } = {}): Promise<TeamsListResponse> {
     return this.command<TeamsListResponse>("list_team_configs", params);
   }
-
-  getTeam(params: { team_name: string; base_dir?: string }): Promise<TeamManifest> {
+  getTeam(params: {
+    team_name: string;
+    base_dir?: string;
+  }): Promise<TeamManifest> {
     return this.command<TeamManifest>("get_team_config", params);
   }
-
   viewSkill(name: string, filePath = ""): Promise<Record<string, unknown>> {
     return this.command("view_skill", {
-      name,
       ...(filePath ? { file_path: filePath } : {}),
+      name
     });
   }
-
   viewPlugin(name: string, filePath = ""): Promise<PluginViewResponse> {
     return this.command<PluginViewResponse>("view_plugin", {
-      name,
       ...(filePath ? { file_path: filePath } : {}),
+      name
     });
   }
-
   skillsConfigStatus(): Promise<SkillsConfigStatusResponse> {
     return this.command<SkillsConfigStatusResponse>("skills_config_status", {});
   }
-
-  setSkillsConfig(params: { enabled?: boolean; disabled: string[] }): Promise<SkillsConfigStatusResponse> {
+  setSkillsConfig(params: {
+    enabled?: boolean;
+    disabled: string[];
+  }): Promise<SkillsConfigStatusResponse> {
     return this.command<SkillsConfigStatusResponse>("set_skills_config", params);
   }
-
-  workflowsConfigStatus(baseDir: string): Promise<{ success: boolean; enabled: boolean }> {
+  workflowsConfigStatus(baseDir: string): Promise<{
+    success: boolean;
+    enabled: boolean;
+  }> {
     return this.command("workflows_config_status", { base_dir: baseDir });
   }
-
-  selfEvolutionConfigStatus(baseDir: string): Promise<{ success: boolean; enabled: boolean }> {
+  selfEvolutionConfigStatus(baseDir: string): Promise<{
+    success: boolean;
+    enabled: boolean;
+  }> {
     return this.command("self_evolution_config_status", { base_dir: baseDir });
   }
-
-  setImageConfig(params: { enabled: boolean }): Promise<Record<string, unknown>> {
-    return this.command("set_image_config", params);
+  setImageConfig(params: {
+    base_dir?: string;
+    enabled?: boolean;
+    model_name?: string;
+  }): Promise<ImageConfigResponse> {
+    return this.command<ImageConfigResponse>("set_image_config", params);
   }
-
   memoryStatus(): Promise<Record<string, unknown>> {
     return this.command("memory_status", {});
   }
-
   memorySearch(query: string, limit = 20): Promise<Record<string, unknown>> {
     return this.command("memory_search", { query, limit });
   }
-
   memoryView(path = ""): Promise<Record<string, unknown>> {
     return this.command("memory_view", path ? { path } : {});
   }
-
   runDream(): Promise<Record<string, unknown>> {
     return this.command("run_dream", {});
   }
-
   setGoal(objective: string): Promise<Record<string, unknown>> {
     return this.command("set_goal", { objective });
   }
-
   getGoal(): Promise<Record<string, unknown>> {
     return this.command("get_goal", {});
   }
-
   pauseGoal(): Promise<Record<string, unknown>> {
     return this.command("pause_goal", {});
   }
-
   resumeGoal(): Promise<Record<string, unknown>> {
     return this.command("resume_goal", {});
   }
-
   clearGoal(): Promise<Record<string, unknown>> {
     return this.command("clear_goal", {});
   }
-
   createCronTask(baseDir: string, cron: string, prompt: string, recurring = true): Promise<Record<string, unknown>> {
     return this.command("create_cron_task", { base_dir: baseDir, cron, prompt, recurring });
   }
-
   listCronTasks(baseDir: string): Promise<Record<string, unknown>> {
     return this.command("list_cron_tasks", { base_dir: baseDir });
   }
-
   deleteCronTask(baseDir: string, id: string): Promise<Record<string, unknown>> {
     return this.command("delete_cron_task", { base_dir: baseDir, id });
   }
-
   cronStatus(baseDir: string): Promise<Record<string, unknown>> {
     return this.command("cron_status", { base_dir: baseDir });
   }
-
   close(): void {
     this.socket?.close();
     this.handleDisconnect(new Error("web gateway client closed"));
     this.socket = null;
   }
-
   private handleMessage(raw: string): void {
     const event = JSON.parse(raw) as ServerEvent;
     if (event.type === "ask_request") {
       if (!event.id) {
         this.ambientAskHandler?.(event.payload);
-      } else {
+      }
+      else {
         const handler = this.askHandlers.get(event.id);
-        if (handler) handler(event.payload);
+        if (handler)
+          handler(event.payload);
         else if (typeof window !== "undefined") {
           console.debug("Dropped late web ask_request", { requestId: event.id });
         }
@@ -414,9 +388,11 @@ export class WebGatewayClient {
     if (event.type === "stream_step") {
       if (!event.id) {
         this.ambientStreamHandler?.(event.payload);
-      } else {
+      }
+      else {
         const handler = this.streamHandlers.get(event.id);
-        if (handler) handler(event.payload);
+        if (handler)
+          handler(event.payload);
         else if (typeof window !== "undefined") {
           console.debug("Dropped late web stream_step", { requestId: event.id });
         }
@@ -424,20 +400,22 @@ export class WebGatewayClient {
       return;
     }
     const pending = this.pending.get(event.id);
-    if (!pending) return;
+    if (!pending)
+      return;
     this.pending.delete(event.id);
     if (event.type === "error") {
       pending.reject(new Error(event.error.message));
-    } else {
+    }
+    else {
       pending.resolve(event.payload);
     }
   }
-
   private handleDisconnect(error: Error): void {
+    this.transportErrorHandler?.(error);
     if (this.pending.size > 0 && typeof window !== "undefined") {
       console.warn("Web gateway transport disconnected", {
         error: error.message,
-        pending: this.pending.size,
+        pending: this.pending.size
       });
     }
     for (const pending of this.pending.values()) {
@@ -447,7 +425,6 @@ export class WebGatewayClient {
     this.streamHandlers.clear();
     this.askHandlers.clear();
   }
-
   private async getJson<T>(path: string): Promise<T> {
     const response = await fetch(`${this.httpBase}${path}`);
     if (!response.ok) {
@@ -455,39 +432,42 @@ export class WebGatewayClient {
     }
     return response.json() as Promise<T>;
   }
-
   private async postJson<T>(path: string, payload: Record<string, unknown>): Promise<T> {
     const response = await fetch(`${this.httpBase}${path}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(payload)
     });
     if (!response.ok) {
       throw new Error(await this.errorMessage(response));
     }
     return response.json() as Promise<T>;
   }
-
   private async putJson<T>(path: string, payload: Record<string, unknown>): Promise<T> {
     const response = await fetch(`${this.httpBase}${path}`, {
       method: "PUT",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(payload)
     });
     if (!response.ok) {
       throw new Error(await this.errorMessage(response));
     }
     return response.json() as Promise<T>;
   }
-
   private async errorMessage(response: Response): Promise<string> {
     try {
-      const payload = (await response.json()) as { detail?: unknown; error?: { message?: unknown } };
+      const payload = (await response.json()) as {
+        detail?: unknown;
+        error?: {
+          message?: unknown;
+        };
+      };
       const detail = payload.detail ?? payload.error?.message;
       if (detail) {
         return String(detail);
       }
-    } catch {
+    }
+    catch {
       // Some gateway errors are plain text or empty. Fall back to HTTP status.
     }
     return `${response.status} ${response.statusText}`;

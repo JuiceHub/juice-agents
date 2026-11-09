@@ -26,6 +26,10 @@
 
 `MEMORY.md` is an index; topic files store concrete facts. `memory_search` searches only `topics/*.md` by default so index lines do not duplicate search results.
 
+Dream eligibility counts managed Agent snapshots changed since the last dream
+under `.juice/sessions/*/agents/*/session.json`, excluding the active Runner.
+Historical `.juice/runners/` snapshots do not contribute to the count.
+
 ## Configuration
 
 Defaults come from the SDK's `core/config/defaults.yaml`; workspace overrides are stored in `.juice/config.yaml`. Configuration commands modify only the workspace override file.

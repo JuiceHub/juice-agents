@@ -30,7 +30,10 @@ except Exception:  # pragma: no cover - 运行时缺依赖时给出清晰错误
 DEFAULT_RUNTIME_CONFIG_PATH = Path(
     str(files("juice_agents.core.config").joinpath("defaults.yaml"))
 ).resolve()
-DEFAULT_DOTENV_PATH = Path.cwd().resolve() / ".env"
+# Keep the public default relative: importing the SDK must neither require a
+# valid cwd nor capture one project's directory for later workspace changes.
+# credential_paths() and ConfigurationContext resolve workspace paths at use time.
+DEFAULT_DOTENV_PATH = Path(".env")
 WORKSPACE_CONFIG_RELATIVE_PATH = Path(".juice") / "config.yaml"
 
 

@@ -114,8 +114,36 @@ def test_inner_agent_empty_actions_continue_instead_of_leaking_protocol_text(tmp
     assert called["result"] == {"answer": "42"}
 
 
+def test_failed_inner_agent_has_no_public_events_or_saved_session_body(tmp_path: Path, scripted) -> None:
+    from juice_agents.core.agent.contracts import RoundFailedError
+
+    scripted([])
+    _write_workflow(
+        tmp_path, "failed_inner",
+        "def run(ctx, args):\n    return ctx.agent('private input', instructions='Work.', tools=[])\n",
+        metadata={"read_only": True, "tools": []},
+    )
+    runner = _runner(tmp_path)
+    events = []
+    runner.subscribe(events.append)
+    try:
+        with pytest.raises(RoundFailedError) as caught:
+            runner.workflow_manager.call("failed_inner", {}, owner_agent_name="root", owner_agent_id="root")
+        assert caught.value.result.status == "failed"
+        assert all(event["kind"] == "workflow_progress" for event in events)
+        assert {event["agent_id"] for event in events} == {"root"}
+        calls = {event["data"]["workflow_call_id"] for event in events}
+        assert len(calls) == 1 and next(iter(calls))
+        assert events[-1]["data"]["event"] == "workflow_failed"
+        assert not [managed for managed in runner.agent_manager.live_agents.values() if managed.role == "workflow"]
+        for path in runner.layout.agents_dir.rglob("*.json"):
+            assert "private input" not in path.read_text(encoding="utf-8")
+    finally:
+        runner.close()
+
+
 def test_caller_cancel_interrupts_inner_agent_at_step_boundary(tmp_path: Path, scripted) -> None:
-    from juice_agents.core.agent import AgentExecutionInterrupted
+    from juice_agents.core.workflow.types import WorkflowCancelledError
 
     cancel = threading.Event()
     calls: list[int] = []
@@ -137,7 +165,8 @@ def test_caller_cancel_interrupts_inner_agent_at_step_boundary(tmp_path: Path, s
         metadata={"read_only": True, "tools": []},
     )
     runner = _runner(tmp_path)
-    with pytest.raises(AgentExecutionInterrupted):
+    # Workflow 调用方观察统一的取消类型，不依赖子 Agent 或监视器谁先响应。
+    with pytest.raises(WorkflowCancelledError):
         runner.workflow_manager.call("slow", {}, owner_agent_name="root", cancel_event=cancel)
     assert len(calls) == 1  # 在第一个 step 边界就停下
 

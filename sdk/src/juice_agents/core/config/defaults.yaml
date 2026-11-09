@@ -1,27 +1,36 @@
 # SDK 只读默认配置。项目设置请写入 <workspace>/.juice/config.yaml。
-models:
-  doubao_lite:
+providers:
+  ark:
     backend: doubao
     api_base: https://ark.cn-beijing.volces.com/api/v3
     api_key_env: DOUBAO_API_KEY
-    provider_model_name: doubao-seed-2-0-lite-260215
+  openai:
+    backend: openai
+    api_base: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+  anthropic:
+    backend: anthropic
+    api_base: https://api.anthropic.com
+    api_base_env: ANTHROPIC_BASE_URL
+    api_key_env: ANTHROPIC_AUTH_TOKEN
+
+models:
+  doubao_lite:
+    provider: ark
+    provider_model_name: doubao-seed-2-1-lite-260915
     supported_efforts: [disabled, low, medium, high, auto]
     thinking_mode: none
     supports_budget_tokens: false
 
   doubao_pro:
-    backend: doubao
-    api_base: https://ark.cn-beijing.volces.com/api/v3
-    api_key_env: DOUBAO_API_KEY
+    provider: ark
     provider_model_name: doubao-seed-2-0-pro-260215
     supported_efforts: [disabled, low, medium, high, auto]
     thinking_mode: none
     supports_budget_tokens: false
 
   gpt4o_mini:
-    backend: openai
-    api_base: https://api.openai.com/v1
-    api_key_env: OPENAI_API_KEY
+    provider: openai
     provider_model_name: gpt-4o-mini
     supported_efforts: [disabled, low, medium, high, auto]
     thinking_mode: none
@@ -30,34 +39,30 @@ models:
   # 5.5 系列不能关闭 thinking：effort=disabled 时框架不发送 thinking/output_config，
   # 由模型按默认 adaptive 运行（Opus 5.5 默认 effort=medium，Sonnet 5.5 默认 high）。
   claude-opus-5-5:
-    backend: anthropic
-    api_base: https://api.anthropic.com
-    api_base_env: ANTHROPIC_BASE_URL
-    api_key_env: ANTHROPIC_AUTH_TOKEN
+    provider: anthropic
     provider_model_name: claude-opus-5-5
     supported_efforts: [disabled, low, medium, high, xhigh, max]
     thinking_mode: adaptive
     supports_budget_tokens: false
 
   claude-sonnet-5-5:
-    backend: anthropic
-    api_base: https://api.anthropic.com
-    api_base_env: ANTHROPIC_BASE_URL
-    api_key_env: ANTHROPIC_AUTH_TOKEN
+    provider: anthropic
     provider_model_name: claude-sonnet-5-5
     supported_efforts: [disabled, low, medium, high, xhigh, max]
     thinking_mode: adaptive
     supports_budget_tokens: false
 
   claude-haiku-4-5-20251001:
-    backend: anthropic
-    api_base: https://api.anthropic.com
-    api_base_env: ANTHROPIC_BASE_URL
-    api_key_env: ANTHROPIC_AUTH_TOKEN
+    provider: anthropic
     provider_model_name: claude-haiku-4-5-20251001
     supported_efforts: [disabled]
     thinking_mode: manual
     supports_budget_tokens: true
+
+image_models:
+  seedream_4:
+    provider: ark
+    provider_model_name: doubao-seedream-4-0-250828
 
 tools:
   tavily:
@@ -72,6 +77,7 @@ tools:
 browser:
   enabled: true
   backend: in_app
+  executable_path: null  # 留空时由 Playwright 选择其默认 Chromium。
   permissions:
     default_policy: ask_for_sensitive
     allow_hosts:
@@ -91,6 +97,7 @@ browser:
 
 image:
   enabled: false
+  model_name: seedream_4
 
 memory:
   enabled: true

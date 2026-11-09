@@ -28,18 +28,28 @@ from .model_catalog import (
     load_runtime_model_config,
     resolve_runtime_model,
 )
+from .image_model_catalog import (
+    DEFAULT_RUNTIME_IMAGE_MODEL_NAME,
+    RuntimeImageModelConfig,
+    list_runtime_image_models,
+    load_runtime_image_model_config,
+)
 
 __all__ = [
     "ConfigurationContext",
     "DEFAULT_DOTENV_PATH",
     "DEFAULT_RUNTIME_MODEL_NAME",
+    "DEFAULT_RUNTIME_IMAGE_MODEL_NAME",
     "DEFAULT_RUNTIME_CONFIG_PATH",
     "WORKSPACE_CONFIG_RELATIVE_PATH",
     "RuntimeModelConfig",
+    "RuntimeImageModelConfig",
     "get_runtime_mapping",
     "credential_paths",
     "list_runtime_models",
+    "list_runtime_image_models",
     "load_runtime_model_config",
+    "load_runtime_image_model_config",
     "normalize_runtime_key",
     "read_runtime_config",
     "read_credential_values",

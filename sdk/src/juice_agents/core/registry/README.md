@@ -40,6 +40,12 @@ tools = ToolRegistry(config_context=context)
 read = tools.instantiate("read")  # relative paths refer to the project
 ```
 
+`generate_edit_image` resolves `image.model_name → image_models → providers`
+through the same context, including workspace overrides and credential priority.
+Its model, endpoint and key never come from `model_config_name` (the chat choice).
+Injected image SDK clients remain caller-owned. Catalog validation and tool
+construction must never fall back to chat credentials after an image config error.
+
 `SkillRegistry(workspace_dir=...)` uses that directory for both local and
 project external Skills. A custom `local_dir` changes writable storage only;
 it never infers a project from arbitrary parent directories.
@@ -93,4 +99,8 @@ Built-in Workflow scripts follow the same first-edit override rule. Unknown name
 and invalid source fail before writing. Skills retain their copy-on-first-edit
 flow, Plugins remain read-only, and Python built-in Tool names cannot be overridden.
 The seed APIs and `fallback_configs` argument have been removed; consumers query
-the Registry directly.
+the Registry directly. Create and restore sessions with `from juice_agents import Runner`
+and `Runner.create(...)` / `Runner.resume(...)`; resource queries use
+`AgentRegistry.list_configs()` or `list_available_agents(...)` directly.
+
+Workflow declarations accept both `def run(ctx, args)` and `async def run(ctx, args)`; validation and source-hash binding apply equally to both.

@@ -7,11 +7,12 @@ Managers.  No mode is allowed to inject an execution callback into this class.
 
 from __future__ import annotations
 
-import json
+import asyncio
 import logging
 from collections import deque
+from contextlib import aclosing, contextmanager
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 import threading
 import time
@@ -19,20 +20,25 @@ from typing import Any, Callable, Iterator
 from uuid import uuid4
 import weakref
 
-from juice_agents.core.agent import AgentExecutionInterrupted, AgentManager, AgentManagerCallbacks, AgentStatus, ManagedAgent
-from juice_agents.core.agent.attachments import RuntimeAttachment, merge_runtime_attachments
+from juice_agents.core.managers import AgentManager, AgentManagerCallbacks, AgentStatus, ManagedAgent
+from juice_agents.core.agent.contracts import RoundResult
+from juice_agents.core.managers.agents import JsonAgentSnapshotStore
+from juice_agents.core.agent.attachments import (
+    RuntimeAttachment, build_async_task_notification_attachment,
+)
 from juice_agents.core.agent.root_config import build_root_config
 from juice_agents.core.agent.tools.runtime import ToolExecutionContext
 from juice_agents.core.config.context import ConfigurationContext
 from juice_agents.core.config.model_catalog import DEFAULT_RUNTIME_CONFIG_PATH, normalize_runtime_model_effort
-from juice_agents.core.managers import AsyncTaskManager, ToolManager, WorkflowRunManager
+from juice_agents.core.managers import AsyncTaskManager, ModelManager, ToolManager, WorkflowRunManager
+from .execution.async_bridge import run_async, on_runtime, iter_sync, iter_async
+from .execution.async_io import blocking
 from juice_agents.core.registry import AgentRegistry, WorkflowRegistry
 from juice_agents.core.registry.agents.types import AgentConfig, normalize_agent_type
 
 from .config import AgentBinding, Capability, RunnerConfig, mode_registry
 from .errors import RunnerBusyError
 from .execution.context import RunnerContext
-from .execution.event_queue import RunnerEventQueue
 from .persistence.store import blank_runner_state, build_layout, load_runner_state, write_runner_state
 from .status import settle_status
 from .types.definitions import PermissionMode, RunnerState, normalize_permission_mode
@@ -91,6 +97,26 @@ class _WorkflowAgentDispatcher:
             }
         )
 
+    async def ainvoke_agent(self, spec: dict[str, Any]) -> dict[str, Any]:
+        return await self._runner().ainvoke_agent({**spec, "execution": "sync",
+            "lifecycle": "functional", "agent_role": "workflow", "ephemeral": True,
+            "permission_mode": "accept"})
+
+
+class _AgentInboxEventSink:
+    """Async producer bridge; accepting an event means its inbox write succeeded."""
+
+    def __init__(self, runner: "Runner") -> None:
+        self._runner_ref = weakref.ref(runner)
+
+    def enqueue(self, recipient_agent_id: str, event: dict[str, Any]) -> dict[str, Any]:
+        runner = self._runner_ref()
+        if runner is None:
+            raise RuntimeError("notification target Runner has been released")
+        runner._ensure_delivery_target(recipient_agent_id)
+        runner.agent_manager.post(recipient_agent_id, build_async_task_notification_attachment(event))
+        return dict(event)
+
 
 class _RunnerStream:
     """Close an unstarted request as reliably as an exhausted generator."""
@@ -124,6 +150,20 @@ class _RunnerStream:
                 close()
         else:
             self._on_unstarted_close()
+
+
+@dataclass
+class _RoundObserver:
+    """一个请求的观察订阅；关闭它只解绑，不撤销已持久化的输入。"""
+
+    events: asyncio.Queue
+    round_id: str
+    message_id: str
+    agent_id: str
+    cleanup: Callable[[], None]
+    managed: ManagedAgent | None = None
+    cancel_check: Callable[[], bool] | None = None
+    task: asyncio.Task | None = None
 
 
 class Runner:
@@ -173,25 +213,29 @@ class Runner:
             "root_agent_id": str(state.get("root_agent_id") or "root"),
         })
         self.runtime_workspace = RuntimeWorkspace(workspace_dir=self.base_dir)
-        self._request_lock = threading.Lock()
+        self._request_lock = threading.RLock()
+        self._active_requests = 0
+        self._functional_root_gate = None
+        self._functional_calls: set[asyncio.Task] = set()
+        self._state_lock = threading.RLock()
+        self._activated = False
+        self._closed = False
         self._cancel_event = threading.Event()
         self._stop_reason: str | None = None
         self._listeners: list[Callable[[dict[str, Any]], None]] = []
         self._listeners_lock = threading.RLock()
         self._team_updates: deque[dict[str, Any]] = deque(maxlen=256)
         self._ask_handler: AskHandler | None = None
-        self._pending_attachments: dict[str, list[RuntimeAttachment]] = {}
-        self._team_dispatch_lock = threading.RLock()
-        self._team_dispatching = False
-        self._team_stopping = False
+        # Process-local strategy configuration survives fresh Agent objects;
+        # scorer instances must never enter the durable session JSON.
+        self._reconfigured_agent_strategies: dict[str, Any] = {}
 
-        self.event_queue = RunnerEventQueue()
         self.tool_manager = ToolManager(
             state_dir=self.layout.tools_dir,
             policy_check=self._check_tool_policy,
         )
         self.async_task_manager = AsyncTaskManager(
-            event_sink=self.event_queue,
+            event_sink=_AgentInboxEventSink(self),
             state_dir=self.layout.async_tasks_dir,
             scope_id=self.runner_id,
             scope_kind="runner",
@@ -215,9 +259,12 @@ class Runner:
             plan_file=self.layout.plans_dir / "root.md",
             managed_agent_names=self._discover_available_agent_names(),
             declaration=self._root_declaration,
+            runtime_config=self.config_context.read_merged_config(),
         )
+        self.model_manager = ModelManager(usage_path=self.layout.agents_dir / "model_usage.jsonl")
         self.agent_manager = AgentManager(
             registry=self.agent_registry,
+            model_manager=self.model_manager,
             runner_id=self.runner_id,
             layout=self.layout,
             runtime_config_path=self.runtime_config_path,
@@ -227,8 +274,9 @@ class Runner:
                 bind_runtime=self._bind_managed_agent,
                 attachments_provider=self._attachments_for,
                 after_step=self._after_agent_step,
-                after_persist=self._after_agent_persist,
                 after_release=self._after_agent_release,
+                on_event=self._on_agent_event,
+                acknowledge=self._acknowledge_attachments,
             ),
         )
         self.workflow_manager = self._create_workflow_manager()
@@ -257,23 +305,42 @@ class Runner:
 
         run_id = str(self.state.get("team_run_id") or uuid4().hex)
         self.state["team_run_id"] = run_id
-        return TeamManager(
+        manager = TeamManager(
             self.layout.root_dir / "team" / self.team_name / run_id,
             member_names=tuple(sorted(self._team_member_names or ())),
             team_name=self.team_name,
+            team_run_id=run_id,
             on_change=self._on_team_change,
         )
+        from functools import partial
+        from juice_agents.core.registry.teams import TeamRegistry
+
+        root_ref = weakref.WeakMethod(self._root)
+
+        def resolve_root():
+            resolve = root_ref()
+            if resolve is None:
+                raise RuntimeError("Team root host has been released")
+            return resolve()
+
+        manager.bind_runtime(
+            agents=self.agent_manager, root_resolver=resolve_root,
+            member_config_loader=partial(TeamRegistry(config_context=self.config_context).load_member_config, self.team_name),
+            auto_dispatch=self.config.team.auto_dispatch,
+        )
+        return manager
 
     def _on_team_change(self, change: dict[str, Any]) -> None:
         event = {
             "kind": "team_update", "runner_id": self.runner_id,
-            "mode_id": self.mode_id, "team_name": self.team_name,
-            **change,
+            "agent_id": self.root_agent_id, "agent_name": self.root_agent_name,
+            "agent_role": "root", "round_id": self.active_round_id, "step_num": None,
+            "event_id": f"event_{uuid4().hex}", "timestamp": time.time(),
+            "data": {"team_name": self.team_name, **change},
         }
         with self._listeners_lock:
             self._team_updates.append(event)
         self._publish(event)
-        self.wake_team()
 
     def _drain_team_updates(self) -> list[dict[str, Any]]:
         with self._listeners_lock:
@@ -282,242 +349,26 @@ class Runner:
         return updates
 
     def _active_team_calls(self) -> bool:
-        if self.team_manager is None:
-            return False
-        if any(
-            member.get("busy")
-            for member in self.team_manager.snapshot()["members"]
-            if member.get("name") != "root"
-        ):
-            return True
-        return any(
-            task.get("type") == "teammate"
-            for task in self.async_task_manager.list_tasks(statuses={"pending", "running"})
-        )
+        return self.team_manager is not None and self.team_manager.has_active_calls()
 
     def wake_team(self) -> None:
-        """Schedule one bounded round per ready member; idle members use no worker."""
-
-        manager = self.team_manager
-        if manager is None or not self.config.team or not self.config.team.auto_dispatch:
-            return
-        with self._team_dispatch_lock:
-            if self._team_dispatching or self._team_stopping:
-                return
-            self._team_dispatching = True
-            try:
-                for member in manager.snapshot()["members"]:
-                    name = str(member.get("name") or "")
-                    if name == "root" or member.get("status") == "closed" or member.get("busy"):
-                        continue
-                    task = manager.claim_next(name)
-                    messages = manager.pending_messages(name)
-                    if task is None and not messages:
-                        continue
-                    manager.set_member_busy(name, True)
-                    task_id = "" if task is None else str(task.get("task_id") or "")
-                    try:
-                        self.async_task_manager.launch(
-                            task_type="teammate",
-                            owner_agent_id=self.root_agent_id,
-                            owner_agent_name=self.root_agent_name,
-                            description=f"team:{name}:{task_id or 'inbox'}",
-                            runner=lambda _task, _path, n=name, t=task: self._run_team_member(n, t),
-                            summary_builder=lambda _result, n=name: f"team member {n} round completed",
-                            metadata={"member_name": name, "team_task_id": task_id},
-                        )
-                    except Exception:
-                        manager.set_member_busy(name, False)
-                        if task_id:
-                            manager.fail_task(task_id, name, error="dispatch_failed")
-                        raise
-            finally:
-                self._team_dispatching = False
-
-    def _run_team_member(self, member_name: str, task: dict[str, Any] | None) -> Any:
-        """Run one member turn with a persistent transcript and durable inbox."""
-
-        manager = self.team_manager
-        assert manager is not None
-        task_id = "" if task is None else str(task.get("task_id") or "")
-        if self._team_stopping or self._cancel_event.is_set():
-            # A queued pool job can begin after stop marked its async record
-            # killed. Never start a fresh Agent turn from that stale callback.
-            if task_id:
-                manager.fail_task(task_id, member_name, error="stopped_before_start")
-            manager.set_member_busy(member_name, False)
-            return None
-        member = next(item for item in manager.snapshot()["members"] if item["name"] == member_name)
-        from juice_agents.core.registry.teams import TeamRegistry
-        from juice_agents.core.registry.tools.types import ToolRef
-        from juice_agents.core.team.builtin.configs import DEFAULT_TEAMMATE_INSTRUCTIONS
-
-        declaration = TeamRegistry(config_context=self.config_context).load_member_config(self.team_name, member_name)
-        # A shared or private Agent need not duplicate Team workflow tools in
-        # its YAML. Build a detached runtime config and remove root-only Team
-        # references that older shared declarations may still contain.
-        root_only = {
-            "team_task_create", "team_task_update", "team_create", "team_use",
-            "team_member_create", "team_member_restart", "team_member_close", "team_finish",
-        }
-        required = (
-            "team_task_list", "team_task_claim", "team_task_complete",
-            "send_message", "team_member_stop_request",
-        )
-        refs = {ref.name: ref for ref in declaration.tools if ref.name not in root_only}
-        for name in required:
-            refs.setdefault(name, ToolRef(name=name))
-        role_instructions = (declaration.instructions or "").strip()
-        workflow = DEFAULT_TEAMMATE_INSTRUCTIONS
-        if workflow not in role_instructions:
-            role_instructions = f"{workflow}\n\n{role_instructions}".strip()
-        custom_prompt = declaration.system_prompt
-        if custom_prompt:
-            # A custom system_prompt can replace the normal Agent template
-            # entirely, so append the fixed Team workflow explicitly there.
-            custom_prompt = f"{custom_prompt.rstrip()}\n\n{role_instructions}"
-        declaration = declaration.copy_with(
-            tools=[ref.to_dict() for ref in refs.values()],
-            instructions=role_instructions,
-            system_prompt=custom_prompt,
-        )
-        generation = int(member.get("generation") or 0)
-        # AgentManager accepts a detached AgentConfig directly. This keeps
-        # Team-local YAML outside the shared Agent registry while the runtime
-        # identity remains the Team member alias supplied below.
-        binding = declaration
-        managed = self.agent_manager.acquire(
-            binding, agent_name=member_name, role="teammate", lifecycle="persistent",
-            agent_id=f"team--{self.state['team_run_id']}--{member_name}--{generation}",
-            metadata={"team_member": member_name, "team_run_id": self.state["team_run_id"], "generation": generation},
-        )
-        if self._team_stopping or self._cancel_event.is_set():
-            self.agent_manager.release(managed)
-            if task_id:
-                manager.fail_task(task_id, member_name, error="stopped_before_start")
-            manager.set_member_busy(member_name, False)
-            return None
-        prompt = (
-            f"{task_id}: {task.get('title', '')}\n{task.get('description', '')}"
-            if task is not None else f"{len(manager.pending_messages(member_name))} new messages"
-        )
-        try:
-            result = self.agent_manager.run(
-                managed, prompt,
-                attachments=self._team_initial_attachments(member_name),
-            )
-            if task_id:
-                current = next((item for item in manager.list_tasks() if item["task_id"] == task_id), None)
-                if current is not None and current.get("status") == "in_progress":
-                    last_step = managed.context.steps[-1] if managed.context.steps else None
-                    if getattr(last_step, "round_outcome", None) == "submitted" and not getattr(last_step, "error", None):
-                        manager.complete_task(task_id, member_name, result=str(result or ""))
-                    else:
-                        manager.fail_task(task_id, member_name, error="member_did_not_submit")
-            return result
-        except AgentExecutionInterrupted:
-            if task_id:
-                manager.fail_task(task_id, member_name, error="interrupted")
-            raise
-        except Exception:
-            if task_id:
-                manager.fail_task(task_id, member_name, error="failed")
-            logger.exception("team_member_round_failed runner_id=%s member=%s", self.runner_id, member_name)
-            raise
-        finally:
-            manager.set_member_busy(member_name, False)
-
-    def _team_initial_attachments(self, member_name: str) -> list[RuntimeAttachment]:
-        manager = self.team_manager
-        if manager is None:
-            return []
-        return merge_runtime_attachments(inbox_messages=manager.pending_messages(member_name))
-
-    def _settle_team_member_call(self, name: str) -> None:
-        """Wait for the old call before changing a member's session identity."""
-
-        for task in self.async_task_manager.list_tasks(statuses={"pending", "running"}):
-            if task.get("type") == "teammate" and dict(task.get("metadata") or {}).get("member_name") == name:
-                self.async_task_manager.cancel(str(task["async_task_id"]), reason="team_member_lifecycle_change")
-        try:
-            managed = self.agent_manager.get_by_name(name)
-        except KeyError:
-            managed = None
-        if managed is not None:
-            if managed.status is AgentStatus.RUNNING:
-                self.agent_manager.interrupt(managed, reason="team_member_lifecycle_change")
-                with managed._run_lock:
-                    pass
-            self.agent_manager.release(managed)
-        if self.team_manager is not None and self._team_stopping:
-            # A pool future cancelled before start has no worker finally block.
-            # Clear its durable busy/claim state here so stop and restart do
-            # not wait forever for a callback that can never execute.
-            claimed = [
-                task for task in self.team_manager.list_tasks()
-                if task.get("status") == "in_progress" and task.get("claimed_by") == name
-            ]
-            for task in claimed:
-                self.team_manager.fail_task(str(task["task_id"]), name, error="member_stopped")
-            self.team_manager.set_member_busy(name, False)
-        # The worker clears TeamManager.busy in its own finally block, after
-        # AgentManager.run has released the per-agent run lock.
-        deadline = time.monotonic() + 30.0
-        while self.team_manager is not None:
-            member = next((item for item in self.team_manager.snapshot()["members"] if item["name"] == name), None)
-            if member is None or not member.get("busy"):
-                return
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"Team member {name} did not stop")
-            time.sleep(0.01)
+        if self.team_manager is not None:
+            self.team_manager.wake()
 
     def restart_team_member(self, name: str) -> dict[str, Any]:
-        manager = self.team_manager
-        if manager is None:
+        if self.team_manager is None:
             raise PermissionError("Team mode is not active")
-        with self._team_dispatch_lock:
-            self._team_stopping = True
-        try:
-            self._settle_team_member_call(name)
-            result = manager.restart_member(name)
-        finally:
-            self._team_stopping = False
-        self.wake_team()
-        return result
+        return self.team_manager.restart_runtime_member(name)
 
     def close_team_member(self, name: str) -> dict[str, Any]:
-        manager = self.team_manager
-        if manager is None:
+        if self.team_manager is None:
             raise PermissionError("Team mode is not active")
-        with self._team_dispatch_lock:
-            self._team_stopping = True
-        try:
-            self._settle_team_member_call(name)
-            result = manager.close_member(name)
-        finally:
-            self._team_stopping = False
-        self.wake_team()
-        return result
+        return self.team_manager.close_runtime_member(name)
 
     def finish_team(self) -> dict[str, Any]:
-        manager = self.team_manager
-        if manager is None:
+        if self.team_manager is None:
             raise PermissionError("Team mode is not active")
-        active = [
-            task for task in self.async_task_manager.list_tasks(statuses={"pending", "running"})
-            if task.get("type") == "teammate"
-        ]
-        if active:
-            raise ValueError("Team has active member calls")
-        snapshot = manager.finish(requester="root")
-        for member in snapshot["members"]:
-            if member["name"] == "root":
-                continue
-            try:
-                self.agent_manager.release(self.agent_manager.get_by_name(member["name"]))
-            except KeyError:
-                pass
-        return snapshot
+        return self.team_manager.finish_runtime()
 
     def create_team(self, name: str, *, description: str = "") -> dict[str, Any]:
         """Create a reusable empty definition, then select a fresh task board."""
@@ -578,46 +429,6 @@ class Runner:
         self._team_member_names = frozenset({*(self._team_member_names or ()), name})
         self._refresh_root_config()
         return member
-
-    def _after_agent_persist(self, snapshot: dict[str, Any]) -> None:
-        """Acknowledge only inbox IDs already present in a durable session."""
-
-        manager = self.team_manager
-        if manager is None:
-            return
-        member_name = str(snapshot.get("agent_name") or "")
-        session = dict(snapshot.get("session") or {})
-
-        # 收集所有 inbox_message 类型附件的 message_id
-        ids: set[str] = set()
-
-        # 从 nodes 结构中收集（新版本 ContextTree 结构）
-        nodes = session.get("nodes")
-        if isinstance(nodes, dict):
-            for node in nodes.values():
-                if not isinstance(node, dict):
-                    continue
-                step = node.get("step")
-                if not isinstance(step, dict):
-                    continue
-                for attachment in step.get("attachments") or []:
-                    if isinstance(attachment, dict) and attachment.get("attachment_type") == "inbox_message":
-                        message_id = str(attachment.get("payload", {}).get("message_id") or "")
-                        if message_id:
-                            ids.add(message_id)
-
-        # 从 steps 列表中收集（旧版本兼容）
-        for step in session.get("steps") or []:
-            if not isinstance(step, dict):
-                continue
-            for attachment in step.get("attachments") or []:
-                if isinstance(attachment, dict) and attachment.get("attachment_type") == "inbox_message":
-                    message_id = str(attachment.get("payload", {}).get("message_id") or "")
-                    if message_id:
-                        ids.add(message_id)
-
-        if ids:
-            manager.reconcile_messages(member_name, sorted(ids))
 
     @property
     def mode_id(self) -> str:
@@ -780,6 +591,26 @@ class Runner:
             return "存在未完成的 Team 工作"
         return None
 
+    @contextmanager
+    def configuration_boundary(self) -> Iterator[None]:
+        """Reserve an idle configuration boundary, including external writes.
+
+        Gateways can validate, persist a project patch and reload under this
+        same reentrant lock. A new request cannot start between those steps.
+        """
+
+        if not self._request_lock.acquire(blocking=False):
+            raise RunnerBusyError(f"runner {self.runner_id} 正忙，不能切换配置")
+        try:
+            if self._active_requests:
+                raise RunnerBusyError(f"runner {self.runner_id} 正忙，不能切换配置")
+            blocked = self.mode_switch_block_reason()
+            if blocked:
+                raise RunnerBusyError(f"runner {self.runner_id} 正忙，不能切换模式：{blocked}")
+            yield
+        finally:
+            self._request_lock.release()
+
     def reconfigure(
         self,
         *,
@@ -787,18 +618,20 @@ class Runner:
         permission_mode: PermissionMode | str | None = None,
         plan_return_mode: str | None = None,
         runtime_overrides: dict[str, Any] | None = None,
+        reload_config: bool = False,
     ) -> None:
-        """Commit configuration at the same request gate used by stream()."""
+        """Commit choices; explicitly reload files with ``reload_config=True``.
 
-        if not self._request_lock.acquire(blocking=False):
-            raise RunnerBusyError(f"runner {self.runner_id} 正忙，不能切换配置")
-        try:
+        Fresh clients use today's providers while Runner identity, session
+        history, Team board and process-local exploration choices survive.
+        """
+
+        with self.configuration_boundary():
             self._reconfigure_at_idle(
                 mode_id=mode_id, permission_mode=permission_mode,
                 plan_return_mode=plan_return_mode, runtime_overrides=runtime_overrides,
+                reload_config=reload_config,
             )
-        finally:
-            self._request_lock.release()
 
     def _reconfigure_at_idle(
         self,
@@ -807,6 +640,7 @@ class Runner:
         permission_mode: PermissionMode | str | None,
         plan_return_mode: str | None,
         runtime_overrides: dict[str, Any] | None,
+        reload_config: bool,
     ) -> None:
         """Apply a new declarative mode at an explicit idle boundary.
 
@@ -818,7 +652,9 @@ class Runner:
 
         target = mode_registry.resolve(mode_id or self.config)
         target_permission = normalize_permission_mode(permission_mode or self.permission_mode)
-        runtime_changed = runtime_overrides is not None and runtime_overrides != self.config_context.overrides
+        runtime_changed = reload_config or (
+            runtime_overrides is not None and runtime_overrides != self.config_context.overrides
+        )
         mode_unchanged = target == self.config and target_permission == self.permission_mode
         if mode_unchanged and not runtime_changed:
             return
@@ -833,9 +669,11 @@ class Runner:
         if runtime_changed:
             # Validate static choices before touching live Agents. Provider
             # construction remains lazy, so no API key or network is needed.
-            if not isinstance(runtime_overrides, dict):
+            if runtime_overrides is not None and not isinstance(runtime_overrides, dict):
                 raise TypeError("runtime_overrides 必须为映射")
-            candidate_context = replace(self.config_context, overrides=deepcopy(runtime_overrides))
+            candidate_context = replace(self.config_context, overrides=deepcopy(
+                self.config_context.overrides if runtime_overrides is None else runtime_overrides
+            ))
             runtime = candidate_context.read_merged_config().get("runtime", {})
             if not isinstance(runtime, dict):
                 raise ValueError("runtime 必须为映射")
@@ -847,6 +685,7 @@ class Runner:
             # session snapshots and Team board remain owned by the same Runner.
             # Do not mutate a shared frozen context or persistent declarations.
             for managed in list(self.agent_manager.live_agents.values()):
+                self._remember_agent_strategy(managed, candidate_context, reload_config=reload_config)
                 self.agent_manager.release(managed)
             self.config_context = candidate_context
             self.agent_registry = candidate_registry
@@ -863,6 +702,7 @@ class Runner:
         except KeyError:
             root = None
         if root is not None:
+            self._remember_agent_strategy(root, self.config_context)
             self.agent_manager.release(root)
 
         # Managers holding worker pools are recreated only after the activity
@@ -879,7 +719,7 @@ class Runner:
             self.state["team_run_id"] = uuid4().hex
         self._refresh_root_config()
         self.async_task_manager = AsyncTaskManager(
-            event_sink=self.event_queue,
+            event_sink=_AgentInboxEventSink(self),
             state_dir=self.layout.async_tasks_dir,
             scope_id=self.runner_id,
             scope_kind="runner",
@@ -889,7 +729,6 @@ class Runner:
             max_workers=target.concurrency_limit,
         )
         self.workflow_manager = self._create_workflow_manager()
-        self._team_stopping = False
         self.team_manager = self._create_team_manager()
         self.agent_manager.permission_mode = target_permission
         self.state.update(
@@ -1006,6 +845,10 @@ class Runner:
             raise TypeError("Runner.resume 不接受旧运行时参数: " + ", ".join(sorted(removed)))
         resolved_base = Path(base_dir).expanduser().resolve()
         state = load_runner_state(build_layout(resolved_base, runner_id).manifest_path)
+        # Validate the complete session before constructors/recovery hooks can
+        # write anything. Old files remain available for manual inspection.
+        for snapshot in JsonAgentSnapshotStore(build_layout(resolved_base, runner_id).agents_dir).list():
+            AgentManager.deserialize_snapshot(snapshot)
         raw_config = state.get("runner_config")
         if not isinstance(raw_config, dict) or not raw_config:
             raise ValueError("旧 Runner 状态不支持恢复: 缺少 runner_config 声明")
@@ -1020,29 +863,45 @@ class Runner:
         )
         runner.async_task_manager.recover()
         if runner.team_manager is not None:
-            runner._team_stopping = True
-            try:
-                runner.team_manager.recover()
-                runner._reconcile_team_inbox()
-            finally:
-                runner._team_stopping = False
-            runner.wake_team()
+            with runner.team_manager.suspend_dispatch():
+                runner.team_manager.recover(preserve_claims=True)
         settle_status(runner.state, status="idle", reason="resumed")
         runner.persist_runner_state()
         return runner
 
     # -- Manager composition ------------------------------------------------------------
 
+    def _remember_agent_strategy(
+        self, managed: ManagedAgent, context: ConfigurationContext, *, reload_config: bool = False,
+    ) -> None:
+        """Retain choices in memory and invalidate only catalog-owned scorers."""
+
+        strategy = getattr(managed.instance, "exploration_strategy", None)
+        if strategy is None:
+            return
+        from juice_agents.core.models.reward_models import GenerativeRewardModel
+
+        scorer = getattr(strategy, "reward_model", None)
+        if reload_config and isinstance(scorer, GenerativeRewardModel):
+            from .execution.async_bridge import run_async
+
+            run_async(scorer.reload_config(context), owner=scorer)
+        self._reconfigured_agent_strategies[managed.agent_id] = strategy
+
     def _bind_managed_agent(self, managed: ManagedAgent, cancel_event: threading.Event) -> None:
         instance = managed.instance
         if instance is None:
             raise RuntimeError("不能为已释放 agent 绑定运行时")
+        strategy = self._reconfigured_agent_strategies.pop(managed.agent_id, None)
+        if strategy is not None:
+            instance.set_exploration_strategy(strategy)
         context = RunnerContext(
             runner=self,
             agent_name=managed.agent_name,
             agent_id=managed.agent_id,
             agent_role=managed.role,
             agent=instance,
+            cancellation=cancel_event,
         )
         instance.runner_context = context
         instance.workspace_rules = self.workspace_rules.prompt
@@ -1088,16 +947,9 @@ class Runner:
         }
         instance.bind_manager_infra(
             agent_id=managed.agent_id,
-            event_queue=self.event_queue,
             async_task_manager=self.async_task_manager,
             runtime_workspace=self.runtime_workspace,
             runtime_base_dir=self.base_dir,
-        )
-        self.async_task_manager.register_agent(
-            agent_name=managed.agent_name,
-            agent_id=managed.agent_id,
-            role=managed.role,
-            metadata={"lifecycle": managed.lifecycle.value, "is_root": managed.is_root},
         )
         self.tool_manager.bind_agent(
             instance,
@@ -1125,27 +977,88 @@ class Runner:
         self.state["root_agent_name"] = self.root_agent_name
         self.state["root_agent_id"] = self.root_agent_id
         self.persist_runner_state()
-        self._emit_manager_lifecycle({"scope": "agent", "event": "checkpointed", "agent_id": managed.agent_id})
 
     def _after_agent_release(self, managed: ManagedAgent) -> None:
         self.tool_manager.release_agent(managed.agent_id)
 
-    def _reconcile_team_inbox(self) -> None:
-        """Replay only messages absent from persisted agent TaskSteps."""
-
-        if self.team_manager is None:
-            return
-        for snapshot in self.agent_manager.snapshot_store.list():
-            self._after_agent_persist(snapshot)
-
     def _attachments_for(self, managed: ManagedAgent, _step_index: int) -> list[RuntimeAttachment]:
-        events = self.event_queue.drain(managed.agent_id)
-        inbox = self._team_initial_attachments(managed.agent_name)
-        return [
-            *self._pending_attachments.pop(managed.agent_id, []),
-            *merge_runtime_attachments(runtime_events=events),
-            *inbox,
-        ]
+        # All producers use AgentManager.post(). The callback remains the
+        # extension seam for per-step dynamic prompt state, never a mailbox.
+        return []
+
+    def _acknowledge_attachments(self, managed: ManagedAgent, attachments: list[RuntimeAttachment]) -> None:
+        """Confirm business delivery only after the context/checkpoint commit."""
+
+        team_ids: list[str] = []
+        notification_ids: set[str] = set()
+        for attachment in attachments:
+            payload = dict(attachment.get("payload") or {})
+            message_id = str(attachment.get("message_id") or payload.get("message_id") or "")
+            if attachment.get("attachment_type") == "inbox_message" and message_id:
+                team_ids.append(message_id)
+            elif attachment.get("attachment_type") == "async_task_notification" and message_id:
+                notification_ids.add(message_id)
+        if team_ids and self.team_manager is not None:
+            self.team_manager.acknowledge(managed, team_ids)
+        if notification_ids:
+            self.async_task_manager.mark_notifications_delivered(notification_ids)
+
+    def _on_agent_event(self, managed: ManagedAgent, payload: dict[str, Any]) -> dict[str, Any]:
+        """Publish each scheduled event once to request and ambient listeners."""
+
+        event = {
+            "runner_id": self.runner_id, "mode_id": self.mode_id,
+            "permission_mode": self.permission_mode, "agent_id": managed.agent_id,
+            "agent_name": managed.agent_name, "agent_role": managed.role,
+            **payload,
+        }
+        event.setdefault("event_id", f"evt_{uuid4().hex}")
+        kind = event.get("kind")
+        if managed.is_root and kind in {"round_start", "round_end"}:
+            with self._state_lock:
+                if kind == "round_start":
+                    settle_status(self.state, status="running", reason="round_started", active_round={
+                        "round_id": event["round_id"], "agent_id": managed.agent_id,
+                        "started_at": event.get("started_at", time.time()),
+                    })
+                elif dict(self.state.get("active_round") or {}).get("round_id") == event.get("round_id"):
+                    settle_status(self.state, status="idle", reason=str(event.get("data", {}).get("result", {}).get("reason") or "round_ended"))
+                try:
+                    self.persist_runner_state()
+                except Exception:
+                    # The authoritative Agent checkpoint is already saved.
+                    # Keep its real result observable if this summary fails.
+                    logger.exception("runner_event_state_save_failed runner_id=%s", self.runner_id)
+        self._publish(event)
+        if self.team_manager is not None:
+            self.team_manager.on_agent_event(managed, event)
+        return event
+
+    def _ensure_delivery_target(self, agent_id: str) -> ManagedAgent:
+        """Restore a persisted identity before replay, without activating it."""
+
+        try:
+            managed = self.agent_manager.get(agent_id)
+            if managed.is_live:
+                return managed
+        except KeyError:
+            pass
+        if agent_id == self.root_agent_id:
+            return self._root()
+        snapshot = self.agent_manager.snapshot_store.load(agent_id)
+        if snapshot is None or snapshot.get("lifecycle") != "persistent":
+            raise ValueError(f"notification target is unavailable: {agent_id}")
+        metadata = dict(snapshot.get("metadata") or {})
+        if metadata.get("team_member"):
+            managed = self.team_manager.acquire_member(str(metadata["team_member"]))
+            if managed.agent_id != agent_id:
+                raise ValueError(f"notification target generation changed: {agent_id}")
+            return managed
+        return self.agent_manager.acquire(
+            str(snapshot["agent_name"]), agent_name=str(snapshot["agent_name"]),
+            agent_id=agent_id, role=str(snapshot.get("role") or "member"),
+            lifecycle="persistent", metadata=metadata,
+        )
 
     def _refresh_root_config(self, declaration: AgentConfig | None = None) -> None:
         """Read shared root data and apply the current mode only in memory."""
@@ -1156,6 +1069,7 @@ class Runner:
             plan_file=self.plan_file_path(),
             managed_agent_names=self._discover_available_agent_names(),
             declaration=self._root_declaration,
+            runtime_config=self.config_context.read_merged_config(),
         )
 
     def _root(self) -> ManagedAgent:
@@ -1171,7 +1085,7 @@ class Runner:
                 self._refresh_root_config(declaration)
             # If YAML did not change, retain intentional in-memory overrides
             # (for example an embedded host selecting ReAct versus CodeAct).
-        return self.agent_manager.acquire_root(self.root_config, role="root")
+        return self.agent_manager.acquire_root(self.root_config, role="root", lifecycle=self.config.root_binding.lifecycle)
 
     def _require_capability(self, capability: Capability | str) -> None:
         resolved = Capability(capability)
@@ -1214,177 +1128,275 @@ class Runner:
 
     # -- Request dispatch ---------------------------------------------------------------
 
-    def stream(self, message: str, task_images: list[Any] | None = None) -> Iterator[dict[str, Any]]:
-        if not self._request_lock.acquire(blocking=False):
-            raise RunnerBusyError(f"runner {self.runner_id} is already processing a request")
-        try:
-            root = self._root()
-        except Exception:
-            # Registry validation/model construction happens lazily here.  A
-            # failed acquisition must not leave the request gate permanently
-            # held and make a corrected follow-up request appear busy.
-            self._request_lock.release()
-            raise
-        self._cancel_event.clear()
-        self._team_stopping = False
-        self._stop_reason = None
-        started_at = time.time()
-        round_id = f"round_{uuid4().hex[:12]}"
-        settle_status(
-            self.state,
-            status="running",
-            reason="request_started",
-            active_round={"round_id": round_id, "agent_id": root.agent_id, "started_at": started_at},
-            at=started_at,
-        )
-        self.persist_runner_state()
+    def activate(self) -> None:
+        """Enable autonomous scheduling after event and Ask bindings are ready."""
 
-        def iterate() -> Iterator[dict[str, Any]]:
-            outcome, output = "failed", None
+        if self._closed:
+            raise RuntimeError("Runner is closed")
+        # Cold empty sessions remain key-free: constructing a model is only
+        # necessary when a saved identity or incoming message needs one.
+        # Restore persisted identities before handing scheduling authority to
+        # AgentManager. Invalid targets stay visible in producer/inbox records.
+        for snapshot in self.agent_manager.snapshot_store.list():
+            if snapshot.get("lifecycle") != "persistent":
+                continue
             try:
-                yield from self._drain_team_updates()
-                task = str(message)
-                images = list(task_images or [])
-                for continuation in range(self.config.continuation_policy.max_rounds):
-                    for step_or_event in self.agent_manager.stream(
-                        root, task, task_images=images,
-                        attachments=self._team_initial_attachments("root"),
-                    ):
-                        # 导入流式事件类型
-                        from juice_agents.core.agent.context import ActionEvent, ActionStep
-
-                        # 处理统一的 ActionEvent
-                        if isinstance(step_or_event, ActionEvent):
-                            event_type = step_or_event.event_type
-                            data = step_or_event.data
-
-                            # 构建统一的 action_event 发送给前端
-                            event = {
-                                "kind": "action_event",
-                                "runner_id": self.runner_id,
-                                "mode_id": self.mode_id,
-                                "permission_mode": self.permission_mode,
-                                "agent_name": root.agent_name,
-                                "agent_id": root.agent_id,
-                                "agent_role": root.role,
-                                "step_num": step_or_event.step_num,
-                                "event_type": event_type,
-                                "data": data,
-                                "round_id": round_id,
-                            }
-                            self._publish(event)
-                            yield event
-                            continue
-
-                        # 处理完整的 ActionStep
-                        if isinstance(step_or_event, ActionStep):
-                            step = step_or_event
-                            outcome = str(step.round_outcome or "continue")
-                            if outcome in {"submitted", "failed"}:
-                                output = step.output if step.output is not None else step.model_output
-                            event = {
-                                "kind": "action_step", "runner_id": self.runner_id, "mode_id": self.mode_id,
-                                "permission_mode": self.permission_mode, "agent_name": root.agent_name,
-                                "agent_id": root.agent_id, "agent_role": root.role, "step_num": step.step_num,
-                                "action_step": step, "round_id": round_id,
-                            }
-                            self._publish(event)
-                            yield event
-                            yield from self._drain_team_updates()
-                    # The transport owns only this stream. Keep it open while
-                    # member calls are active so completion updates reach
-                    # CLI/Web without a separate polling channel.
-                    while self._active_team_calls() and not self._cancel_event.is_set():
-                        yield from self._drain_team_updates()
-                        time.sleep(0.02)
-                    pending_root = [] if self.team_manager is None else self.team_manager.pending_messages("root")
-                    if (
-                        not pending_root or self._cancel_event.is_set()
-                        or not self.config.continuation_policy.continue_on_pending_work
-                    ):
-                        break
-                    if continuation + 1 == self.config.continuation_policy.max_rounds:
-                        logger.warning("team_root_continuation_limit runner_id=%s pending=%d", self.runner_id, len(pending_root))
-                        break
-                    task = f"{len(pending_root)} new Team messages"
-                    images = []
-                reason = "interrupted" if root.status is AgentStatus.INTERRUPTED else "round_ended"
-                settle_status(self.state, status="idle", reason=reason)
-                yield from self._drain_team_updates()
-                end = {
-                    "kind": "round_end", "runner_id": self.runner_id, "mode_id": self.mode_id,
-                    "permission_mode": self.permission_mode, "agent_name": root.agent_name,
-                    "agent_id": root.agent_id, "agent_role": root.role, "round_id": round_id,
-                    "outcome": outcome, "output": output, "reason": reason,
-                }
-                self._publish(end)
-                yield end
-            except AgentExecutionInterrupted as exc:
-                settle_status(self.state, status="idle", reason="interrupted")
-                event = {
-                    "kind": "stream_cancelled", "runner_id": self.runner_id, "mode_id": self.mode_id,
-                    "permission_mode": self.permission_mode, "agent_name": root.agent_name,
-                    "agent_id": root.agent_id, "agent_role": root.role, "round_id": round_id,
-                    "stop_reason": exc.reason,
-                }
-                self._publish(event)
-                yield event
+                self._ensure_delivery_target(str(snapshot["agent_id"]))
             except Exception:
-                settle_status(self.state, status="failed", reason="request_failed")
-                logger.exception("runner_request_failed runner_id=%s", self.runner_id)
+                logger.exception("runner_restore_target_failed runner_id=%s agent_id=%s", self.runner_id, snapshot.get("agent_id"))
+        self.wake_team()
+        self.agent_manager.activate()
+        self._activated = True
+        logger.info("runner_activated runner_id=%s", self.runner_id)
+
+    def post(self, agent_id: str, attachment: RuntimeAttachment) -> dict[str, Any]:
+        """Durably accept an attachment; activation is explicit for background hosts."""
+
+        self._ensure_delivery_target(agent_id)
+        return self.agent_manager.post(agent_id, attachment)
+
+    async def _open_stream(self, message: str, task_images: list[Any], cancel_check=None, *,
+                           cancel_accepted: bool = False) -> _RoundObserver:
+        events = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+        released = False
+        unsubscribe = lambda: None
+
+        def cleanup() -> None:
+            nonlocal released
+            with self._request_lock:
+                if released:
+                    return
+                released = True
+                self._active_requests -= 1
+            unsubscribe()
+
+        def prepare():
+            nonlocal unsubscribe
+            with self._request_lock:
+                if self._closed or self.agent_manager._closed:
+                    raise RuntimeError("Runner is stopped or closed")
+                self._active_requests += 1
+            unsubscribe = self.subscribe(lambda event: loop.call_soon_threadsafe(events.put_nowait, event))
+            for update in self._drain_team_updates():
+                loop.call_soon_threadsafe(events.put_nowait, update)
+            try:
+                if self.config.root_binding.lifecycle == "functional":
+                    return _RoundObserver(events, f"round_{uuid4().hex}", "", self.root_agent_id, cleanup,
+                                          cancel_check=cancel_check)
+                with self._request_lock:
+                    root = self._root()
+                    self._stop_reason = None
+                    self._cancel_event.clear()
+                    receipt = self.agent_manager.post(root.agent_id, {
+                        "attachment_type": "user_message", "message_id": f"msg_{uuid4().hex}",
+                        "created_at": time.time(), "payload": {"text": message, "task_images": task_images},
+                    })
+                    if cancel_check is not None and cancel_check():
+                        self.agent_manager.cancel_round(receipt["round_id"])
+                    self.activate()
+                return _RoundObserver(events, str(receipt["round_id"]), str(receipt["message_id"]),
+                                      root.agent_id, cleanup, root, cancel_check)
+            except BaseException:
+                cleanup()
                 raise
+
+        async def discard(observer):
+            try:
+                if cancel_accepted:
+                    await self._cancel_observer(observer)
             finally:
-                self.persist_runner_state()
-                self._request_lock.release()
+                observer.cleanup()
 
-        def close_unstarted() -> None:
-            settle_status(self.state, status="idle", reason="stream_closed")
-            self.persist_runner_state()
-            self._request_lock.release()
+        observer = await blocking(prepare, on_discard=discard)
+        if self.config.root_binding.lifecycle == "functional":
+            async def execute():
+                if self._functional_root_gate is None:
+                    self._functional_root_gate = asyncio.Lock()
+                try:
+                    async with self._functional_root_gate:
+                        managed = await blocking(self._root)
+                        observer.managed = managed
+                        if cancel_check is not None and await blocking(cancel_check):
+                            managed.external_cancel = threading.Event()
+                            managed.external_cancel.set()
+                        await self.agent_manager.arun(managed, message, task_images=task_images,
+                                                      round_id=observer.round_id)
+                except Exception as exc:
+                    await events.put(exc)
 
-        return _RunnerStream(iterate(), close_unstarted)
+            task = asyncio.create_task(execute(), name=f"functional-{self.runner_id}")
+            observer.task = task
+            self._functional_calls.add(task)
+            task.add_done_callback(self._functional_calls.discard)
+        return observer
+
+    async def _cancel_observer(self, observer: _RoundObserver) -> None:
+        """取消本次调用并等已启动的执行收尾；排队输入只需持久化意图。"""
+        if observer.task is not None:
+            observer.task.cancel()
+            await asyncio.gather(observer.task, return_exceptions=True)
+            return
+        cancelled = await blocking(self.cancel_round, observer.round_id, reason="caller_cancelled")
+        managed = observer.managed
+        while cancelled and managed is not None:
+            if await blocking(self.agent_manager.round_result, managed.agent_id, observer.round_id) is not None:
+                return
+            if managed._execution_error is not None:
+                raise managed._execution_error
+            await asyncio.sleep(0.01)
+
+    async def _observe_round(self, observer: _RoundObserver):
+        try:
+            while True:
+                if observer.cancel_check is not None and await blocking(observer.cancel_check):
+                    await blocking(self.cancel_round, observer.round_id)
+                try:
+                    event = await asyncio.wait_for(observer.events.get(), 0.05)
+                except TimeoutError:
+                    if observer.managed is not None and observer.managed._execution_error is not None:
+                        raise observer.managed._execution_error
+                    continue
+                if isinstance(event, BaseException):
+                    raise event
+                if event.get("kind") == "message_deferred" and event.get("data", {}).get("message_id") == observer.message_id:
+                    observer.round_id = str(event["round_id"])
+                    continue
+                if event.get("kind") == "team_update":
+                    yield event
+                    continue
+                if event.get("agent_id") != observer.agent_id or event.get("round_id") != observer.round_id:
+                    continue
+                yield event
+                if event.get("kind") == "round_end":
+                    return
+        finally:
+            observer.cleanup()
+
+    def stream(self, message: str, task_images: list[Any] | None = None, *, cancel_check=None):
+        observer = run_async(self._open_stream(str(message), list(task_images or []), cancel_check))
+        return _RunnerStream(iter_sync(self._observe_round(observer)), observer.cleanup)
+
+    async def astream(self, message: str, task_images: list[Any] | None = None, *, cancel_check=None):
+        observer = await on_runtime(self._open_stream(str(message), list(task_images or []), cancel_check))
+        async with aclosing(iter_async(self._observe_round(observer))) as events:
+            async for event in events:
+                yield event
+
+    async def arun_round(self, message: str, task_images: list[Any] | None = None, *, cancel_check=None) -> RoundResult:
+        async def execute():
+            observer = await self._open_stream(str(message), list(task_images or []), cancel_check,
+                                               cancel_accepted=True)
+            try:
+                async with aclosing(self._observe_round(observer)) as events:
+                    async for event in events:
+                        if event["kind"] == "round_end":
+                            return RoundResult.from_dict(event["data"]["result"])
+            except asyncio.CancelledError:
+                await self._cancel_observer(observer)
+                raise
+            raise RuntimeError("round ended without a committed result")
+        return await on_runtime(execute())
+
+    async def arun(self, message: str, task_images: list[Any] | None = None) -> Any:
+        return (await self.arun_round(message, task_images)).unwrap()
+
+    @classmethod
+    async def acreate(cls, **kwargs: Any):
+        return await blocking(cls.create, **kwargs)
+
+    @classmethod
+    async def aresume(cls, **kwargs: Any):
+        return await blocking(cls.resume, **kwargs)
+
+    async def aactivate(self) -> None:
+        await blocking(self.activate)
+
+    async def apost(self, agent_id: str, attachment: RuntimeAttachment) -> dict[str, Any]:
+        return await blocking(self.post, agent_id, attachment)
+
+    async def aclose(self) -> None:
+        await on_runtime(self._aclose())
+
+    async def _aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self.team_manager is not None:
+            await self.team_manager.aclose()
+        await blocking(self.stop, reason="runner_closed")
+        await asyncio.gather(*tuple(self._functional_calls), return_exceptions=True)
+        await self.async_task_manager.aclose(wait=True, timeout_seconds=None)
+        await self.tool_manager.aclose(wait=True)
+        await self.model_manager.aclose()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc) -> None:
+        await self.aclose()
+
+    def run_round(
+        self, message: str, task_images: list[Any] | None = None, *,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> RoundResult:
+        """Wait for the committed outcome, also used by transport request handlers."""
+        stream = self.stream(message, task_images=task_images, cancel_check=cancel_check)
+        try:
+            for event in stream:
+                if event["kind"] == "round_end":
+                    return RoundResult.from_dict(event["data"]["result"])
+        finally:
+            stream.close()
+        raise RuntimeError("round ended without a committed result")
 
     def run(self, message: str, task_images: list[Any] | None = None) -> Any:
-        result: Any = None
-        for event in self.stream(message, task_images=task_images):
-            if event.get("kind") == "round_end":
-                result = event.get("output")
-        return result
+        return self.run_round(message, task_images=task_images).unwrap()
+
+    @property
+    def active_round_id(self) -> str | None:
+        value = dict(self.state.get("active_round") or {}).get("round_id")
+        return str(value) if value else None
+
+    def cancel_round(self, round_id: str, *, reason: str = "user_cancelled") -> bool:
+        """Persist cancellation for this round; later messages remain runnable."""
+
+        cancelled = bool(self.agent_manager.cancel_round(round_id, reason=reason))
+        if cancelled:
+            logger.info("runner_round_cancelled runner_id=%s round_id=%s reason=%s", self.runner_id, round_id, reason)
+        return cancelled
 
     def request_stop_stream(self, *, reason: str = "user_cancelled") -> None:
-        self._team_stopping = True
-        self._stop_reason = str(reason or "user_cancelled")
-        self._cancel_event.set()
-        self.agent_manager.interrupt(reason=self._stop_reason)
-        logger.info("runner_stream_stop_requested runner_id=%s reason=%s", self.runner_id, self._stop_reason)
+        round_id = self.active_round_id
+        if round_id:
+            self.cancel_round(round_id, reason=reason)
 
     def stop(self, *, reason: str = "runner_stopped") -> None:
-        self.request_stop_stream(reason=reason)
-        self.async_task_manager.stop(reason=reason)
+        """Close scheduling and resources; this is separate from round cancellation."""
+
         if self.team_manager is not None:
-            for member in self.team_manager.snapshot()["members"]:
-                if member["name"] != "root" and member.get("busy"):
-                    self._settle_team_member_call(str(member["name"]))
-        # AgentManager owns the running call.  Wait for its lock before
-        # releasing the persistent instance and its durable session.
-        for managed in list(self.agent_manager.live_agents.values()):
-            if managed.status is AgentStatus.RUNNING:
-                with managed._run_lock:
-                    pass
-        for managed in list(self.agent_manager.live_agents.values()):
-            self.agent_manager.release(managed)
+            self.team_manager.stopping = True
+        self._stop_reason = reason
+        self._cancel_event.set()
+        self.agent_manager.close(wait=True)
+        self.async_task_manager.stop(reason=reason)
         settle_status(self.state, status="idle", reason=reason)
         self.state["last_stop"] = {"reason": reason, "at": time.time()}
         self.persist_runner_state()
+        self._activated = False
 
     def close(self) -> None:
-        self.stop(reason="runner_closed")
-        self.async_task_manager.release(wait=False)
-        self.tool_manager.release(wait=False)
+        run_async(self._aclose())
 
     # -- generic Manager capabilities ---------------------------------------------------
 
     def invoke_agent(self, spec: dict[str, Any]) -> dict[str, Any]:
+        return run_async(self._ainvoke_agent(spec))
+
+    async def ainvoke_agent(self, spec: dict[str, Any]) -> dict[str, Any]:
+        return await on_runtime(self._ainvoke_agent(spec))
+
+    async def _ainvoke_agent(self, spec: dict[str, Any]) -> dict[str, Any]:
         """调用 agent 的唯一入口；构造、运行、释放全部交给 AgentManager。
 
         - ``agent_ref`` 为名字：按 ``/agents`` 同一套可用性判断（mode、禁用列表），
@@ -1396,55 +1408,123 @@ class Runner:
         - 未指定 ``model`` 时继承发起者（owner）的模型。
         """
 
-        self._require_capability(Capability.AGENTS)
-        raw_ref = spec.get("agent_ref") or spec.get("agent_name")
-        task = str(spec.get("task") or "").strip()
-        if raw_ref is None or not task:
-            raise ValueError("agent_ref 和 task 不能为空")
-        is_inline = isinstance(raw_ref, AgentConfig)
-        agent_name = str(
-            getattr(raw_ref, "name", "")
-            or (raw_ref.get("name") if isinstance(raw_ref, dict) else raw_ref)
-        ).strip()
-        if not is_inline and not self.is_agent_available(agent_name):
-            allowed = ", ".join(self._discover_available_agent_names()) or "(none)"
-            raise PermissionError(
-                f"当前 Runner 不允许调用 Agent ({allowed}); got {agent_name!r}"
+        def prepare():
+            self._require_capability(Capability.AGENTS)
+            raw_ref = spec.get("agent_ref") or spec.get("agent_name")
+            task = str(spec.get("task") or "").strip()
+            if raw_ref is None or not task:
+                raise ValueError("agent_ref 和 task 不能为空")
+            is_inline = isinstance(raw_ref, AgentConfig)
+            agent_name = str(
+                getattr(raw_ref, "name", "")
+                or (raw_ref.get("name") if isinstance(raw_ref, dict) else raw_ref)
+            ).strip()
+            if not is_inline and not self.is_agent_available(agent_name):
+                allowed = ", ".join(self._discover_available_agent_names()) or "(none)"
+                raise PermissionError(
+                    f"当前 Runner 不允许调用 Agent ({allowed}); got {agent_name!r}"
+                )
+            execution = str(spec.get("execution") or "background").strip()
+            owner_name = str(spec.get("owner_agent_name") or self.root_agent_name).strip()
+            owner = self.agent_manager.get_by_name(owner_name)
+            if execution == "background" and owner.lifecycle.value == "functional":
+                raise PermissionError("functional Agent cannot launch background work; use a synchronous call")
+            role = str(spec.get("agent_role") or self.config.member_binding.role).strip()
+            lifecycle = str(spec.get("lifecycle") or ("functional" if is_inline else self.config.member_binding.lifecycle)).strip()
+            if is_inline and lifecycle != "functional":
+                raise ValueError("临时 AgentConfig 只支持 functional 生命周期")
+            binding: Any = raw_ref if not isinstance(raw_ref, str) else AgentBinding(agent_name, role, lifecycle)
+            model = spec.get("model")
+            if model is None and owner.instance is not None:
+                model = getattr(owner.instance, "model", None)
+            managed = self.agent_manager.acquire(
+                binding, agent_name=agent_name or None, role=role, lifecycle=lifecycle,
+                model=model, metadata={"parent_agent": owner.agent_name,
+                    **({"cancellation_round_id": owner.metadata.get("cancellation_round_id")
+                        or owner.round_checkpoint.get("round_id")} if execution == "sync" else {}),
+                    **dict(spec.get("metadata") or {})},
+                ephemeral=bool(spec.get("ephemeral")),
+                permission_mode=str(spec.get("permission_mode") or ""),
+                external_cancel=(spec.get("cancel_event") or owner.cancel_event) if lifecycle == "functional" and execution == "sync" else None,
             )
-        execution = str(spec.get("execution") or "background").strip()
-        owner_name = str(spec.get("owner_agent_name") or self.root_agent_name).strip()
-        owner = self.agent_manager.get_by_name(owner_name)
-        role = str(spec.get("agent_role") or self.config.member_binding.role).strip()
-        lifecycle = str(spec.get("lifecycle") or ("functional" if is_inline else self.config.member_binding.lifecycle)).strip()
-        if is_inline and lifecycle != "functional":
-            raise ValueError("临时 AgentConfig 只支持 functional 生命周期")
-        binding: Any = raw_ref if not isinstance(raw_ref, str) else AgentBinding(agent_name, role, lifecycle)
-        model = spec.get("model")
-        if model is None and owner.instance is not None:
-            model = getattr(owner.instance, "model", None)
-        managed = self.agent_manager.acquire(
-            binding, agent_name=agent_name or None, role=role, lifecycle=lifecycle,
-            model=model, metadata={"parent_agent": owner.agent_name, **dict(spec.get("metadata") or {})},
-            ephemeral=bool(spec.get("ephemeral")),
-            permission_mode=str(spec.get("permission_mode") or ""),
-            external_cancel=spec.get("cancel_event"),
-        )
-        run_args = {"task_images": list(spec.get("task_images") or []), "reset_session": not bool(spec.get("inherit_session"))}
+            run_args = {"task_images": list(spec.get("task_images") or []), "reset_session": not bool(spec.get("inherit_session"))}
+            return managed, task, owner, execution, run_args
+
+        managed, task, owner, execution, run_args = await blocking(prepare)
+        async def execute(cancel_event: threading.Event | None = None) -> Any:
+            if managed.lifecycle.value == "persistent":
+                return await self._ainvoke_persistent_round(managed, task, task_images=run_args["task_images"], cancel_event=cancel_event)
+            if cancel_event is not None:
+                managed.external_cancel = cancel_event
+            return await self.agent_manager.arun(managed, task, **run_args)
+
         if execution == "sync":
-            return {"status": "completed", "agent_id": managed.agent_id, "agent_name": managed.agent_name, "output": self.agent_manager.run(managed, task, **run_args)}
+            result = await execute(spec.get("cancel_event") or owner.cancel_event)
+            output = result.unwrap()
+            return {"status": result.status, "agent_id": managed.agent_id, "agent_name": managed.agent_name,
+                    "output": output, "result": result.to_dict()}
         if execution != "background":
             raise ValueError(f"未知 agent execution: {execution}")
-        receipt = self.async_task_manager.launch(
+        async def background(async_task, _path):
+            return (await execute(self.async_task_manager.cancel_event_for(str(async_task["async_task_id"])))).unwrap()
+
+        receipt = await self.async_task_manager.alaunch(
             task_type="local_agent", owner_agent_id=owner.agent_id, owner_agent_name=owner.agent_name,
-            description=task, runner=lambda _task, _path: self.agent_manager.run(managed, task, **run_args),
+            description=task,
+            runner=background,
             summary_builder=lambda _result: f"agent {managed.agent_name} completed",
             metadata={"target_agent_name": managed.agent_name},
         )
         return {"status": "pending", "agent_id": managed.agent_id, "agent_name": managed.agent_name, **dict(receipt)}
 
+    async def _ainvoke_persistent_round(
+        self, managed: ManagedAgent, task: str, *, task_images: list[Any],
+        cancel_event: threading.Event | None,
+    ) -> RoundResult:
+        """Persistent child calls share inbox scheduling and parent cancellation."""
+
+        events = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+        unsubscribe = self.subscribe(lambda event: loop.call_soon_threadsafe(events.put_nowait, event))
+        try:
+            receipt = await self.agent_manager.apost(managed.agent_id, {
+                "attachment_type": "task_assignment", "message_id": f"msg_{uuid4().hex}",
+                "created_at": time.time(), "payload": {"text": task, "task_images": task_images},
+            })
+            round_id, message_id = str(receipt["round_id"]), str(receipt["message_id"])
+            await blocking(self.agent_manager.activate)
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    await blocking(self.cancel_round, round_id, reason="caller_cancelled")
+                try:
+                    event = await asyncio.wait_for(events.get(), 0.05)
+                except TimeoutError:
+                    if managed._execution_error is not None:
+                        raise managed._execution_error
+                    continue
+                if event.get("kind") == "message_deferred" and event.get("data", {}).get("message_id") == message_id:
+                    round_id = str(event["round_id"])
+                    continue
+                if event.get("agent_id") == managed.agent_id and event.get("round_id") == round_id and event.get("kind") == "round_end":
+                    return RoundResult.from_dict(event["data"]["result"])
+        except asyncio.CancelledError:
+            await blocking(self.cancel_round, round_id, reason="caller_cancelled")
+            # Round cancellation is durable, but its result follows cleanup.
+            while managed.round_checkpoint.get("status") == "active":
+                await asyncio.sleep(0.01)
+            raise
+        finally:
+            unsubscribe()
+
+    @staticmethod
+    def _require_persistent_async_owner(owner: ManagedAgent) -> None:
+        if owner.lifecycle.value == "functional":
+            raise PermissionError("functional Agent cannot launch background work")
+
     def launch_local_bash_async_task(self, *, owner_agent_name: str, command: str, cwd: str, timeout_seconds: float | None, max_observation_chars: int | None = None) -> dict[str, Any]:
         self._require_capability(Capability.ASYNC_TASKS)
         owner = self.agent_manager.get_by_name(owner_agent_name)
+        self._require_persistent_async_owner(owner)
         return self.async_task_manager.launch_shell(
             owner_agent_id=owner.agent_id,
             owner_agent_name=owner.agent_name,
@@ -1463,18 +1543,21 @@ class Runner:
         self._require_capability(Capability.WORKFLOWS)
         self._require_capability(Capability.ASYNC_TASKS)
         owner = self.agent_manager.get_by_name(owner_agent_name)
+        self._require_persistent_async_owner(owner)
         name = str(getattr(workflow, "name", workflow) or "")
+        caller_round_id = owner.round_checkpoint.get("round_id")
+        caller_step_num = getattr(owner.instance, "_active_step_num", None)
+        async def execute(task, _path):
+            return await self.workflow_manager.acall(
+                workflow, args, config,
+                owner_agent_name=owner.agent_name, owner_agent_id=owner.agent_id,
+                round_id=caller_round_id, step_num=caller_step_num,
+                cancel_event=self.async_task_manager.cancel_event_for(str(task["async_task_id"])),
+            )
+
         return self.async_task_manager.launch(
             task_type="local_workflow", owner_agent_id=owner.agent_id, owner_agent_name=owner.agent_name,
-            description=f"workflow:{name}",
-            runner=lambda task, _path: self.workflow_manager.call(
-                workflow,
-                args,
-                config,
-                owner_agent_name=owner.agent_name,
-                # async_task_stop 会 set 这个信号，workflow 在下一个调用边界停下。
-                cancel_event=self.async_task_manager.cancel_event_for(str(task.get("async_task_id") or "")),
-            ),
+            description=f"workflow:{name}", runner=execute,
             summary_builder=lambda _result: f"workflow {name} completed",
             metadata={"workflow_name": name, "max_observation_chars": max_observation_chars},
         )
@@ -1501,24 +1584,27 @@ class Runner:
     def ask_user(self, request: dict[str, Any]) -> dict[str, Any]:
         return {"status": "error", "error": "没有可用的用户交互通道"} if self._ask_handler is None else dict(self._ask_handler(dict(request)))
 
-    def describe_agent_sessions(self) -> dict[str, Any]:
-        return {"runner_id": self.runner_id, "mode_id": self.mode_id, **self.agent_manager.describe_sessions()}
+    def describe_agent_sessions(self, agent_id: str | None = None) -> dict[str, Any]:
+        return {"runner_id": self.runner_id, "mode_id": self.mode_id,
+                **self.agent_manager.describe_sessions(agent_id=agent_id)}
 
     def token_usage(self) -> dict[str, Any]:
-        """只读代理 AgentManager 的用量汇总，不持有第二份账本或唤醒 Agent。"""
-        return self.agent_manager.token_usage()
+        """只读代理 ModelManager 的用量汇总，不持有第二份账本或唤醒 Agent。"""
+        return self.model_manager.token_usage()
 
     def queue_agent_user_message(self, *, agent_name: str, message: str) -> dict[str, Any]:
-        managed = self.agent_manager.get_by_name(agent_name)
-        # A user message is a session-level input for a managed agent.  It is
-        # queued rather than injected into a live instance, so it survives the
-        # same acquire/step boundary as all other Runner-owned attachments.
-        self._pending_attachments.setdefault(managed.agent_id, []).append({"attachment_type": "agent_user_message", "created_at": time.time(), "payload": {"from": "user", "agent_name": managed.agent_name, "text": str(message)}})
-        return {"accepted": True, "agent_name": managed.agent_name, "delivery": "agent_attachment"}
+        managed = self._root() if agent_name == self.root_agent_name else self.agent_manager.get_by_name(agent_name)
+        receipt = self.agent_manager.post(managed.agent_id, {
+            "attachment_type": "agent_user_message", "message_id": f"msg_{uuid4().hex}",
+            "created_at": time.time(),
+            "payload": {"from": "user", "agent_name": managed.agent_name, "text": str(message)},
+        })
+        return {"accepted": True, "agent_name": managed.agent_name, "delivery": "agent_attachment", **receipt}
 
     def interrupt_agent(self, *, agent_name: str, reason: str = "user_agent_interrupt") -> dict[str, Any]:
         managed = self.agent_manager.get_by_name(agent_name)
-        return {"interrupted": bool(self.agent_manager.interrupt(managed, reason=reason)), "agent_name": managed.agent_name, "reason": reason}
+        round_id = str(managed.round_checkpoint.get("round_id") or "")
+        return {"interrupted": self.cancel_round(round_id, reason=reason), "agent_name": managed.agent_name, "round_id": round_id, "reason": reason}
 
     def plan_file_path(self) -> Path:
         """Return the sole formal plan artifact for this Runner.
@@ -1537,7 +1623,7 @@ class Runner:
         payload = {"agent_name": agent_name, "plan": plan, "plan_file": plan_file}
         self.state["pending_plan_exit"] = dict(payload)
         self.persist_runner_state()
-        self._pending_attachments.setdefault(self.root_agent_id, []).append({"attachment_type": "plan_mode_exit", "created_at": time.time(), "payload": payload})
+        self.agent_manager.post(self.root_agent_id, {"attachment_type": "plan_mode_exit", "message_id": f"msg_{uuid4().hex}", "created_at": time.time(), "payload": payload})
 
     def pending_plan_exit(self) -> dict[str, Any] | None:
         """Read an approved exit request without changing it.
@@ -1550,8 +1636,18 @@ class Runner:
         return dict(value) if isinstance(value, dict) else None
 
     def persist_runner_state(self) -> RunnerState:
-        self.state = write_runner_state(self.layout.manifest_path, self.state)
-        return self.state
+        with self._state_lock:
+            self.state = write_runner_state(self.layout.manifest_path, self.state)
+            return self.state
+
+    def subscribe_events(self, listener: Callable[[dict[str, Any]], None]) -> Callable[[], None]:
+        """Subscribe once to public execution and business events."""
+        return self.register_stream_event_listener(listener)
+
+    def subscribe(self, listener: Callable[[dict[str, Any]], None]) -> Callable[[], None]:
+        """Subscribe to all rounds, including autonomous rounds after a request."""
+
+        return self.register_stream_event_listener(listener)
 
     def register_stream_event_listener(self, listener: Callable[[dict[str, Any]], None]) -> Callable[[], None]:
         with self._listeners_lock:
@@ -1563,6 +1659,8 @@ class Runner:
         return unregister
 
     def _publish(self, event: dict[str, Any]) -> None:
+        event.setdefault("event_id", f"evt_{uuid4().hex}")
+        event.setdefault("timestamp", time.time())
         with self._listeners_lock:
             listeners = list(self._listeners)
         for listener in listeners:
@@ -1572,8 +1670,20 @@ class Runner:
                 logger.exception("runner stream listener failed")
 
     def _emit_manager_lifecycle(self, event: dict[str, Any] | str, **details: Any) -> None:
+        """Only business progress is public; storage/pool details stay in logs."""
         payload = dict(event) if isinstance(event, dict) else {"event": event, **details}
-        self._publish({"kind": "runner_lifecycle", "runner_id": self.runner_id, "mode_id": self.mode_id, "permission_mode": self.permission_mode, "agent_name": self.root_agent_name, "agent_id": self.root_agent_id, "agent_role": self.config.root_binding.role, "lifecycle_event": payload})
+        if payload.get("scope") != "workflow":
+            logger.debug("manager_lifecycle %s", payload)
+            return
+        agent_id = str(payload.pop("agent_id", None) or payload.get("owner_agent_id") or self.root_agent_id)
+        try:
+            managed = self.agent_manager.get(agent_id)
+        except KeyError:
+            return
+        round_id = payload.pop("round_id", managed.round_checkpoint.get("round_id"))
+        step_num = payload.pop("step_num", getattr(managed.instance, "_active_step_num", None))
+        self.agent_manager._emit_round_event(managed, {"kind": "workflow_progress", "data": payload,
+            "round_id": round_id, "step_num": step_num})
 
 
 __all__ = ["Runner", "RunnerBusyError"]

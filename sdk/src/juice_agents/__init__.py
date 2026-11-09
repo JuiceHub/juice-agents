@@ -1,15 +1,21 @@
 """Juice Agents Python SDK public package."""
 
-from ._client import CronManager, Juice, RunnerManager
 from .core.runner import Runner, RunnerBusyError
+from .core.agent.contracts import (
+    RoundCancelledError,
+    RoundExecutionError,
+    RoundFailedError,
+    RoundResult,
+)
 
 __version__ = "0.1.0"
 
 __all__ = [
-    "CronManager",
-    "Juice",
+    "RoundResult",
+    "RoundExecutionError",
+    "RoundFailedError",
+    "RoundCancelledError",
     "Runner",
     "RunnerBusyError",
-    "RunnerManager",
     "__version__",
 ]

@@ -41,6 +41,7 @@ export interface WebCommandContext {
 export interface WebCommandResult {
   blocks: MessageBlock[];
   clearMessages: boolean;
+  newSession?: boolean;
   forwardMessage?: string;
   forwardAgentMode?: string;
   status?: SessionStatus;
@@ -182,7 +183,7 @@ export async function executeWebCommand(
     };
   }
   if (command === "/sessions") return { blocks: [presentSessions(await client.listSessions(baseDir))], clearMessages: false, refreshSessions: true };
-  if (command === "/clear") return { blocks: [], clearMessages: true };
+  if (command === "/clear") return { blocks: [], clearMessages: false, newSession: true };
 
   if (command === "/mode") {
     // /mode 只切执行模式；审批策略走 /permissions。

@@ -548,12 +548,11 @@ def _tavily_search_api(
 
 
 class WebSearchTool(Tool):
-    _execution_mode = "parallel_safe"
     """
     网页搜索工具。
 
     说明：
-    - engine 在初始化时配置（当前内置 duckduckgo / ddg / bing）。
+    - engine 在初始化时配置（默认 bing，另支持 duckduckgo / ddg）。
     - max_results 控制返回数量上限（会被 cap 限制以避免过大请求/解析）。
     """
 
@@ -586,7 +585,7 @@ class WebSearchTool(Tool):
     def __init__(
         self,
         *,
-        engine: str = "duckduckgo",
+        engine: str = "bing",
         timeout_s: float = DEFAULT_TIMEOUT_S,
         user_agent: str = DEFAULT_USER_AGENT,
         max_results_cap: int = DEFAULT_MAX_RESULTS_CAP,
@@ -647,7 +646,6 @@ class WebSearchTool(Tool):
 
 
 class ApiWebSearchTool(Tool):
-    _execution_mode = "parallel_safe"
     """
     需要 API key 的网页搜索工具（当前支持 Tavily / SerpAPI）。
 

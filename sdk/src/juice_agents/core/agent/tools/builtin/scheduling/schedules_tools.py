@@ -56,7 +56,6 @@ class CronCreateTool(_CronToolBase):
 
 
 class CronListTool(_CronToolBase):
-    _execution_mode = "parallel_safe"
     """List scheduled prompts."""
 
     max_observation_chars = LIST_OBSERVATION_CHARS

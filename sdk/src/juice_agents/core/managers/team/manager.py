@@ -1,4 +1,4 @@
-"""Persistent task board, inboxes, and member lifecycle for one Team run."""
+"""Persistent Team business state; AgentManager owns runtime inboxes."""
 
 from __future__ import annotations
 
@@ -14,10 +14,12 @@ from typing import Any, Callable, Iterator
 
 from juice_agents.core.registry.common.store import atomic_write_text, normalize_name
 
+from .runtime import TeamRuntime
+
 logger = logging.getLogger(__name__)
 
 
-class TeamManager:
+class TeamManager(TeamRuntime):
     """Own one Team's durable coordination state.
 
     Every operation rereads the JSON document while holding an OS file lock.
@@ -35,13 +37,17 @@ class TeamManager:
         *,
         root_name: str = "root",
         team_name: str = "default",
+        team_run_id: str | None = None,
         on_change: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
+        self._init_runtime()
         self.state_dir = Path(state_dir).expanduser().resolve()
         self.state_path = self.state_dir / "team.json"
         self._lock_path = self.state_dir / ".team.lock"
         self.root_name = normalize_name(root_name)
         self.team_name = normalize_name(team_name)
+        # The directory is stable for older callers; Runner supplies its run ID.
+        self.team_run_id = str(team_run_id or self.state_dir.name)
         self._on_change = on_change
         names = [normalize_name(name) for name in member_names]
         if len(set(names)) != len(names) or self.root_name in names:
@@ -53,6 +59,7 @@ class TeamManager:
                     "schema_version": self.SCHEMA_VERSION,
                     "root_name": self.root_name,
                     "team_name": self.team_name,
+                    "team_run_id": self.team_run_id,
                     "finished": False,
                     "finished_at": None,
                     "tasks": [],
@@ -67,6 +74,10 @@ class TeamManager:
                 state = self._read()
                 if state["root_name"] != self.root_name or state["team_name"] != self.team_name:
                     raise ValueError("Team identity differs from persisted state")
+                if team_run_id and state["team_run_id"] != team_run_id:
+                    raise ValueError("Team run differs from persisted state")
+                self.team_run_id = state["team_run_id"]
+                self._write(state)
 
     @staticmethod
     def _new_member(name: str, *, role: str, now: float, agent_name: str = "") -> dict[str, Any]:
@@ -99,6 +110,16 @@ class TeamManager:
             raise ValueError("Invalid Team state lists")
         if not isinstance(state.get("members"), list):
             raise ValueError("Invalid Team members")
+        # Import old pending records once with their existing stable message ID.
+        # Generations are frozen here, then retained by subsequent replacements.
+        state.setdefault("team_run_id", self.team_run_id)
+        members = {member["name"]: member for member in state["members"]}
+        for message in state["messages"]:
+            message.setdefault("team_run_id", state["team_run_id"])
+            target = members.get(message.get("to"), {})
+            message.setdefault("target_generation", target.get("generation", 0))
+            message.setdefault("delivery_state", "delivered" if message.get("delivered_at") is not None else "pending")
+            message.setdefault("delivery_error", "")
         return state
 
     def _write(self, state: dict[str, Any]) -> None:
@@ -121,6 +142,11 @@ class TeamManager:
                 self._on_change({"update": update, "snapshot": snapshot})
             except Exception:
                 logger.exception("Team state observer failed")
+        try:
+            self.wake()
+        except Exception:
+            # 分派失败不撤销已提交的业务操作；恢复或后续变更可重放待处理记录。
+            logger.exception("Team dispatch failed after business commit")
 
     @staticmethod
     def _find(items: list[dict[str, Any]], key: str, value: str) -> dict[str, Any]:
@@ -152,7 +178,7 @@ class TeamManager:
         state = self.snapshot()
         return not state["finished"] and (
             any(task["status"] != "completed" for task in state["tasks"])
-            or any(message["delivered_at"] is None for message in state["messages"])
+            or any(message["delivery_state"] == "pending" for message in state["messages"])
             or any(member["busy"] for member in state["members"])
         )
 
@@ -378,19 +404,25 @@ class TeamManager:
             state["messages"].append(self._new_message(
                 member_name, state["root_name"],
                 f"Task {task_id} failed for {member_name}: {task['error']}. Review with team_task_update.",
+                state=state,
             ))
             logger.warning("Team task failed: task_id=%s member=%s error=%s", task_id, member_name, error)
             return task
 
         return self._mutate({"type": "task_failed", "task_id": task_id, "member": member_name}, operation)
 
-    def recover(self) -> dict[str, Any]:
-        """Clear stale busy flags but retain claims for manual root review."""
+    def recover(self, *, preserve_claims: bool = False) -> dict[str, Any]:
+        """Clear process-local busy flags, preserving resumable Agent claims.
+
+        Runner owns round checkpoints and passes ``preserve_claims=True`` so an
+        active round (or a claim awaiting inbox handoff) continues normally.
+        Standalone callers without an Agent checkpoint retain manual review.
+        """
         def operation(state: dict[str, Any]) -> dict[str, Any]:
             for member in state["members"]:
                 member["busy"] = False
             for task in state["tasks"]:
-                if task["status"] == "in_progress" and not task["error"]:
+                if not preserve_claims and task["status"] == "in_progress" and not task["error"]:
                     task.update(
                         error="stale_on_recovery",
                         updated_at=time.time(),
@@ -398,28 +430,58 @@ class TeamManager:
                     state["messages"].append(self._new_message(
                         task["claimed_by"], state["root_name"],
                         f"Task {task['task_id']} was active during recovery. Review with team_task_update.",
+                        state=state,
                     ))
             return state
 
         return self._mutate({"type": "team_recovered"}, operation)
 
     def send_message(self, sender: str, recipient: str, text: str) -> dict[str, Any]:
-        sender, recipient = normalize_name(sender), normalize_name(recipient)
+        """Save the recipient snapshot before any observer can deliver a copy.
+
+        Broadcasts share only a broadcast ID: every target has its own message
+        ID, generation, acknowledgement and failure record. Observer failures
+        cannot roll back or suppress another recipient's durable copy.
+        """
+        sender = normalize_name(sender)
+        recipient = "*" if recipient == "*" else normalize_name(recipient)
         content = str(text or "").strip()
         if not content:
             raise ValueError("Message text is required")
         message_id = uuid.uuid4().hex
+        broadcast_id = uuid.uuid4().hex if recipient == "*" else ""
 
         def operation(state: dict[str, Any]) -> dict[str, Any]:
             self._require_open(state)
             self._member(state, sender, active=True)
-            self._member(state, recipient, active=True)
-            message = self._new_message(sender, recipient, content, message_id=message_id)
-            state["messages"].append(message)
-            logger.info("Team message queued: message_id=%s from=%s to=%s", message_id, sender, recipient)
-            return message
+            recipients = (
+                [member["name"] for member in state["members"]
+                 if member["status"] == "active" and member["name"] != sender]
+                if broadcast_id else [self._member(state, recipient, active=True)["name"]]
+            )
+            receipts = []
+            for target in recipients:
+                message = self._new_message(
+                    sender, target, content, state=state,
+                    message_id=None if broadcast_id else message_id,
+                )
+                if broadcast_id:
+                    message["broadcast_id"] = broadcast_id
+                state["messages"].append(message)
+                receipts.append(message)
+                logger.info("team_message_received team_run_id=%s message_id=%s broadcast_id=%s from=%s to=%s generation=%s",
+                            state["team_run_id"], message["message_id"], broadcast_id, sender, target, message["target_generation"])
+            return {"broadcast_id": broadcast_id, "receipts": receipts} if broadcast_id else receipts[0]
 
-        return self._mutate({"type": "message_sent", "message_id": message_id, "recipient": recipient}, operation)
+        result = self._mutate({"type": "message_sent", "message_id": message_id,
+                               "broadcast_id": broadcast_id, "recipient": recipient}, operation)
+        # Synchronous delivery observers may have recorded per-target failures.
+        # Return the latest durable receipts, rather than their pre-delivery copy.
+        messages = {item["message_id"]: item for item in self.snapshot()["messages"]}
+        if broadcast_id:
+            result["receipts"] = [messages[item["message_id"]] for item in result["receipts"]]
+            return result
+        return messages[message_id]
 
     def request_member_stop(self, member_name: str, reason: str = "") -> dict[str, Any]:
         """Queue a structured request for root; ordinary messages have no stop effect."""
@@ -434,7 +496,7 @@ class TeamManager:
             member = self._member(state, member_name, active=True)
             if member["role"] != "member":
                 raise ValueError("Only a Team member can request its own stop")
-            message = self._new_message(member_name, state["root_name"], detail, message_id=message_id)
+            message = self._new_message(member_name, state["root_name"], detail, state=state, message_id=message_id)
             message.update(kind="member_stop_request", member_name=member_name)
             state["messages"].append(message)
             logger.info("Team member stop requested: member=%s message_id=%s", member_name, message_id)
@@ -442,24 +504,47 @@ class TeamManager:
 
         return self._mutate({"type": "member_stop_requested", "member": member_name, "message_id": message_id}, operation)
 
-    @staticmethod
-    def _new_message(sender: str, recipient: str, content: str, *, message_id: str | None = None) -> dict[str, Any]:
+    def _new_message(self, sender: str, recipient: str, content: str, *, state: dict[str, Any], message_id: str | None = None) -> dict[str, Any]:
         now = time.time()
         return {
             "message_id": message_id or uuid.uuid4().hex,
+            "team_run_id": state["team_run_id"],
+            "target_generation": self._member(state, recipient)["generation"],
             "from": sender,
             "to": recipient,
             "text": content,
             "created_at": now,
             "timestamp": now,
             "delivered_at": None,
+            "delivery_state": "pending",
+            "delivery_error": "",
         }
 
     def pending_messages(self, member_name: str) -> list[dict[str, Any]]:
         member_name = normalize_name(member_name)
         state = self.snapshot()
         self._member(state, member_name)
-        return [item for item in state["messages"] if item["to"] == member_name and item["delivered_at"] is None]
+        return [item for item in state["messages"] if item["to"] == member_name and item["delivery_state"] == "pending"]
+
+    def message_target_valid(self, message: dict[str, Any]) -> bool:
+        """Check the frozen identity before handing a business record to inbox."""
+        state = self.snapshot()
+        member = next((item for item in state["members"] if item["name"] == message.get("to")), None)
+        return bool(member and member["status"] == "active"
+                    and message.get("team_run_id") == state["team_run_id"]
+                    and message.get("target_generation") == member["generation"])
+
+    def mark_message_failed(self, message_id: str, error: str) -> dict[str, Any]:
+        """Retain a visible terminal delivery failure without repeatedly waking."""
+        def operation(state: dict[str, Any]) -> dict[str, Any]:
+            message = self._find(state["messages"], "message_id", message_id)
+            if message["delivery_state"] == "pending":
+                message.update(delivery_state="failed", delivery_error=str(error), failed_at=time.time())
+                logger.error("team_delivery_failed team_run_id=%s message_id=%s recipient=%s error=%s",
+                             state["team_run_id"], message_id, message["to"], error)
+            return message
+
+        return self._mutate({"type": "message_delivery_failed", "message_id": message_id}, operation)
 
     def ack_messages(self, member_name: str, message_ids: list[str] | tuple[str, ...]) -> list[dict[str, Any]]:
         """Confirm delivery after the caller has saved the receiving session step."""
@@ -480,7 +565,11 @@ class TeamManager:
                 message = owned[message_id]
                 if message["delivered_at"] is None:
                     message["delivered_at"] = now
+                    message["delivery_state"] = "delivered"
+                    message["delivery_error"] = ""
                     changed.append(deepcopy(message))
+                    logger.info("team_message_acknowledged team_run_id=%s message_id=%s member=%s",
+                                state["team_run_id"], message_id, member_name)
             if not changed:
                 return []
             self._write(state)
@@ -522,6 +611,9 @@ class TeamManager:
                 raise ValueError("Cannot restart Team root")
             if member["busy"]:
                 raise ValueError("Cannot restart a busy Team member")
+            for message in state["messages"]:
+                if message["to"] == name and message["delivery_state"] == "pending":
+                    message.update(delivery_state="failed", delivery_error="target_generation_changed", failed_at=time.time())
             member.update(status="active", busy=False, generation=member["generation"] + 1, updated_at=time.time())
             logger.info("Team member restarted: member=%s generation=%d", name, member["generation"])
             return member
@@ -542,12 +634,16 @@ class TeamManager:
             # Preserve undelivered content, but make it actionable after the
             # recipient is closed. Root can inspect and acknowledge redirects.
             for message in state["messages"]:
-                if message["to"] == name and message["delivered_at"] is None:
-                    message.update(
-                        to=state["root_name"],
-                        original_recipient=name,
-                        redirected_at=time.time(),
-                    )
+                if message["to"] == name and message["delivery_state"] == "pending":
+                    if message.get("broadcast_id"):
+                        message.update(delivery_state="failed", delivery_error="target_closed", failed_at=time.time())
+                    else:
+                        message.update(
+                            to=state["root_name"],
+                            target_generation=self._member(state, state["root_name"])["generation"],
+                            original_recipient=name,
+                            redirected_at=time.time(),
+                        )
             # A closed member's unfinished claims remain visible for root
             # review. Pending tasks keep their frozen eligibility list.
             for task in state["tasks"]:
@@ -578,7 +674,7 @@ class TeamManager:
                 raise ValueError("Only Team root can finish the Team")
             if any(item["status"] != "completed" for item in state["tasks"]):
                 raise ValueError("Team has unfinished tasks")
-            if any(item["delivered_at"] is None for item in state["messages"]):
+            if any(item["delivery_state"] == "pending" for item in state["messages"]):
                 raise ValueError("Team has pending messages")
             if any(item["busy"] for item in state["members"] if item["name"] != requester):
                 raise ValueError("Team has active member calls")

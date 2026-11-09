@@ -11,12 +11,15 @@
 from __future__ import annotations
 
 import logging
+import asyncio
+import inspect
 import threading
 from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 
 from juice_agents.core.config.context import ConfigurationContext
+from juice_agents.core.agent.contracts import RoundCancelledError
 from juice_agents.core.registry.workflows import WorkflowMetadata, WorkflowRegistry
 from juice_agents.core.workflow.context import WorkflowContext
 from juice_agents.core.workflow.types import (
@@ -24,6 +27,9 @@ from juice_agents.core.workflow.types import (
     WorkflowBuildContext,
     WorkflowConfig,
 )
+
+from juice_agents.core.runner.execution.async_bridge import run_async
+from juice_agents.core.runner.execution.async_io import blocking, cancel_and_drain
 
 logger = logging.getLogger(__name__)
 
@@ -56,61 +62,102 @@ class WorkflowRunManager:
         self.owner_agent_name = str(owner_agent_name or "")
         self._lifecycle_callback = lifecycle_callback
 
-    def call(
+    def call(self, workflow: str | WorkflowMetadata, args: dict[str, Any],
+             config: dict[str, Any] | None = None, **kwargs: Any) -> dict[str, Any]:
+        return run_async(self.acall(workflow, args, config, **kwargs))
+
+    async def acall(
         self,
         workflow: str | WorkflowMetadata,
         args: dict[str, Any],
         config: dict[str, Any] | None = None,
         *,
         owner_agent_name: str = "",
+        owner_agent_id: str = "",
+        round_id: str | None = None,
+        step_num: int | None = None,
         cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
-        """同步执行一次 workflow，返回 ``{"result", "artifacts_dir", "stats"}``。
+        """异步执行一次 workflow，返回 ``{"result", "artifacts_dir", "stats"}``。
 
         传入 metadata（例如工具权限检查时拿到的那一份）会绑定其源码哈希：
-        脚本在审批后被改写则拒绝执行。异常原样抛出，由调用方决定如何呈现。
+        脚本在审批后被改写则拒绝执行。业务异常原样抛出；调用方取消/超时
+        统一报告 Workflow 控制异常，不受内部 Agent 的响应顺序影响。
         """
 
         if not isinstance(args, dict):
             raise ValueError("workflow args 必须为 object")
-        meta = self.registry.validate(workflow)
-        run_config = WorkflowConfig.from_any(config)
-        run_fn = self.registry.instantiate(meta)
-        artifacts_dir = self.workflows_dir / f"{meta.name}-{uuid4().hex[:12]}"
-        build = WorkflowBuildContext(
-            config_context=self.config_context,
-            workspace_dir=self.config_context.workspace_dir,
-            runner_id=self.runner_id,
-            artifacts_dir=artifacts_dir,
-            agent_dispatcher=self.agent_dispatcher,
-            owner_agent_name=str(owner_agent_name or self.owner_agent_name),
-            cancel_event=cancel_event or threading.Event(),
-        )
-        ctx = WorkflowContext(
-            build,
-            name=meta.name,
-            declared_tools=meta.tools,
-            read_only=meta.read_only,
-            config=run_config,
-            lifecycle_callback=lambda event: self._emit(
-                str(event.get("event") or ""),
-                workflow_name=meta.name,
-                **{key: value for key, value in event.items() if key != "event"},
-            ),
-        )
-        self._emit("workflow_started", workflow_name=meta.name)
-        logger.info("workflow call started: workflow=%s", meta.name)
+        def prepare():
+            meta = self.registry.validate(workflow)
+            run_config = WorkflowConfig.from_any(config)
+            run_fn = self.registry.instantiate(meta)
+            workflow_call_id = uuid4().hex
+            artifacts_dir = self.workflows_dir / f"{meta.name}-{workflow_call_id[:12]}"
+            build = WorkflowBuildContext(
+                config_context=self.config_context,
+                workspace_dir=self.config_context.workspace_dir,
+                runner_id=self.runner_id,
+                artifacts_dir=artifacts_dir,
+                agent_dispatcher=self.agent_dispatcher,
+                owner_agent_name=str(owner_agent_name or self.owner_agent_name),
+                owner_agent_id=str(owner_agent_id or ""),
+                workflow_call_id=workflow_call_id,
+                round_id=round_id,
+                step_num=step_num,
+                cancel_event=cancel_event or threading.Event(),
+            )
+            ctx = WorkflowContext(
+                build,
+                name=meta.name,
+                declared_tools=meta.tools,
+                read_only=meta.read_only,
+                config=run_config,
+                lifecycle_callback=lambda event: self._emit(
+                    str(event.get("event") or ""),
+                    workflow_name=meta.name,
+                    **{key: value for key, value in event.items() if key != "event"},
+                ),
+            )
+            identity = {"workflow_name": meta.name, "workflow_call_id": workflow_call_id, "call_id": workflow_call_id,
+                        "owner_agent_id": build.owner_agent_id, "owner_agent_name": build.owner_agent_name,
+                        "round_id": round_id, "step_num": step_num}
+            return ctx, run_fn, build, identity
+
+        ctx, run_fn, build, identity = await blocking(prepare)
+        meta_name = str(identity["workflow_name"])
+        await blocking(self._emit, "workflow_started", **identity)
+        logger.info("workflow call started: workflow=%s", meta_name)
+        async def execute_script():
+            if inspect.iscoroutinefunction(run_fn):
+                return await run_fn(ctx, dict(args))
+            result = await blocking(run_fn, ctx, dict(args), on_cancel=ctx.cancel)
+            return await result if inspect.isawaitable(result) else result
+
+        operation = asyncio.create_task(execute_script())
         try:
-            result = run_fn(ctx, dict(args))
+            while not operation.done():
+                ctx.check_control()
+                await asyncio.wait((operation,), timeout=0.05)
+            try:
+                result = await operation
+            except RoundCancelledError:
+                # 子 Agent 可能先观察到调用方令牌；对外仍报告 Workflow 的
+                # 取消/超时类型，避免调度时序改变同一次操作的异常契约。
+                ctx.check_control()
+                raise
+            ctx.check_control()
         except BaseException as exc:
-            self._emit("workflow_failed", workflow_name=meta.name, detail=str(exc))
-            logger.warning("workflow call failed: workflow=%s error=%s", meta.name, exc)
+            ctx.cancel()
+            await cancel_and_drain(operation)
+            await asyncio.gather(operation, return_exceptions=True)
+            await blocking(self._emit, "workflow_failed", **identity, detail=str(exc))
+            logger.warning("workflow call failed: workflow=%s error=%s", meta_name, exc)
             raise
-        self._emit("workflow_completed", workflow_name=meta.name)
-        logger.info("workflow call completed: workflow=%s agent_calls=%d", meta.name, ctx.agent_calls)
+        await blocking(self._emit, "workflow_completed", **identity)
+        logger.info("workflow call completed: workflow=%s agent_calls=%d", meta_name, ctx.agent_calls)
         return {
             "result": result,
-            "artifacts_dir": str(artifacts_dir) if artifacts_dir.exists() else "",
+            "artifacts_dir": str(build.artifacts_dir) if await blocking(build.artifacts_dir.exists) else "",
             "stats": {"agent_calls": ctx.agent_calls},
         }
 

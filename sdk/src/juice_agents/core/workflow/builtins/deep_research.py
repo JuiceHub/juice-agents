@@ -432,7 +432,7 @@ def verify_citations(report: str, verified_claims: list[ClaimRecord]) -> tuple[s
     return report, limitations
 
 
-def _plan_topics(
+async def _plan_topics(
     ctx: Any,
     *,
     question: str,
@@ -446,7 +446,7 @@ def _plan_topics(
     limits: dict[str, int],
 ) -> list[dict[str, Any]]:
     max_topics = _topic_limit(complexity=complexity, configured_limit=limits["max_concurrent_research_units"])
-    planned = ctx.agent(
+    planned = await ctx.aagent(
         {
             "brief": brief,
             "gaps": gaps,
@@ -485,7 +485,7 @@ def _plan_topics(
     return topics
 
 
-def run(ctx: Any, args: dict[str, Any]) -> dict[str, Any]:
+async def run(ctx: Any, args: dict[str, Any]) -> dict[str, Any]:
     if "source" in args:
         raise ValueError("deep_research 使用 source_mode，不支持 source")
     question = str(args.get("question") or "").strip()
@@ -497,7 +497,7 @@ def run(ctx: Any, args: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"source_mode 不支持 {source_mode!r}，可选值: {sorted(SOURCE_MODES)}")
     limits = _limits(args)
 
-    brief = ctx.agent(
+    brief = await ctx.aagent(
         {"question": question, "requested_scope": scope, "source_mode": source_mode},
         instructions=RESEARCH_BRIEF_PROMPT,
         schema=BRIEF_SCHEMA,
@@ -520,7 +520,7 @@ def run(ctx: Any, args: dict[str, Any]) -> dict[str, Any]:
     rounds = 0
     for round_number in range(1, limits["max_research_rounds"] + 1):
         rounds = round_number
-        round_topics = _plan_topics(
+        round_topics = await _plan_topics(
             ctx,
             question=question,
             source_mode=source_mode,
@@ -534,9 +534,9 @@ def run(ctx: Any, args: dict[str, Any]) -> dict[str, Any]:
         )
         topics.extend(round_topics)
         research_results.extend(
-            ctx.parallel(
+            await ctx.aparallel(
                 [
-                    lambda topic=topic: ctx.agent(
+                    lambda topic=topic: ctx.aagent(
                         {"topic": topic, "brief": brief, "known_gaps": list(voted["gaps"])},
                         instructions=RESEARCHER_PROMPT,
                         tools=_research_tools(str(topic["source_mode"])),
@@ -554,7 +554,7 @@ def run(ctx: Any, args: dict[str, Any]) -> dict[str, Any]:
         if not voted["gaps"]:
             break
 
-    written = ctx.agent(
+    written = await ctx.aagent(
         {
             "question": question,
             "brief": brief,
@@ -582,11 +582,11 @@ def run(ctx: Any, args: dict[str, Any]) -> dict[str, Any]:
         "unverified": voted["unverified_claims"],
     }
     artifacts = {
-        "report": str(ctx.artifact("report.md", report + "\n")),
-        "sources": str(ctx.artifact("sources.json", merged["sources"])),
-        "claims": str(ctx.artifact("claims.json", claims_payload)),
+        "report": str(await ctx.aartifact("report.md", report + "\n")),
+        "sources": str(await ctx.aartifact("sources.json", merged["sources"])),
+        "claims": str(await ctx.aartifact("claims.json", claims_payload)),
         "debug": str(
-            ctx.artifact(
+            await ctx.aartifact(
                 "debug.json",
                 {"question": question, "source_mode": source_mode, "rounds": rounds, "topics": topics, "gaps": voted["gaps"]},
             )

@@ -17,7 +17,6 @@ test("safe command tokens bypass a busy stream and existing ordinary FIFO", () =
     "/permissions accept",
     "/help",
     "/status",
-    "/clear",
     "/exit",
   ]) {
     assert.equal(getCommandExecutionPolicy(input), "immediate", input);
@@ -42,6 +41,7 @@ test("ordinary messages, reconfiguration, and execution commands stay FIFO", () 
     "/mode accept",
     "/model doubao_seed",
     "/config",
+    "/clear",
     "/agent-type codeact",
     "$workflow:deep_research compare APIs",
   ]) {

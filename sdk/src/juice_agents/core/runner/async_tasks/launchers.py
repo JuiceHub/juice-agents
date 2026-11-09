@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import os
+import asyncio
+
+from ..execution.async_io import blocking
+import signal
 import subprocess
-import time
 from pathlib import Path
 from typing import Any, Callable, TYPE_CHECKING
 
@@ -44,7 +48,7 @@ class _AsyncTaskLaunchersMixin:
         with self._lock:
             self._store_async_task_locked(async_task)
             self._persist_locked()
-        future = self._executor.submit(self._run_async_task, async_task_id, runner, summary_builder)
+        future = self._submit_async_task(async_task_id, runner, summary_builder)
         with self._lock:
             self._futures[async_task_id] = future
         return {
@@ -64,49 +68,60 @@ class _AsyncTaskLaunchersMixin:
         cwd: str,
         timeout_seconds: float | None,
         max_observation_chars: int | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        def _runner(async_task: InternalAsyncTaskState, output_dir: Path) -> dict[str, Any]:
+        async def _runner(async_task: InternalAsyncTaskState, output_dir: Path) -> dict[str, Any]:
             async_task_id = str(async_task.get("async_task_id") or output_dir.name)
-            timeout_at = (
-                time.time() + float(timeout_seconds)
-                if timeout_seconds is not None and float(timeout_seconds) > 0
-                else None
-            )
-            process = subprocess.Popen(
-                command,
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                cwd=cwd or None,
-            )
-            with self._lock:
-                self._processes[async_task_id] = process
+            creation = asyncio.create_task(asyncio.create_subprocess_shell(
+                command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                cwd=cwd or None, start_new_session=os.name == "posix",
+            ))
+            cancelled = False
+            # 创建进程的 await 也可能被取消；先拿到句柄，finally 才有能力回收它。
+            while True:
+                try:
+                    process = await asyncio.shield(creation)
+                    break
+                except asyncio.CancelledError:
+                    cancelled = True
+            communication = asyncio.create_task(process.communicate())
+
+            def signal_group(force: bool) -> None:
+                try:
+                    if os.name == "posix":
+                        os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
+                    elif process.returncode is None:
+                        process.kill() if force else process.terminate()
+                except ProcessLookupError:
+                    pass
+
             try:
-                while process.poll() is None:
-                    if self.is_async_task_cancelled(async_task_id):
-                        process.terminate()
-                        try:
-                            process.wait(timeout=1.0)
-                        except subprocess.TimeoutExpired:
-                            process.kill()
-                        break
-                    if timeout_at is not None and time.time() >= timeout_at:
-                        process.kill()
-                        raise subprocess.TimeoutExpired(command, timeout_seconds)
-                    time.sleep(0.05)
-                stdout, stderr = process.communicate(timeout=1.0)
+                if cancelled:
+                    raise asyncio.CancelledError
+                try:
+                    stdout, stderr = await asyncio.wait_for(asyncio.shield(communication), timeout_seconds)
+                except TimeoutError as exc:
+                    raise subprocess.TimeoutExpired(command, timeout_seconds) from exc
             finally:
-                with self._lock:
-                    self._processes.pop(async_task_id, None)
+                if not communication.done():
+                    signal_group(False)
+                    try:
+                        await asyncio.wait_for(asyncio.shield(communication), 1.0)
+                    except TimeoutError:
+                        signal_group(True)
+                        await communication
+                    finally:
+                        # shell 可能先退出；仍需回收忽略 TERM 的后代。
+                        signal_group(True)
+            stdout, stderr = stdout.decode(errors="replace"), stderr.decode(errors="replace")
             payload = {
                 "stdout": (stdout or "").rstrip("\n"),
                 "stderr": (stderr or "").rstrip("\n"),
                 "returncode": process.returncode,
             }
-            self._write_stream_log(output_dir, "stdout.log", payload["stdout"])
-            self._write_stream_log(output_dir, "stderr.log", payload["stderr"])
-            self._append_async_task_output(
+            await blocking(self._write_stream_log, output_dir, "stdout.log", payload["stdout"])
+            await blocking(self._write_stream_log, output_dir, "stderr.log", payload["stderr"])
+            await blocking(self._append_async_task_output,
                 output_dir,
                 {
                     "async_task_id": async_task_id,
@@ -123,11 +138,12 @@ class _AsyncTaskLaunchersMixin:
             description=f"shell background command: {command}",
             extra_fields={
                 "metadata": {
+                    **dict(metadata or {}),
                     "command": command,
                     "cwd": cwd,
                     "timeout_seconds": timeout_seconds,
                     "cancel_requested": False,
-                    "max_observation_chars": max_observation_chars,
+                    "max_observation_chars": max_observation_chars or dict(metadata or {}).get("max_observation_chars"),
                 }
             },
             runner=_runner,

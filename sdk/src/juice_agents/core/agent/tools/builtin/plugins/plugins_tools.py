@@ -23,7 +23,6 @@ logger = logging.getLogger(__name__)
 class PluginsListTool(Tool):
     """List plugin metadata without exposing any mutation path."""
 
-    _execution_mode = "parallel_safe"
     max_observation_chars = LIST_OBSERVATION_CHARS
     name = "plugins_list"
     is_read_only = True
@@ -65,7 +64,6 @@ class PluginsListTool(Tool):
 class PluginViewTool(Tool):
     """Read an enabled plugin manifest or one safe UTF-8 file."""
 
-    _execution_mode = "parallel_safe"
     max_observation_chars = CONTENT_OBSERVATION_CHARS
     name = "plugin_view"
     is_read_only = True

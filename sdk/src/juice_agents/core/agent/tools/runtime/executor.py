@@ -6,25 +6,27 @@ and hand the actions to this module.  Keeping permission checks, scheduling,
 normalisation and audit records here prevents the two agent loops from slowly
 developing different semantics again.
 
-The implementation uses a small, bounded worker pool for adjacent
-``PARALLEL_SAFE`` actions.  Serial and barrier actions run on the caller's
-thread after waiting for all prior work, which also preserves the
-manager-request thread affinity used by Runner.  A resource-key lock is held for the complete
-call, so two tools that touch the same logical resource never overlap.
+Foreground actions use a bounded worker pool by default. Dependencies belong
+in separate agent steps. Explicit barriers and main-thread constraints preserve
+the request-thread affinity needed by Runner; background calls return launch
+receipts. Resource locks protect shared state for the complete foreground call.
 """
 
 from __future__ import annotations
 
 from contextlib import nullcontext
+
+from juice_agents.core.runner.execution.async_io import blocking
 from dataclasses import dataclass, field
 from enum import Enum
 import asyncio
 import concurrent.futures
 import inspect
 import logging
+import queue
 import threading
 import time
-from typing import Any, Callable, Iterable, Literal, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Literal, Mapping, Sequence
 from uuid import uuid4
 
 from juice_agents.core.runner.execution.cancellation import StreamCancelled
@@ -37,8 +39,7 @@ logger = logging.getLogger(__name__)
 class ToolExecutionMode(str, Enum):
     """Scheduling mode selected by a tool, never by the language model."""
 
-    SERIAL = "serial"
-    PARALLEL_SAFE = "parallel_safe"
+    FOREGROUND = "foreground"
     BARRIER = "barrier"
     BACKGROUND = "background"
 
@@ -52,7 +53,7 @@ class ToolExecutionPolicy:
     based on validated business arguments.
     """
 
-    mode: ToolExecutionMode
+    mode: ToolExecutionMode = ToolExecutionMode.FOREGROUND
     thread_affinity: Literal["any", "main"] = "any"
     resource_keys: tuple[str, ...] = ()
 
@@ -103,6 +104,9 @@ class ToolExecutionContext:
     sandbox: Any | None = None
     background_launcher: Callable[..., Any] | None = None
     cancel_event: threading.Event | None = None
+    # Public starts describe actual invocation, after resource acquisition.
+    # The engine's iterator still reports admission attempts for internal audit.
+    on_tool_start: Callable[[Any, str], None] | None = None
     cancel_token: threading.Event | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -227,10 +231,10 @@ class ToolExecutionResult:
         """Resolved framework-owned scheduling mode.
 
         Guard failures can happen before policy resolution. They still need a
-        stable serial audit projection rather than a nullable field.
+        stable foreground audit projection rather than a nullable field.
         """
 
-        return self.policy.mode if self.policy is not None else ToolExecutionMode.SERIAL
+        return self.policy.mode if self.policy is not None else ToolExecutionMode.FOREGROUND
 
     @property
     def thread_affinity(self) -> str:
@@ -296,6 +300,21 @@ class ToolExecutionResult:
 # ``ToolExecutionRecord`` is a descriptive alias used by audit adapters; the
 # canonical public type remains ``ToolExecutionResult``.
 ToolExecutionRecord = ToolExecutionResult
+
+
+@dataclass(frozen=True, slots=True)
+class ToolExecutionEvent:
+    """A scheduled call, followed by its terminal result when available.
+
+    Start events have no result. The framework allocates ``call_id`` before
+    preflight so start, terminal result and persisted audit share one identity,
+    including calls denied or cancelled without invoking the tool. Completion
+    events may arrive out of action order; ``action.order`` retains model order.
+    """
+
+    action: ResolvedToolAction
+    call_id: str
+    result: ToolExecutionResult | None = None
 
 
 class _ToolExecutionEngine:
@@ -372,6 +391,11 @@ class _ToolExecutionEngine:
             max_workers=self.max_workers,
             thread_name_prefix="juice-tool",
         )
+        # 异步宿主没有 request thread。同步屏障工具和 CodeAct 固定到同一线程，
+        # 保持浏览器/解释器的线程亲和性；等待普通工具的协程不占用此线程。
+        self._affinity_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="juice-tool-affinity",
+        )
         self._call_counter = 0
         self._call_counter_lock = threading.Lock()
         self._records: list[ToolExecutionResult] = []
@@ -410,6 +434,7 @@ class _ToolExecutionEngine:
         if not self._closed:
             self._closed = True
             self._pool.shutdown(wait=wait, cancel_futures=True)
+            self._affinity_pool.shutdown(wait=wait, cancel_futures=True)
 
     def __enter__(self) -> "_ToolExecutionEngine":
         return self
@@ -708,6 +733,11 @@ class _ToolExecutionEngine:
                 limit_cm,
                 action.tool.execution_context_scope(context),
             ):
+                # A call can be cancelled while waiting for a shared resource.
+                # Recheck after acquiring it so queued mutations never run late.
+                context.check_cancelled()
+                if context.on_tool_start is not None:
+                    context.on_tool_start(action, call_id)
                 if context.background_launcher is not None and policy.mode is ToolExecutionMode.BACKGROUND:
                     raw = self._call_background_launcher(
                         context.background_launcher,
@@ -901,15 +931,22 @@ class _ToolExecutionEngine:
         *,
         context: ToolExecutionContext | None = None,
     ) -> list[ToolExecutionResult]:
-        """Execute one or more actions, returning records in action order."""
+        """Consume the shared streaming scheduler and return action order."""
 
+        results = [
+            event.result
+            for event in self.execute_streaming(actions, context=context)
+            if event.result is not None
+        ]
+        return sorted(results, key=lambda item: item.order)
+
+    def _prepare_batch(self, actions, context):
+        """同步/异步调度共用预检，每个 guard 与 policy 恰好执行一次。"""
         if isinstance(actions, (ResolvedToolAction, Tool)) or isinstance(actions, Mapping):
             action_list: Sequence[Any] = [actions]
         else:
             action_list = actions
         resolved = self.resolve_actions(action_list, context=context)
-        if not resolved:
-            return []
 
         # Preflight every action once, before scheduling any worker.  Apart
         # from avoiding duplicate permission prompts, this guarantees that a
@@ -942,76 +979,144 @@ class _ToolExecutionEngine:
                 continue
             prepared.append((index, action, action_context, call_id, policy))
 
-        futures: dict[int, concurrent.futures.Future[ToolExecutionResult]] = {}
+        logger.debug(
+            "执行工具批次: actions=%s admitted=%s workers=%s",
+            len(resolved), len(prepared), self.max_workers,
+        )
+        return resolved, prepared, result_slots
 
-        def wait_prior() -> None:
-            if not futures:
-                return
-            for index in sorted(futures):
-                if index not in result_slots:
-                    result_slots[index] = futures[index].result()
-            futures.clear()
+    def execute_streaming(
+        self,
+        actions: Sequence[ResolvedToolAction | Mapping[str, Any] | Tool] | ResolvedToolAction | Mapping[str, Any] | Tool,
+        *,
+        context: ToolExecutionContext | None = None,
+        on_complete: Callable[[list[ToolExecutionResult]], None] | None = None,
+    ) -> Iterator[ToolExecutionEvent]:
+        """Schedule a step, yielding starts and completions on the caller thread.
 
-        cursor = 0
-        while cursor < len(prepared):
-            index, action, action_context, call_id, policy = prepared[cursor]
-            if (
-                policy.mode is ToolExecutionMode.PARALLEL_SAFE
-                and policy.thread_affinity == "any"
-            ):
-                # Adjacent parallel-safe actions form one bounded batch.  A
-                # gap caused by a denied/skipped action is still a model action
-                # boundary, so only the next prepared item can join when its
-                # original index is adjacent.
-                batch = [(index, action, action_context, call_id, policy)]
-                batch_cursor = cursor + 1
-                expected_index = index + 1
-                while batch_cursor < len(prepared):
-                    candidate = prepared[batch_cursor]
-                    if candidate[0] != expected_index:
-                        break
-                    candidate_policy = candidate[4]
-                    if (
-                        candidate_policy.mode is not ToolExecutionMode.PARALLEL_SAFE
-                        or candidate_policy.thread_affinity != "any"
-                    ):
-                        break
-                    batch.append(candidate)
-                    batch_cursor += 1
-                    expected_index += 1
-                # A denied/skipped/serial action creates a hard model-order
-                # boundary. Do not let a later parallel batch overlap an
-                # earlier batch merely because both happen to be safe.
-                if futures:
-                    wait_prior()
-                for batch_index, batch_action, batch_context, batch_call_id, batch_policy in batch:
-                    futures[batch_index] = self._pool.submit(
-                        self._invoke,
-                        batch_action,
-                        batch_policy,
-                        batch_context,
-                        batch_call_id,
-                    )
-                cursor = batch_cursor
-                continue
+        All guards run before workers are started. Only explicit barriers,
+        main-thread affinity and background launches divide the worker batches;
+        a denied action cannot impose a dependency on its valid neighbours.
+        Closing the stream drains submitted calls before handing control back.
+        """
 
-            # SERIAL, BARRIER, main-affine and BACKGROUND calls all establish a
-            # scheduling boundary.  Waiting here prevents later work from
-            # overlapping a barrier or an ordinary serial mutation.
-            wait_prior()
-            if self._cancelled(action_context):
-                result_slots[index] = self._skipped_result(action, call_id)
-            else:
-                result_slots[index] = self._invoke(action, policy, action_context, call_id)
-            cursor += 1
+        resolved, prepared, result_slots = self._prepare_batch(actions, context)
+        # Completion callbacks only enqueue futures. All result processing and
+        # event delivery stay on the request thread, including barrier tools.
+        pending: dict[concurrent.futures.Future[ToolExecutionResult], int] = {}
+        completed: queue.SimpleQueue[concurrent.futures.Future[ToolExecutionResult]] = queue.SimpleQueue()
+        prepared_by_index = {item[0]: item for item in prepared}
 
-        wait_prior()
-        final_results = list(result_slots.values())
-        final_results.sort(key=lambda item: item.order)
+        def wait_prior() -> Iterator[ToolExecutionEvent]:
+            while pending:
+                future = completed.get()
+                index = pending.pop(future)
+                result_slots[index] = future.result()
+                result = result_slots[index]
+                yield ToolExecutionEvent(resolved[index], result.call_id, result)
+
+        try:
+            for index, action in enumerate(resolved):
+                item = prepared_by_index.get(index)
+                if item is None:
+                    # Denials/skips still need paired UI events but do not
+                    # prevent other admitted calls in this step from overlapping.
+                    result = result_slots[index]
+                    yield ToolExecutionEvent(action, result.call_id)
+                    yield ToolExecutionEvent(action, result.call_id, result)
+                    continue
+                _, _, action_context, call_id, policy = item
+                if policy.mode is ToolExecutionMode.FOREGROUND and policy.thread_affinity == "any":
+                    yield ToolExecutionEvent(action, call_id)
+                    future = self._pool.submit(self._invoke, action, policy, action_context, call_id)
+                    pending[future] = index
+                    future.add_done_callback(completed.put)
+                    continue
+
+                # Framework barriers and background launch receipts must run
+                # on the request thread. The task behind a receipt keeps running.
+                yield from wait_prior()
+                yield ToolExecutionEvent(action, call_id)
+                result_slots[index] = (
+                    self._skipped_result(action, call_id)
+                    if self._cancelled(action_context)
+                    else self._invoke(action, policy, action_context, call_id)
+                )
+                yield ToolExecutionEvent(action, call_id, result_slots[index])
+            yield from wait_prior()
+        finally:
+            # A consumer can close a stream between events. Finish collecting
+            # already submitted work so no call leaks into a later agent step,
+            # and make every terminal record available for Manager persistence.
+            for _event in wait_prior():
+                pass
+            self._complete_batch(result_slots, on_complete)
+
+    def _complete_batch(self, result_slots, on_complete):
+        final_results = sorted(result_slots.values(), key=lambda item: item.order)
         with self._records_lock:
             self._records.extend(final_results)
             self._records.sort(key=lambda item: item.order)
-        return final_results
+        if on_complete is not None:
+            on_complete(final_results)
+
+    async def aexecute_streaming(self, actions, *, context=None, on_complete=None):
+        """原生调度等待；仅同步 guard、工具本体和落盘占用工作线程。
+
+        每个 Agent 有自己的有界工具池。父工具同步等待子 Agent 时，不持有
+        全局流线程；子 Agent 的模型与工具仍可前进。屏障使用稳定的亲和线程。
+        """
+        resolved, prepared, result_slots = await blocking(
+            self._prepare_batch, actions, context, executor=self._affinity_pool,
+        )
+        prepared_by_index = {item[0]: item for item in prepared}
+        pending = {}
+        completed = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+
+        async def wait_prior():
+            while pending:
+                future = await completed.get()
+                index = pending.pop(future)
+                result = future.result()
+                result_slots[index] = result
+                yield ToolExecutionEvent(resolved[index], result.call_id, result)
+
+        try:
+            for index, action in enumerate(resolved):
+                item = prepared_by_index.get(index)
+                if item is None:
+                    result = result_slots[index]
+                    yield ToolExecutionEvent(action, result.call_id)
+                    yield ToolExecutionEvent(action, result.call_id, result)
+                    continue
+                _, _, action_context, call_id, policy = item
+                if policy.mode is ToolExecutionMode.FOREGROUND and policy.thread_affinity == "any":
+                    yield ToolExecutionEvent(action, call_id)
+                    future = loop.run_in_executor(self._pool, self._invoke, action, policy, action_context, call_id)
+                    pending[future] = index
+                    future.add_done_callback(completed.put_nowait)
+                    continue
+                async for event in wait_prior():
+                    yield event
+                yield ToolExecutionEvent(action, call_id)
+                result = (self._skipped_result(action, call_id) if self._cancelled(action_context)
+                          else await blocking(self._invoke, action, policy, action_context, call_id,
+                                              executor=self._affinity_pool))
+                result_slots[index] = result
+                yield ToolExecutionEvent(action, call_id, result)
+            async for event in wait_prior():
+                yield event
+        except (asyncio.CancelledError, GeneratorExit):
+            for _, _, action_context, _, _ in prepared:
+                if action_context.cancel_event is not None:
+                    action_context.cancel_event.set()
+            raise
+        finally:
+            # 关闭流也必须收集已提交的工具并记账，不能让副作用越过回合边界。
+            async for _event in wait_prior():
+                pass
+            await blocking(self._complete_batch, result_slots, on_complete)
 
     # Common adapter aliases.  They intentionally delegate to one code path.
     run = execute
@@ -1023,6 +1128,7 @@ class _ToolExecutionEngine:
 __all__ = [
     "ToolExecutionMode",
     "ToolExecutionPolicy",
+    "ToolExecutionEvent",
     "ToolExecutionContext",
     "ToolExecutionCancelled",
     "ResolvedToolAction",

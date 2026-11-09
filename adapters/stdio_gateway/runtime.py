@@ -5,11 +5,14 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterator
+from typing import TYPE_CHECKING, Any, Callable
 
-from juice_agents import Juice
+from juice_agents import Runner
+from juice_agents.core.runner.execution.async_bridge import run_async
+from juice_agents.core.runner.execution.async_io import blocking
 from juice_agents.core.runner.types.ask import AskHandler
 from juice_agents.core.registry.plugins import PluginRegistry
 from juice_agents.core.registry.skills import SkillRegistry
@@ -22,9 +25,10 @@ from juice_agents.core.config.model_catalog import (
 )
 from juice_agents.core.runner.types.definitions import normalize_agent_mode, normalize_permission_mode
 from juice_agents.core.config.context import ConfigurationContext
+from juice_agents.core.config.image_model_catalog import list_runtime_image_models, load_runtime_image_model_config
 from juice_agents.core.registry import AgentRegistry
 from juice_agents.core.registry.agents.types import normalize_agent_type
-from juice_agents.core.runner import Runner, RunnerBusyError, mode_registry
+from juice_agents.core.runner import RunnerBusyError, mode_registry
 from juice_agents.core.memory.config import get_memory_config, set_workspace_memory_feature
 from juice_agents.core.memory.store import MemoryStore
 from juice_agents.core.config.runtime_config import read_runtime_config, update_workspace_config
@@ -81,6 +85,7 @@ class DirectRunnerRuntime:
         agent_mode: str | None = None,
         agent_type: str | None = None,
         ask_handler: AskHandler | None = None,
+        event_handler: Callable[[dict[str, Any]], None] | None = None,
         worktree: str | None = None,
     ) -> None:
         self.base_dir = Path(base_dir).expanduser().resolve()
@@ -104,12 +109,9 @@ class DirectRunnerRuntime:
         # may create this adapter solely for a cold workspace lookup; runtime
         # launch selections stay in memory even after a Runner starts.
         self._ask_handler = ask_handler
+        self._event_handler = event_handler
+        self._runner_unsubscribe: Callable[[], None] | None = None
         self.worktree = None if worktree is None else str(worktree)
-        self._juice = Juice(
-            workspace=self.base_dir,
-            runtime_config_path=self.runtime_config_path,
-            ask_handler=ask_handler,
-        )
         self._runner: Any | None = None
         # Strategy configuration is transport-local. In particular, reward
         # model objects must never be written into the workspace configuration.
@@ -121,15 +123,83 @@ class DirectRunnerRuntime:
         self._started = False
         self._resumed = False
         self._mode_before_plan = "agent"
-        # Queued cancellation stays transport-local; active cancellation is
-        # forwarded to Runner.request_stop_stream().
-        self._cancel_requested = threading.Event()
+
+    @classmethod
+    def for_session_replacement(
+        cls,
+        previous: DirectRunnerRuntime | None,
+        *,
+        preserve_launch_configuration: bool,
+        **options: Any,
+    ) -> DirectRunnerRuntime:
+        """Prepare a replacement without closing the current session.
+
+        `/clear` retains the current workspace's launch choices; explicit
+        request fields still take precedence. Resume keeps the persisted
+        session's execution settings, but needs the same catalog source and
+        transport-local strategy/reward choices. Never transfer configuration
+        between workspaces or share a provider object between runtimes.
+        """
+
+        same_workspace = previous is not None and previous.base_dir == Path(
+            options.get("base_dir", ".")
+        ).expanduser().resolve()
+        if same_workspace:
+            retained = ["runtime_config_path"]
+            if preserve_launch_configuration:
+                retained.extend((
+                    "permission_mode", "agent_mode", "agent_type", "model_name", "model_effort",
+                ))
+            for name in retained:
+                if options.get(name) is None:
+                    options[name] = getattr(previous, name)
+
+        replacement = cls(**options)
+        if same_workspace:
+            strategy = previous.pending_strategy_configuration
+            reward_model = previous.pending_reward_model_configuration
+            if strategy is not None:
+                replacement.switch_strategy(strategy)
+            if reward_model is not None:
+                replacement.configure_reward_model(reward_model)
+        return replacement
 
     def _install_ask_handler(self) -> None:
         """把 adapter 提供的 ask handler 绑定到当前 Runner。"""
 
         if self._runner is not None and hasattr(self._runner, "set_ask_handler"):
             self._runner.set_ask_handler(self._ask_handler)
+
+    def _bind_runner(self) -> None:
+        """Bind transport callbacks before enabling recovered or autonomous work.
+
+        A subscription belongs to one concrete Runner. The identity guard also
+        rejects an already queued callback after a session switch.
+        """
+        runner = self._runner
+        if runner is None:
+            return
+        self._install_ask_handler()
+        handler = getattr(self, "_event_handler", None)
+        subscribe = getattr(runner, "subscribe_events", None)
+        if handler is not None and callable(subscribe):
+            def deliver(event: dict[str, Any]) -> None:
+                if self._runner is runner:
+                    handler(event)
+            self._runner_unsubscribe = subscribe(deliver)
+
+    def activate_session(self, runner_id: str) -> dict[str, Any]:
+        """Start scheduling only after the client installed its initial snapshot.
+
+        The concrete identity rejects delayed activation from a previous view.
+        Binding subscriptions in create/resume is safe, but recovered messages
+        must remain dormant until the view is ready to consume their events.
+        """
+        if self._runner is None or str(self._runner.runner_id) != runner_id:
+            raise ValueError(f"Session is no longer active: {runner_id}")
+        self._runner.activate()
+        logger.info("gateway_session_activated runner_id=%s", runner_id)
+        return {"runner_id": runner_id, "activated": True}
 
     def start_session(self) -> SessionStatus:
         """Create a new runner for the requested permission mode and agent mode."""
@@ -145,7 +215,7 @@ class DirectRunnerRuntime:
             self._close_runner(reason="runner_switch")
         self._runner = self._create_declarative_runner()
         self._install_strategy_handler()
-        self._install_ask_handler()
+        self._bind_runner()
         self._started = False
         self._resumed = False
         return self.describe_session()
@@ -171,7 +241,8 @@ class DirectRunnerRuntime:
     def _create_declarative_runner(self) -> Runner:
         """Create one Runner from a serializable configuration template only."""
 
-        return self._juice.runners.create(
+        return Runner.create(
+            base_dir=self.base_dir,
             permission_mode=self.permission_mode,
             runner_config=mode_registry.resolve(self.agent_mode),
             runtime_config_path=self.runtime_config_path,
@@ -189,13 +260,29 @@ class DirectRunnerRuntime:
 
         if self._runner is None:
             return
-        close = getattr(self._runner, "close", None)
-        if callable(close):
-            close()
-            return
-        stop = getattr(self._runner, "stop", None)
-        if callable(stop):
-            stop(reason=reason)
+        runner = self._runner
+        try:
+            # Keep the observer bound while close drains started work: users
+            # must receive the matching model/tool/step and round boundaries.
+            close = getattr(runner, "close", None)
+            if callable(close):
+                close()
+            else:
+                stop = getattr(runner, "stop", None)
+                if callable(stop):
+                    stop(reason=reason)
+        finally:
+            # Even a failed close cannot leave a closed Runner as the current
+            # destination. Late queued callbacks fail the identity guard after
+            # this point, including when replacement construction later fails.
+            if self._runner is runner:
+                self._runner = None
+            self._started = False
+            self._resumed = False
+            unsubscribe = getattr(self, "_runner_unsubscribe", None)
+            self._runner_unsubscribe = None
+            if callable(unsubscribe):
+                unsubscribe()
 
     def _rebuild_live_runner(self, *, reason: str) -> None:
         """Recreate a live Runner after a static workspace setting changed."""
@@ -205,7 +292,7 @@ class DirectRunnerRuntime:
         self._close_runner(reason=reason)
         self._runner = self._create_declarative_runner()
         self._install_strategy_handler()
-        self._install_ask_handler()
+        self._bind_runner()
         self._started = True
         self._resumed = False
         logger.info(
@@ -318,8 +405,9 @@ class DirectRunnerRuntime:
         if self._runner is not None:
             self._close_runner(reason="runner_switch")
         try:
-            self._runner = self._juice.runners.resume(
+            self._runner = Runner.resume(
                 runner_id=runner_id,
+                base_dir=self.base_dir,
                 runtime_config_path=self.runtime_config_path,
                 runtime_overrides=self._runtime_overrides(),
             )
@@ -330,7 +418,7 @@ class DirectRunnerRuntime:
         self._started = True
         self._resumed = True
         self._install_strategy_handler()
-        self._install_ask_handler()
+        self._bind_runner()
         self.permission_mode = str(
             getattr(self._runner, "permission_mode", self.permission_mode) or self.permission_mode
         )
@@ -357,41 +445,41 @@ class DirectRunnerRuntime:
         class_name = type(root).__name__.lower()
         return "codeact" if "codeact" in class_name else self.agent_type
 
-    def stream_message(
+    def stream_message(self, task: str, **kwargs: Any) -> dict[str, Any]:
+        return run_async(self.astream_message(task, **kwargs))
+
+    async def astream_message(
         self,
         task: str,
         *,
         agent_mode_override: str | None = None,
         cancel_check: Callable[[], bool] | None = None,
-    ) -> Iterator[Any]:
-        """Send a task to the active runner and yield raw action steps back to the caller."""
-        if self._runner is None:
-            self.start_session()
-        # 每次新一轮 stream 入口清空 cancel 标志，避免上一轮的取消影响新会话。
-        self._cancel_requested.clear()
-        if cancel_check is not None and cancel_check():
-            return
+    ) -> dict[str, Any]:
+        """Wait for the committed result; the permanent subscription owns events.
 
-        # A temporary mode returns only after its stream has reached an idle
-        # boundary.  Do not rebuild in ``finally``: cancellation or a tool
-        # failure must leave the durable Runner available for inspection.
+        This request never republishes a stream or attaches transcript copies.
+        A rejected request or transport error therefore cannot fabricate a
+        terminal event. The Manager is the only owner of round completion.
+        """
+        if self._runner is None:
+            await blocking(self.start_session)
         override_mode = (
             None if agent_mode_override is None else normalize_agent_mode(agent_mode_override)
         )
         if override_mode is not None and override_mode != self.agent_mode:
             original_agent_mode = self.agent_mode
             original_agent_type = self.agent_type
-            self.switch_agent_mode(override_mode, agent_type=self.agent_type)
-            yield from self.stream_message(task, cancel_check=cancel_check)
-            self.switch_agent_mode(original_agent_mode, agent_type=original_agent_type)
-            return
+            await blocking(self.switch_agent_mode, override_mode, agent_type=self.agent_type)
+            try:
+                result = await self.astream_message(task, cancel_check=cancel_check)
+            finally:
+                await blocking(self.switch_agent_mode, original_agent_mode, agent_type=original_agent_type)
+            return result
 
-        # The SDK owns capability parsing, goal continuation, and async-task
-        # notification wakeups. This adapter only forwards events.
-        for event in self._runner.stream(task):
-            yield event
+        result = await self._runner.arun_round(task, cancel_check=cancel_check)
         self._started = True
-        self._apply_approved_plan_exit()
+        await blocking(self._apply_approved_plan_exit)
+        return {"done": True, "result": result.to_dict()}
 
     def _apply_approved_plan_exit(self) -> bool:
         """Apply an approved plan exit only after the stream has settled."""
@@ -426,7 +514,7 @@ class DirectRunnerRuntime:
     def describe_session(self) -> SessionStatus:
         """Expose the active runner state in a transport-friendly snapshot."""
         if self._runner is None:
-            raise RuntimeError("当前还没有活动会话")
+            return self._preview_session_status()
         runtime_model = self._resolve_runtime_model_metadata()
         runner_permission_mode = str(
             getattr(self._runner, "permission_mode", self.permission_mode) or self.permission_mode
@@ -527,6 +615,21 @@ class DirectRunnerRuntime:
             workspace_dir=self.base_dir,
         )
 
+    def list_image_models(self) -> dict[str, Any]:
+        """Read the image-only catalog without creating clients or workspace files."""
+
+        payload = read_runtime_config(self.runtime_config_path, workspace_dir=self.base_dir)
+        image = payload.get("image", {})
+        if not isinstance(image, dict):
+            raise ValueError("image 必须为映射")
+        return {
+            "image_models": list_runtime_image_models(
+                runtime_config_path=self.runtime_config_path, workspace_dir=self.base_dir,
+            ),
+            "current_image_model_name": str(image.get("model_name") or ""),
+            "image_enabled": bool(image.get("enabled", False)),
+        }
+
     def list_available_agents(
         self,
         *,
@@ -557,18 +660,6 @@ class DirectRunnerRuntime:
             mode_id=selected_mode,
             runner=self._runner,
         )
-
-    def _image_generation_enabled(self) -> bool:
-        """Read merged image.enabled for catalog and live runner reconfiguration."""
-
-        try:
-            payload = read_runtime_config(self.runtime_config_path, workspace_dir=self.base_dir)
-        except Exception:
-            return False
-        raw_image = payload.get("image") if isinstance(payload, dict) else {}
-        if not isinstance(raw_image, dict):
-            return False
-        return bool(raw_image.get("enabled", False))
 
     def list_async_tasks(self, *, statuses: set[str] | None = None) -> list[dict[str, Any]]:
         """Return async task snapshots from the active runner."""
@@ -604,11 +695,11 @@ class DirectRunnerRuntime:
             "max_lines": int(max_lines),
         }
 
-    def describe_agent_sessions(self) -> dict[str, Any]:
+    def describe_agent_sessions(self, agent_id: str | None = None) -> dict[str, Any]:
         """Return Manager-owned Agent transcript snapshots from the active runner."""
         if self._runner is None:
             raise RuntimeError("No active session")
-        return dict(self._runner.describe_agent_sessions())
+        return dict(self._runner.describe_agent_sessions(agent_id=agent_id))
 
     def send_agent_message(self, *, agent_name: str, message: str) -> dict[str, Any]:
         """Queue a user control message for an acquired Agent."""
@@ -714,7 +805,7 @@ class DirectRunnerRuntime:
         )
 
     def set_browser_config(self, *, enabled: bool) -> dict[str, Any]:
-        """Persist browser tool visibility and reload the active prebuilt runner."""
+        """Persist browser tool visibility and reload the active Runner."""
 
         normalized_enabled = bool(enabled)
 
@@ -743,34 +834,57 @@ class DirectRunnerRuntime:
             "runner_id": "" if self._runner is None else str(getattr(self._runner, "runner_id", "") or ""),
         }
 
-    def set_image_config(self, *, enabled: bool) -> dict[str, Any]:
-        """Persist image generation tool visibility and reload the active prebuilt runner."""
+    def set_image_config(
+        self, *, enabled: bool | None = None, model_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Validate an image-only patch before saving it at an idle Runner boundary.
 
-        normalized_enabled = bool(enabled)
+        Choosing a model does not enable generation. Disabled selections only
+        need valid catalog metadata; enabling also resolves credentials before
+        anything reaches disk. The Runner gate spans persistence and reload so
+        a concurrent message cannot begin halfway through the change.
+        """
 
-        def _update(current: dict[str, Any]) -> dict[str, Any]:
-            raw_image = current.get("image")
-            image = dict(raw_image) if isinstance(raw_image, dict) else {}
-            image["enabled"] = normalized_enabled
-            current["image"] = image
-            return current
-
-        update_workspace_config(self.base_dir, _update)
-        logger.info(
-            "更新 workspace image 配置: base_dir=%s enabled=%s",
-            self.base_dir,
-            normalized_enabled,
-        )
-        if self._runner is not None:
-            self._rebuild_live_runner(reason="image_config_changed")
-            logger.info(
-                "image 配置变更后已热重装 runner: runner_id=%s enabled=%s",
-                getattr(self._runner, "runner_id", ""),
-                normalized_enabled,
+        if enabled is not None and not isinstance(enabled, bool):
+            raise ValueError("enabled must be a boolean")
+        if model_name is not None and (not isinstance(model_name, str) or not model_name.strip()):
+            raise ValueError("model_name must be a non-empty image catalog name")
+        status = self.list_image_models()
+        selected_name = status["current_image_model_name"] if model_name is None else model_name.strip()
+        selected_enabled = status["image_enabled"] if enabled is None else enabled
+        patch: dict[str, Any] = {}
+        if model_name is not None:
+            if selected_name not in {item["model_name"] for item in status["image_models"]}:
+                raise ValueError(f"Unknown image model: {selected_name}. Use /image_model to list available models.")
+            patch["model_name"] = selected_name
+        if enabled is not None:
+            patch["enabled"] = enabled
+        if selected_enabled and patch:
+            load_runtime_image_model_config(
+                model_name=selected_name, runtime_config_path=self.runtime_config_path,
+                workspace_dir=self.base_dir,
             )
+
+        if patch:
+            boundary = self._runner.configuration_boundary() if self._runner is not None else nullcontext()
+            with boundary:
+                update_workspace_config(
+                    self.base_dir,
+                    lambda current: {
+                        **current, "image": {**dict(current.get("image") or {}), **patch},
+                    },
+                )
+                if self._runner is not None:
+                    self._runner.reconfigure(reload_config=True)
+                    if self._reward_model is not None:
+                        from juice_agents.core.runner.execution.async_bridge import run_async
+
+                        run_async(self._reward_model.reload_config(self._runner.config_context), owner=self._reward_model)
+            logger.info("image_config_updated model=%s enabled=%s", selected_name, selected_enabled)
         return {
-            "enabled": normalized_enabled,
-            "runner_id": "" if self._runner is None else str(getattr(self._runner, "runner_id", "") or ""),
+            "enabled": selected_enabled,
+            "image_model_name": selected_name,
+            "runner_id": "" if self._runner is None else str(self._runner.runner_id),
         }
 
     def _skill_registry(self) -> SkillRegistry:
@@ -1279,31 +1393,26 @@ class DirectRunnerRuntime:
 
     def stop_session(self, *, source: str = "user_exit") -> dict[str, bool]:
         """Stop active backend work for the current runner."""
-        if self._runner is not None and callable(getattr(self._runner, "stop", None)):
-            self._runner.stop(reason=source)
+        self._close_runner(reason=source)
         return {"stopped": True}
 
-    def request_cancel_stream(self, *, reason: str = "user_cancelled") -> dict[str, bool]:
-        """请求中断当前正在进行的 stream_message; cooperative，仅在 step 边界生效。
+    def request_cancel_stream(
+        self, *, reason: str = "user_cancelled", runner_id: str = "", round_id: str = "",
+    ) -> dict[str, bool]:
+        """Cancel one round while preserving the Runner and independent async tasks.
 
-        当前没有 active runner、或 runner 不支持中断时返回 cancelled=False；
-        否则同时设置 runtime / runner 上的中断标志并返回 cancelled=True，由
-        后续 step 边界与 _continue_active_goal 分别协作退出。
+        Explicit identities never fall back to the current round: a delayed
+        cancellation from an old view must not interrupt a newer round.
         """
-
         if self._runner is None:
             return {"cancelled": False}
-        request = getattr(self._runner, "request_stop_stream", None)
-        if not callable(request):
+        if runner_id and runner_id != str(self._runner.runner_id):
             return {"cancelled": False}
-        request(reason=reason)
-        # runtime 自己也维护标志，避免依赖 runner.is_stop_requested 的 truthy 行为
-        # （MagicMock 默认 truthy；把判断收敛在 runtime 侧更稳）。
-        cancel_requested = getattr(self, "_cancel_requested", None)
-        if not callable(getattr(cancel_requested, "set", None)):
-            self._cancel_requested = threading.Event()
-        self._cancel_requested.set()
-        return {"cancelled": True}
+        target = round_id or getattr(self._runner, "active_round_id", "")
+        cancel = getattr(self._runner, "cancel_round", None)
+        if not isinstance(target, str) or not target or not callable(cancel):
+            return {"cancelled": False}
+        return {"cancelled": bool(cancel(target, reason=reason))}
 
     def _resolve_runtime_model_metadata(self) -> dict[str, Any]:
         try:
@@ -1376,6 +1485,26 @@ class DirectRunnerRuntime:
         if isinstance(value, (dict, list)):
             return json.dumps(value, ensure_ascii=False, indent=2)
         return str(value)
+
+
+def ask_execution_cancelled(runner: Any | None, request: dict[str, Any]) -> bool:
+    """Read the owning execution token while an adapter waits for an Ask answer.
+
+    A request token may be cancelled after the message was submitted but before
+    the UI received round_start. Polling the Manager-owned token closes that
+    race and also observes inherited synchronous-child cancellation without
+    disturbing independent background requests.
+    """
+    agent_id = str(request.get("agent_id") or "")
+    if runner is None or not agent_id:
+        return False
+    if request.get("runner_id") and str(request["runner_id"]) != str(runner.runner_id):
+        return True
+    try:
+        managed = runner.agent_manager.get(agent_id)
+    except (AttributeError, KeyError):
+        return True
+    return bool(managed.cancel_event.is_set())
 
 
 def _read_log_tail(path: Path, *, max_lines: int) -> str:

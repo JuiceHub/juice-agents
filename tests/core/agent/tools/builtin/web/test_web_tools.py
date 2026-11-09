@@ -1,12 +1,14 @@
 """Web search and browser automation tool contracts."""
 
 import json
+import sys
 import tempfile
 import threading
+import types
 import unittest
 from textwrap import dedent
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from urllib.error import URLError
 
 from juice_agents.core.config.context import ConfigurationContext
@@ -90,7 +92,7 @@ class WebSearchToolTests(unittest.TestCase):
 """
         mock_urlopen.return_value = _DummyResponse(html)
 
-        tool = WebSearchTool(timeout_s=0.1, max_results_cap=10)
+        tool = WebSearchTool(engine="duckduckgo", timeout_s=0.1, max_results_cap=10)
         out = tool.forward(query="hello", max_results=1)
         self.assertNotIn("engine", out)
         self.assertEqual(out["query"], "hello")
@@ -121,7 +123,7 @@ class WebSearchToolTests(unittest.TestCase):
 """
         mock_urlopen.side_effect = [URLError("fail"), _DummyResponse(html)]
 
-        tool = WebSearchTool(timeout_s=0.1, max_results_cap=10)
+        tool = WebSearchTool(engine="duckduckgo", timeout_s=0.1, max_results_cap=10)
         out = tool.forward(query="hello", max_results=1)
         self.assertEqual(len(out["results"]), 1)
         self.assertEqual(mock_urlopen.call_count, 2)
@@ -132,7 +134,7 @@ class WebSearchToolTests(unittest.TestCase):
         self.assertIn("https://lite.duckduckgo.com/lite/", second_req.full_url)
 
     @patch("juice_agents.core.agent.tools.builtin.web.web_search_tools.urlopen")
-    def test_bing_rss_parse_and_limit(self, mock_urlopen):
+    def test_default_bing_rss_parse_and_limit(self, mock_urlopen):
         rss = b"""
 <rss version="2.0">
   <channel>
@@ -151,8 +153,9 @@ class WebSearchToolTests(unittest.TestCase):
 """
         mock_urlopen.return_value = _DummyResponse(rss)
 
-        tool = WebSearchTool(engine="bing", timeout_s=0.1, max_results_cap=10)
+        tool = WebSearchTool(timeout_s=0.1, max_results_cap=10)
         out = tool.forward(query="hello", max_results=5)
+        self.assertEqual(mock_urlopen.call_args.args[0].full_url, "https://www.bing.com/search?format=rss&q=hello")
         self.assertEqual(out["query"], "hello")
         self.assertEqual(len(out["results"]), 2)
         self.assertEqual(out["results"][0]["title"], "Example 1")
@@ -161,6 +164,9 @@ class WebSearchToolTests(unittest.TestCase):
         self.assertEqual(out["results"][1]["title"], "Example 2")
         self.assertEqual(out["results"][1]["url"], "https://example.org")
         self.assertEqual(out["results"][1]["snippet"], "Snippet 2")
+
+        explicit_bing = WebSearchTool(engine="bing", max_results_cap=10)
+        self.assertEqual(len(explicit_bing.forward(query="hello", max_results=1)["results"]), 1)
 
     def test_api_web_search_missing_api_key_raises(self):
         with tempfile.TemporaryDirectory() as td:
@@ -357,7 +363,7 @@ class _FakeBrowserSession:
 
 class _FakeLayout:
     def __init__(self):
-        self.browser_screenshots_dir = Path("/tmp/project/.juice/runners/run123/browser_screenshots")
+        self.browser_screenshots_dir = Path("/tmp/project/.juice/sessions/run123/browser_screenshots")
 
 
 class _FakeRunnerContext:
@@ -444,7 +450,7 @@ class BrowserToolsTests(unittest.TestCase):
 
         out = tool.forward(full_page=True)
 
-        self.assertTrue(out["path"].startswith("/tmp/project/.juice/runners/run123/browser_screenshots/"))
+        self.assertTrue(out["path"].startswith("/tmp/project/.juice/sessions/run123/browser_screenshots/"))
         self.assertTrue(out["path"].endswith(".png"))
         self.assertEqual(mock_get_session.call_args.args[0], "run123:browser")
 
@@ -523,6 +529,65 @@ class BrowserToolsTests(unittest.TestCase):
         finally:
             session_module._BROWSER_SESSIONS.clear()
             session_module._BROWSER_SESSIONS.update(old_sessions)
+
+    def test_workspace_browser_executable_updates_session_before_launch(self):
+        import juice_agents.core.agent.tools.builtin.web.browser.session as session_module
+
+        playwright = MagicMock()
+        sync_api = types.ModuleType("playwright.sync_api")
+        sync_api.sync_playwright = MagicMock()  # type: ignore[attr-defined]
+        sync_api.sync_playwright.return_value.start.return_value = playwright  # type: ignore[attr-defined]
+        with tempfile.TemporaryDirectory() as workspace:
+            config_path = Path(workspace) / ".juice" / "config.yaml"
+            config_path.parent.mkdir()
+            config_path.write_text("browser:\n  executable_path: /opt/chrome/first\n", encoding="utf-8")
+            owner = _FakeOwnerAgent()
+            owner._declared_config_context = ConfigurationContext.from_workspace(workspace)
+            tool = BrowserSearchTool()
+            tool.bind_owner_agent(owner)
+
+            # Keep the session registry isolated and defer startup until after the edit.
+            with patch.object(session_module, "_BROWSER_SESSIONS", {}):
+                session = tool._session()
+                self.assertEqual(session.executable_path, "/opt/chrome/first")
+                config_path.write_text("browser:\n  executable_path: /opt/chrome/updated\n", encoding="utf-8")
+                self.assertIs(tool._session(), session)
+
+                session._new_context = MagicMock(  # type: ignore[method-assign]
+                    side_effect=lambda: setattr(session, "_context", MagicMock())
+                )
+                session._register_page = MagicMock()  # type: ignore[method-assign]
+                with patch.dict(sys.modules, {"playwright.sync_api": sync_api}):
+                    session._ensure_started()
+
+                self.assertEqual(playwright.chromium.launch.call_args.kwargs["executable_path"], "/opt/chrome/updated")
+
+    def test_browser_launch_uses_configured_executable_only_when_provided(self):
+        """A local Chromium path is forwarded without changing default launches."""
+
+        for executable_path in (None, "/opt/chromium/chrome"):
+            with self.subTest(executable_path=executable_path):
+                playwright = MagicMock()
+                sync_api = types.ModuleType("playwright.sync_api")
+                sync_api.sync_playwright = MagicMock()  # type: ignore[attr-defined]
+                sync_api.sync_playwright.return_value.start.return_value = playwright  # type: ignore[attr-defined]
+                kwargs = {} if executable_path is None else {"executable_path": executable_path}
+                session = PlaywrightBrowserSession(**kwargs)
+                session._context = MagicMock()
+                session._new_context = MagicMock()  # type: ignore[method-assign]
+                session._register_page = MagicMock()  # type: ignore[method-assign]
+
+                # Isolate startup from a real Playwright driver and browser.
+                with patch.dict(sys.modules, {"playwright.sync_api": sync_api}):
+                    session._ensure_started()
+
+                launch_kwargs = {
+                    "headless": True,
+                    "args": ["--no-sandbox", "--disable-dev-shm-usage"],
+                }
+                if executable_path is not None:
+                    launch_kwargs["executable_path"] = executable_path
+                playwright.chromium.launch.assert_called_once_with(**launch_kwargs)
 
     def test_search_detailed_runs_on_browser_owner_thread(self):
         class _FakePage:

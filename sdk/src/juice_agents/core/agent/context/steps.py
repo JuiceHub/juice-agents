@@ -52,6 +52,7 @@ class TaskStep(AgentStep):
     task: str
     task_images: List[ImageType] = field(default_factory=list)
     attachments: List[dict[str, Any]] = field(default_factory=list)
+    round_id: str = ""
 
     def to_messages(self, *, include_reasoning_in_context: bool = False) -> List[dict[str, Any]]:
         content = [text_block(f"<task>{self.task}</task>")]
@@ -88,6 +89,9 @@ class ActionStep(AgentStep):
     # submitted/failed 结束当前 round；continue（含空 actions 步）进入下一次模型调用。
     round_outcome: Literal["continue", "submitted", "failed"] = "continue"
     output: Any = None
+    # Durable identity distinguishes repeated step numbers across rounds.
+    round_id: str = ""
+    step_id: str = ""
 
     def __setattr__(self, name: str, value: Any) -> None:
         if name == "model_output":
@@ -194,8 +198,14 @@ class ActionEvent:
 
     event_type 决定 data 的内容：
     - "thinking": data 包含 thought, model_output, reasoning_content
-    - "tool_start": data 包含 tool_name, tool_args, tool_index
-    - "tool_end": data 包含 tool_name, tool_index, observation, error, execution_time
+    - "tool_start": data 包含 tool_name, tool_args, tool_index, call_id，供
+      并发调用关联及审计对照；身份由框架分配，不接受模型指定。
+    - "tool_end": data 包含 tool_name, tool_args, tool_index, status,
+      observation, error, execution_time，以及开始事件的 call_id；ReAct 另含 task_id。
+      status 保留 completed/background/failed/denied/cancelled 的执行结果语义。
+      CodeAct 的 Python 事件描述整个代码块，使用独立于内部工具的 call_id。
+      工具错误属于结束结果与 tool_calls，不额外写入 ActionStep.error。
+    - "model_start" / "model_end": model_call_id、purpose 和模型身份；结束含 status/error/usage。
     - "step_complete": data 包含完整的 ActionStep
     - "candidates": 内部事件，包含 steps、scores、selected_index 和生成信息；
       由 Manager 消费并持久化，不进入用户可见事件流。

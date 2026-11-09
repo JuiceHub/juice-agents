@@ -1,4 +1,4 @@
-"""Examples launch as ordinary files and submit useful default tasks to Juice."""
+"""Examples launch as ordinary files and submit useful default tasks to Runner."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from unittest.mock import Mock
 import pytest
 
 from examples import _runtime
-from juice_agents import Juice
+from juice_agents import Runner
 from juice_agents.core.agent.builtin.configs import get_general_config
 from juice_agents.core.config.context import ConfigurationContext
 from juice_agents.core.registry.agents import registry as registry_module
@@ -68,7 +68,7 @@ def test_direct_file_help_from_external_directory(scenario, tmp_path):
 def test_direct_file_without_arguments_submits_its_demo(monkeypatch, capsys, scenario, tmp_path):
     """Execute the real file entry while replacing only the public SDK boundary.
 
-    The fake accepts the current RunnerManager API rather than arbitrary
+    The fake accepts the public Runner API rather than arbitrary
     keywords, so removed builder/group/mode arguments cannot slip through.
     No model is loaded and no real workspace files are generated.
     """
@@ -78,7 +78,7 @@ def test_direct_file_without_arguments_submits_its_demo(monkeypatch, capsys, sce
 
     def stream(task):
         tasks.append(task)
-        yield {"kind": "round_end", "outcome": "submitted", "output": "demo complete"}
+        yield {"kind": "round_end", "data": {"result": {"round_id": "r1", "status": "completed", "output": "demo complete"}}}
 
     runner = SimpleNamespace(
         runner_id="default-demo",
@@ -87,21 +87,17 @@ def test_direct_file_without_arguments_submits_its_demo(monkeypatch, capsys, sce
         _root=lambda: SimpleNamespace(instance=SimpleNamespace(tools={})),
         stream=stream,
         stop=Mock(),
+        set_ask_handler=Mock(),
     )
     create_calls = []
 
-    def create(*, permission_mode="default", runner_config=None, team_name=None):
-        create_calls.append((permission_mode, runner_config, team_name))
+    def create(*, base_dir, permission_mode="default", runner_config=None, team_name=None):
+        create_calls.append((permission_mode, runner_config, team_name, base_dir))
         return runner
 
-    juice = SimpleNamespace(runners=SimpleNamespace(create=create, resume=Mock()))
-    captured_workspaces = []
-
-    def juice_from_args(_args, *, workspace, **_kwargs):
-        captured_workspaces.append(workspace)
-        return juice
-
-    monkeypatch.setattr(_runtime, "_juice_from_args", juice_from_args)
+    resume = Mock()
+    monkeypatch.setattr(_runtime.Runner, "create", create)
+    monkeypatch.setattr(_runtime.Runner, "resume", resume)
     monkeypatch.setattr(sys, "argv", [str(entry)])
     namespace = runpy.run_path(str(entry), run_name="__main__")
 
@@ -111,14 +107,15 @@ def test_direct_file_without_arguments_submits_its_demo(monkeypatch, capsys, sce
         if scenario == "agent_research" else default_task
     )
     assert tasks == [expected_task]
-    assert captured_workspaces == [entry.parent]
+    assert create_calls[0][3] == entry.parent
     assert create_calls[0][1] == {
         "agent_research": "agent",
         "agent_evolution": "agent",
         "group_operations": "group",
         "team_delivery": "team",
     }[scenario]
-    juice.runners.resume.assert_not_called()
+    resume.assert_not_called()
+    runner.set_ask_handler.assert_called_once_with(_runtime.console_ask)
     runner.stop.assert_called_once()
     assert "demo complete" in capsys.readouterr().out
 
@@ -139,7 +136,7 @@ def test_real_sdk_initializes_scenario_policy_and_tools(monkeypatch, tmp_path, s
     monkeypatch.setattr(registry_module, "resolve_runtime_model", lambda **_kwargs: StaticModel())
     module = importlib.import_module(f"examples.{scenario}.__main__")
     mode = {"group_operations": "group", "team_delivery": "team"}.get(scenario, "agent")
-    runner = Juice(workspace=tmp_path).runners.create(runner_config=mode)
+    runner = Runner.create(base_dir=tmp_path, runner_config=mode)
     try:
         configure = {
             "agent_research": "configure_research_runner",
@@ -209,7 +206,7 @@ def test_research_demo_runs_selected_workflow_with_automatic_workflows_disabled(
 
     assert module.main([]) == "research complete"
     assert model.outputs == []
-    reports = list(tmp_path.glob(".juice/runners/*/workflows/*/report.md"))
+    reports = list(tmp_path.glob(".juice/sessions/*/workflows/*/report.md"))
     assert len(reports) == 1
     assert "[entry]" in reports[0].read_text()
     debug = json.loads((reports[0].parent / "debug.json").read_text())

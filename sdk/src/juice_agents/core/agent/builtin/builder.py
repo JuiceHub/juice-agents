@@ -7,10 +7,9 @@ from typing import Any
 
 from juice_agents.core.registry import AgentRegistry
 from juice_agents.core.registry.agents.types import AgentConfig, normalize_agent_type
-from juice_agents.core.registry.tools.types import ToolRef
+from juice_agents.core.agent.root_config import apply_root_feature_flags
 from juice_agents.core.config.context import ConfigurationContext
 from juice_agents.core.config.model_catalog import DEFAULT_RUNTIME_CONFIG_PATH
-from juice_agents.core.config.runtime_config import read_runtime_config
 from juice_agents.core.agent.tools.builtin.memory.memory_tools import (
     MemoryForgetTool,
     MemoryReadTool,
@@ -62,65 +61,6 @@ def _refresh_prompt(agent: Any) -> None:
         agent.system_prompt = agent.init_system_prompt()
         if getattr(agent, "session", None) is not None:
             agent.session.system_prompt = agent.system_prompt
-
-
-def _browser_tools_enabled(
-    *,
-    runtime_config_path: str | Path | None,
-    runtime_workspace: RuntimeWorkspace,
-) -> bool:
-    """Return the merged browser.enabled flag; missing config keeps defaults on."""
-
-    try:
-        payload = read_runtime_config(
-            runtime_config_path,
-            workspace_dir=runtime_workspace.workspace_dir,
-        )
-    except Exception:
-        return True
-    raw_browser = payload.get("browser") if isinstance(payload, dict) else {}
-    if not isinstance(raw_browser, dict):
-        return True
-    return bool(raw_browser.get("enabled", True))
-
-
-def _image_generation_enabled(
-    *,
-    runtime_config_path: str | Path | None,
-    runtime_workspace: RuntimeWorkspace,
-) -> bool:
-    """Return the merged image.enabled flag; image generation defaults off."""
-
-    try:
-        payload = read_runtime_config(
-            runtime_config_path,
-            workspace_dir=runtime_workspace.workspace_dir,
-        )
-    except Exception:
-        return False
-    raw_image = payload.get("image") if isinstance(payload, dict) else {}
-    if not isinstance(raw_image, dict):
-        return False
-    return bool(raw_image.get("enabled", False))
-
-
-def _without_browser_tools(config: AgentConfig, *, browser_enabled: bool) -> AgentConfig:
-    """Remove Playwright browser tool refs from an agent config when disabled."""
-
-    if browser_enabled:
-        return config
-    return config.copy_with(
-        tools=[tool_ref.to_dict() for tool_ref in config.tools if not tool_ref.name.startswith("browser_")]
-    )
-
-
-def _with_image_generation_tool(config: AgentConfig, *, image_enabled: bool) -> AgentConfig:
-    """Expose generate/edit image only when image.enabled is explicitly on."""
-
-    tools = [tool_ref for tool_ref in config.tools if tool_ref.name != "generate_edit_image"]
-    if image_enabled:
-        tools.append(ToolRef(name="generate_edit_image"))
-    return config.copy_with(tools=[tool_ref.to_dict() for tool_ref in tools])
 
 
 def _install_memory_capabilities(
@@ -206,19 +146,8 @@ def build_general_agent(
         model_effort=model_effort,
         juice_root=juice_root,
     )
-    browser_enabled = _browser_tools_enabled(
-        runtime_config_path=runtime_config_path,
-        runtime_workspace=runtime_workspace,
-    )
-    image_enabled = _image_generation_enabled(
-        runtime_config_path=runtime_config_path,
-        runtime_workspace=runtime_workspace,
-    )
     runtime_config = _prepare_config(
-        _with_image_generation_tool(
-            _without_browser_tools(declared_config, browser_enabled=browser_enabled),
-            image_enabled=image_enabled,
-        ),
+        apply_root_feature_flags(declared_config, factory.config_context.read_merged_config()),
         runtime_workspace=runtime_workspace,
         default_plan_base_dir=default_plan_base_dir,
     )

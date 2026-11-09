@@ -1,4 +1,4 @@
-"""End-to-end Team dispatch through Runner, AgentManager and AsyncTaskManager."""
+"""End-to-end Team business delivery through the unified Agent inbox scheduler."""
 
 from __future__ import annotations
 
@@ -75,6 +75,7 @@ def _member_session_id(runner: Runner, name: str, generation: int = 1) -> str:
 def test_team_dispatch_persists_member_session_and_acknowledges_inbox(tmp_path: Path) -> None:
     runner = Runner.create(runner_config="team", base_dir=tmp_path)
     runner.agent_manager.registry = _Registry()  # type: ignore[assignment]
+    runner.activate()
     _add_member(runner, "developer")
     manager = runner.team_manager
     assert manager is not None
@@ -99,9 +100,106 @@ def test_team_dispatch_persists_member_session_and_acknowledges_inbox(tmp_path: 
         runner.close()
 
 
+def test_team_acknowledgement_can_request_rescan_while_dispatch_waits_on_inbox(tmp_path: Path, monkeypatch) -> None:
+    """A producer callback must not invert dispatch and Agent durability locks."""
+    runner = Runner.create(runner_config="team", base_dir=tmp_path)
+    runner.agent_manager.registry = _Registry()
+    _add_member(runner, "developer")
+    runner.team_manager.stopping = True
+    runner.team_manager.send_message("root", "developer", "Deliver once")
+    runner.team_manager.stopping = False
+    held, posting, rescanned = threading.Event(), threading.Event(), threading.Event()
+    acquire = runner.team_manager.acquire_member
+
+    def observed_acquire(*args, **kwargs):
+        posting.set()
+        return acquire(*args, **kwargs)
+
+    monkeypatch.setattr(runner.team_manager, "acquire_member", observed_acquire)
+
+    def acknowledge_at_commit() -> None:
+        with runner.agent_manager._lock:
+            held.set()
+            assert posting.wait(3)
+            runner.wake_team()
+            rescanned.set()
+
+    acknowledgement = threading.Thread(target=acknowledge_at_commit, daemon=True)
+    dispatcher = threading.Thread(target=runner.wake_team, daemon=True)
+    try:
+        acknowledgement.start()
+        assert held.wait(2)
+        dispatcher.start()
+        assert rescanned.wait(3)
+        acknowledgement.join(3)
+        dispatcher.join(3)
+        assert not acknowledgement.is_alive() and not dispatcher.is_alive()
+        runner.activate()
+        _wait_for(lambda: not runner.team_manager.pending_messages("developer"))
+        managed = runner.agent_manager.get_by_name("developer")
+        assert len(managed.committed_message_ids) == 1
+    finally:
+        runner.close()
+
+
+def test_team_message_acknowledgement_preserves_busy_until_round_end(tmp_path: Path) -> None:
+    runner = Runner.create(runner_config="team", base_dir=tmp_path)
+    _add_member(runner, "developer")
+    entered, release = threading.Event(), threading.Event()
+    runner.agent_manager.registry = type("Registry", (), {
+        "instantiate": lambda self, raw, **kwargs: _BlockingAgent(str(getattr(raw, "name", raw)), entered, release),
+    })()
+    snapshots: list[dict] = []
+    runner.subscribe(lambda event: snapshots.append(event["data"]["snapshot"])
+                     if event.get("kind") == "team_update" and event.get("data", {}).get("update", {}).get("type") == "messages_acknowledged" else None)
+    try:
+        runner.activate()
+        runner.team_manager.send_message("root", "developer", "Run this message")
+        assert entered.wait(3)
+        assert not runner.team_manager.pending_messages("developer")
+        assert runner.team_manager.has_pending_work()
+        assert snapshots and next(member for member in snapshots[0]["members"] if member["name"] == "developer")["busy"]
+        release.set()
+        _wait_for(lambda: not runner.team_manager.has_pending_work())
+    finally:
+        release.set()
+        runner.close()
+
+
+def test_recovery_reconciles_final_session_before_team_business_ack(tmp_path: Path, monkeypatch) -> None:
+    """A crash after final session commit must settle the existing claim."""
+    monkeypatch.setattr(AgentRegistry, "instantiate", lambda self, raw, **kwargs: _Registry().instantiate(raw, **kwargs))
+    runner = Runner.create(runner_config="team", base_dir=tmp_path)
+    _add_member(runner, "developer")
+    try:
+        task = runner.team_manager.add_task("Finish once", eligible_members=["developer"])
+        managed = runner.agent_manager.get_by_name("developer")
+        # No scheduler activation: direct consumption simulates the session
+        # commit with its round_end business observer lost to process death.
+        original = runner.agent_manager.callbacks
+        runner.agent_manager.callbacks = __import__("dataclasses").replace(original, on_event=None)
+        runner.agent_manager.run(managed, "Finish once")
+        runner.agent_manager.callbacks = original
+        assert managed.round_checkpoint["status"] == "completed"
+        assert runner.team_manager.list_tasks()[0]["status"] == "in_progress"
+        runner_id = runner.runner_id
+    finally:
+        runner.close()
+    restored = Runner.resume(runner_id=runner_id, base_dir=tmp_path)
+    try:
+        current = restored.team_manager.list_tasks()[0]
+        assert current["task_id"] == task["task_id"]
+        assert current["status"] == "completed"
+        restored.activate()
+        assert not restored.team_manager.has_pending_work()
+    finally:
+        restored.close()
+
+
 def test_team_use_reuses_member_definition_with_a_new_isolated_board(tmp_path: Path) -> None:
     runner = Runner.create(runner_config="team", base_dir=tmp_path)
     runner.agent_manager.registry = _Registry()  # type: ignore[assignment]
+    runner.activate()
     try:
         assert [member["name"] for member in runner.team_manager.snapshot()["members"]] == ["root"]
 
@@ -135,7 +233,7 @@ def test_team_use_reuses_member_definition_with_a_new_isolated_board(tmp_path: P
 def test_failed_task_notifies_root_and_waits_for_review(tmp_path: Path) -> None:
     runner = Runner.create(runner_config="team", base_dir=tmp_path)
     _add_member(runner, "developer")
-    runner._team_stopping = True
+    runner.team_manager.stopping = True
     try:
         manager = runner.team_manager
         task = manager.add_task("Check change", eligible_members=["developer"])
@@ -158,7 +256,7 @@ def test_team_pending_work_blocks_mode_switch_and_resume_keeps_unread_inbox(tmp_
     _add_member(runner, "developer")
     manager = runner.team_manager
     assert manager is not None
-    runner._team_stopping = True
+    runner.team_manager.stopping = True
     message = manager.send_message("root", "developer", "Resume this message")
     try:
         assert "Team" in str(runner.mode_switch_block_reason())
@@ -169,6 +267,8 @@ def test_team_pending_work_blocks_mode_switch_and_resume_keeps_unread_inbox(tmp_
     monkeypatch.setattr(AgentRegistry, "instantiate", lambda self, raw, **kwargs: _Registry().instantiate(raw, **kwargs))
     resumed = Runner.resume(runner_id=runner_id, base_dir=tmp_path)
     try:
+        assert resumed.team_manager.pending_messages("developer")
+        resumed.activate()
         _wait_for(lambda: not resumed.team_manager.pending_messages("developer"))
         assert any(item["message_id"] == message["message_id"] for item in resumed.team_manager.snapshot()["messages"])
     finally:
@@ -184,6 +284,7 @@ def test_team_stop_keeps_failed_claim_for_root_review(tmp_path: Path) -> None:
     })()  # type: ignore[assignment]
     manager = runner.team_manager
     assert manager is not None
+    runner.activate()
     task = manager.add_task("Block briefly", eligible_members=["developer"])
     assert entered.wait(5.0)
     stopped = threading.Thread(target=runner.stop, kwargs={"reason": "test_stop"})
@@ -214,21 +315,21 @@ def test_team_updates_reach_serialized_runner_stream(tmp_path: Path) -> None:
     runner = Runner.create(runner_config="team", base_dir=tmp_path)
     runner.agent_manager.registry = _Registry()  # type: ignore[assignment]
     _add_member(runner, "developer")
-    runner._team_stopping = True
+    runner.team_manager.stopping = True
     try:
         runner.team_manager.add_task("Queued update", eligible_members=["developer"])
         events = [serialize_runner_stream_event(event) for event in runner.stream("inspect team")]
         update = next(
             event for event in events
-            if event["kind"] == "team_update" and event["team_event"]["update"]["type"] == "task_added"
+            if event["kind"] == "team_update" and event["data"]["update"]["type"] == "task_added"
         )
-        assert update["team_event"]["snapshot"]["tasks"][0]["title"] == "Queued update"
-        assert update["team_event"]["update"]["type"] == "task_added"
+        assert update["data"]["snapshot"]["tasks"][0]["title"] == "Queued update"
+        assert update["data"]["update"]["type"] == "task_added"
     finally:
         runner.close()
 
 
-def test_live_member_completion_update_precedes_round_end(tmp_path: Path) -> None:
+def test_live_member_completion_arrives_after_foreground_round(tmp_path: Path) -> None:
     runner = Runner.create(runner_config="team", base_dir=tmp_path)
     _add_member(runner, "developer")
     entered, resume = threading.Event(), threading.Event()
@@ -245,22 +346,23 @@ def test_live_member_completion_update_precedes_round_end(tmp_path: Path) -> Non
 
     runner.agent_manager.registry = _SchedulingRegistry()  # type: ignore[assignment]
     events: list[dict[str, Any]] = []
+    ambient: list[dict[str, Any]] = []
+    unsubscribe = runner.subscribe(ambient.append)
     worker = threading.Thread(target=lambda: events.extend(runner.stream("start team")))
     try:
         worker.start()
         assert entered.wait(5.0)
-        assert worker.is_alive()
-        resume.set()
         worker.join(5.0)
         assert not worker.is_alive()
-        kinds = [event["kind"] for event in events]
-        assert "team_update" in kinds
-        completed = next(
-            index for index, event in enumerate(events)
-            if event["kind"] == "team_update" and event["update"]["type"] == "task_completed"
-        )
-        assert completed < kinds.index("round_end")
+        assert events[-1]["kind"] == "round_end"
+        assert runner.state["status"] == "idle"
+        resume.set()
+        _wait_for(lambda: any(event.get("data", {}).get("update", {}).get("type") == "task_completed" for event in ambient))
+        completed = next(index for index, event in enumerate(ambient) if event.get("data", {}).get("update", {}).get("type") == "task_completed")
+        root_end = next(index for index, event in enumerate(ambient) if event.get("kind") == "round_end" and event.get("agent_name") == "root")
+        assert completed > root_end
     finally:
+        unsubscribe()
         resume.set()
         runner.close()
 
@@ -268,6 +370,7 @@ def test_live_member_completion_update_precedes_round_end(tmp_path: Path) -> Non
 def test_member_restart_uses_new_session_and_close_requeues_work(tmp_path: Path) -> None:
     runner = Runner.create(runner_config="team", base_dir=tmp_path)
     runner.agent_manager.registry = _Registry()  # type: ignore[assignment]
+    runner.activate()
     _add_member(runner, "developer")
     manager = runner.team_manager
     assert manager is not None
@@ -286,9 +389,9 @@ def test_member_restart_uses_new_session_and_close_requeues_work(tmp_path: Path)
         assert first["message_id"] in old_text and first["message_id"] not in new_text
         assert second["message_id"] in new_text and second["message_id"] not in old_text
 
-        runner._team_stopping = True
-        runner.wake_team = lambda: None  # type: ignore[method-assign]
-        task = manager.add_task("Review me", eligible_members=["developer"])
+        with runner.team_manager._dispatch_lock:
+            runner.team_manager.stopping = True
+            task = manager.add_task("Review me", eligible_members=["developer"])
         assert runner.close_team_member("developer")["status"] == "closed"
         queued = next(item for item in manager.list_tasks() if item["task_id"] == task["task_id"])
         assert queued["status"] == "pending"
@@ -315,7 +418,7 @@ def test_team_config_round_trip_requires_team_policy() -> None:
         raise AssertionError("Old Team config was accepted")
 
 
-def test_stop_cleans_queued_member_without_starting_its_call(tmp_path: Path) -> None:
+def test_agents_run_independently_of_async_pool_limit(tmp_path: Path) -> None:
     config = replace(mode_registry.resolve("team"), concurrency_limit=1)
     runner = Runner.create(runner_config=config, base_dir=tmp_path)
     _add_member(runner, "developer")
@@ -334,25 +437,26 @@ def test_stop_cleans_queued_member_without_starting_its_call(tmp_path: Path) -> 
     runner.agent_manager.registry = _PoolRegistry()  # type: ignore[assignment]
     manager = runner.team_manager
     assert manager is not None
+    runner.activate()
     first = manager.add_task("Running", eligible_members=["developer"])
     assert entered.wait(5.0)
     second = manager.add_task("Queued", eligible_members=["researcher"])
-    _wait_for(lambda: next(item for item in manager.snapshot()["members"] if item["name"] == "researcher")["busy"])
+    _wait_for(lambda: next(item for item in manager.list_tasks() if item["task_id"] == second["task_id"])["status"] == "completed")
     stopped = threading.Thread(target=runner.stop, kwargs={"reason": "stop_queue"})
     stopped.start()
     _wait_for(lambda: runner.cancel_event.is_set())
     resume.set()
     stopped.join(5.0)
     assert not stopped.is_alive()
-    assert "researcher" not in started
+    assert "researcher" in started
     assert {item["task_id"]: item["status"] for item in manager.list_tasks()} == {
-        first["task_id"]: "in_progress", second["task_id"]: "in_progress",
+        first["task_id"]: "in_progress", second["task_id"]: "completed",
     }
-    assert all(item["error"] for item in manager.list_tasks())
+    assert next(item for item in manager.list_tasks() if item["task_id"] == first["task_id"])["error"]
     runner.close()
 
 
-def test_member_message_wakes_root_continuation_in_same_stream(tmp_path: Path) -> None:
+def test_member_message_wakes_independent_root_round(tmp_path: Path) -> None:
     runner = Runner.create(runner_config="team", base_dir=tmp_path)
     _add_member(runner, "developer")
     root_calls: list[int] = []
@@ -376,14 +480,20 @@ def test_member_message_wakes_root_continuation_in_same_stream(tmp_path: Path) -
             return _CoordinatingRoot(name) if name == "root" else _ReplyingMember(name)
 
     runner.agent_manager.registry = _ReplyRegistry()  # type: ignore[assignment]
+    ambient: list[dict[str, Any]] = []
+    unsubscribe = runner.subscribe(ambient.append)
     try:
         events = list(runner.stream("start collaboration"))
-        assert len(root_calls) == 2
-        assert [event["kind"] for event in events].count("action_step") == 2
+        _wait_for(lambda: len(root_calls) == 2 and not runner.team_manager.pending_messages("root"))
+        root_ends = [event for event in ambient if event.get("kind") == "round_end" and event.get("agent_name") == "root"]
+        _wait_for(lambda: len([event for event in ambient if event.get("kind") == "round_end" and event.get("agent_name") == "root"]) == 2)
+        assert [event["kind"] for event in events].count("step_end") == 1
+        assert len({event["round_id"] for event in ambient if event.get("kind") == "round_end" and event.get("agent_name") == "root"}) == 2
         assert not runner.team_manager.pending_messages("root")
         message_id = runner.team_manager.snapshot()["messages"][0]["message_id"]
         root_snapshot = runner.agent_manager.load_snapshot("root")
         # 检查新的 ContextTree 结构：将整个 session 转为字符串来查找 message_id
         assert message_id in str(root_snapshot["session"])
     finally:
+        unsubscribe()
         runner.close()

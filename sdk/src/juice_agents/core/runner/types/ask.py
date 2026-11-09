@@ -20,6 +20,10 @@ class AskOption(TypedDict):
 
 
 class AskRequest(TypedDict, total=False):
+    runner_id: str
+    agent_id: str
+    round_id: str | None
+    cancellation_round_id: str | None
     request_id: str
     question: str
     options: list[AskOption]

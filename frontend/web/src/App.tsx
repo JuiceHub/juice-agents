@@ -39,6 +39,7 @@ import {
   type PreviewFeature,
 } from "./lib/layout.js";
 import { executeWebCommand } from "./lib/commands.js";
+import { isClearCommand, startWebSession, webActorMessageTarget, WebComposerQueue } from "./lib/session.js";
 
 const DEFAULT_GATEWAY = import.meta.env.VITE_JUICE_WEB_GATEWAY || "http://127.0.0.1:8003";
 const PREVIEW_WIDTH_STORAGE_KEY = "juice-web.previewWidth";
@@ -81,8 +82,8 @@ export function App() {
   const baseDir = useMemo(resolveBaseDir, []);
   const client = useMemo(() => new WebGatewayClient(DEFAULT_GATEWAY), []);
   const bootstrapped = useRef(false);
-  const queueFlushInFlight = useRef(false);
   const activeRunnerIdRef = useRef("");
+  const sessionCreationRef = useRef<Promise<SessionStatus> | null>(null);
   const [bootstrap, setBootstrap] = useState<BootstrapPayload | null>(null);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [models, setModels] = useState<RuntimeModelInfo[]>([]);
@@ -118,16 +119,35 @@ export function App() {
   const [archivedLoading, setArchivedLoading] = useState(false);
   const [archivedError, setArchivedError] = useState("");
   const conversation = useConversationStream(client, {
+    runnerId: status?.runner_id ?? "",
     acceptEvent: acceptConversationEvent,
     onEvent: handleConversationEvent,
     onActiveAgentsReport: setActiveAgentsReport,
     onAskRequest: setPendingAsk,
   });
   const { messages, streaming } = conversation;
+  const composerCallbacksRef = useRef({
+    busy: false,
+    execute: sendComposerText,
+  });
+  composerCallbacksRef.current = {
+    busy: streaming || conversation.streamInFlight || runtimeSwitching,
+    execute: sendComposerText,
+  };
+  const composerQueueRef = useRef<WebComposerQueue | null>(null);
+  if (!composerQueueRef.current) {
+    composerQueueRef.current = new WebComposerQueue({
+      isBusy: () => composerCallbacksRef.current.busy,
+      execute: (text) => composerCallbacksRef.current.execute(text),
+      onChange: setQueuedMessages,
+    });
+  }
 
   const activeSession = sessions.find((session) => session.runner_id === status?.runner_id) || null;
   const selectedActor = findActorByName(actorSessionsReport, activeActorName);
-  const visibleMessages = activeActorName ? presentActiveAgent(selectedActor) : messages;
+  const visibleMessages = activeActorName
+    ? (selectedActor && conversation.agentMessages[selectedActor.agent_id]) || presentActiveAgent(selectedActor)
+    : messages;
   const threadTitle = activeActorName
     ? selectedActor?.agent_name || activeActorName
     : rootRunnerTitle(activeSession) || status?.runner_id || "New runner";
@@ -154,23 +174,8 @@ export function App() {
   }, [previewWidth]);
 
   useEffect(() => {
-    if (
-      streaming ||
-      queuedMessages.length === 0 ||
-      queueFlushInFlight.current
-    ) return;
-    const next = queuedMessages[0];
-    queueFlushInFlight.current = true;
-    void sendComposerText(next, true)
-      .then((result) => {
-        if (result !== "retry") {
-          setQueuedMessages((prev) => prev.slice(1));
-        }
-      })
-      .finally(() => {
-        queueFlushInFlight.current = false;
-      });
-  }, [streaming, queuedMessages]);
+    void composerQueueRef.current?.flush();
+  }, [streaming, conversation.streamInFlight, runtimeSwitching, queuedMessages]);
 
   useEffect(() => {
     if (previewCollapsed || activePreviewFeature !== "browser") return;
@@ -241,11 +246,12 @@ export function App() {
   }
 
   function acceptConversationEvent(event: RunnerStreamEvent): boolean {
-    const eventRunnerId = event.runner_id || event.agent_sessions_report?.runner_id || "";
-    return !(eventRunnerId && activeRunnerIdRef.current && eventRunnerId !== activeRunnerIdRef.current);
+    const eventRunnerId = event.runner_id;
+    return Boolean(activeRunnerIdRef.current) && !(eventRunnerId && eventRunnerId !== activeRunnerIdRef.current);
   }
 
   function handleConversationEvent(event: RunnerStreamEvent): void {
+    if (event.agent_role !== "root") return;
     const previewIntent = derivePreviewIntent(event);
     if (previewIntent?.kind === "file") {
       void openFile(previewIntent.path);
@@ -263,29 +269,65 @@ export function App() {
     });
   }
 
-  async function newRunner(options: { clearMessages?: boolean } = { clearMessages: true }): Promise<SessionStatus> {
-    setError("");
-    setActiveView("thread");
-    if (options.clearMessages !== false) {
-      conversation.clearMessages();
-    }
-    setActiveActorName(null);
-    setActiveAgentsReport(null);
-    const result = await client.command<SessionStatus>("start_session", {
-      base_dir: bootstrap?.base_dir || baseDir,
-      permission_mode: bootstrap?.effective_config.runtime?.permission_mode || "default",
-      agent_mode: bootstrap?.effective_config.runtime?.agent_mode || "agent",
-      agent_type: bootstrap?.effective_config.runtime?.agent_type || "react",
-      model_name: selectedModelName || models[0]?.model_name || "doubao_lite",
-      model_effort: selectedModelEffort,
+  function newRunner(options: { clearMessages?: boolean } = { clearMessages: true }): Promise<SessionStatus> {
+    if (sessionCreationRef.current) return sessionCreationRef.current;
+    // A Browser action can create the first session without going through the
+    // composer. Hold its FIFO synchronously and reuse an in-flight creation so
+    // neither that action nor a cold first message can race a queued /clear.
+    const release = composerQueueRef.current!.hold();
+    const creation = createRunner(options).finally(() => {
+      sessionCreationRef.current = null;
+      release();
     });
-    activeRunnerIdRef.current = result.runner_id;
-    setStatus(result);
+    sessionCreationRef.current = creation;
+    return creation;
+  }
+
+  async function createRunner(options: { clearMessages?: boolean }): Promise<SessionStatus> {
+    setError("");
+    let result: SessionStatus;
+    try {
+      result = await startWebSession(client, {
+        baseDir: bootstrap?.base_dir || baseDir,
+        status,
+        config: bootstrap?.effective_config || {},
+        modelName: selectedModelName || models[0]?.model_name || "doubao_lite",
+        modelEffort: selectedModelEffort,
+      }, {
+        commit: (created) => {
+          activeRunnerIdRef.current = created.runner_id;
+          conversation.bindRunner(created.runner_id);
+          setStatus(created);
+          setActiveView("thread");
+          if (options.clearMessages !== false) conversation.clearMessages();
+          setActiveActorName(null);
+          setActiveAgentsReport(null);
+          setPendingAsk(null);
+        },
+        reconcile: (actual) => {
+          activeRunnerIdRef.current = actual?.runner_id || "";
+          setStatus(actual);
+        },
+      });
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : String(exc));
+      console.warn("Failed to create web session", exc);
+      throw exc;
+    }
     setSelectedModelName(result.model_name);
     setSelectedModelEffort(normalizeModelEffort(result.model_effort, models.find((model) => model.model_name === result.model_name)));
-    await syncBrowserForRunner(result.runner_id);
-    await refreshActorSessions({ updateRootMessages: true });
-    await refreshSessions();
+    // Session creation is committed. Metadata failures should report their
+    // own error without turning a successful /clear into a failed transition.
+    const [, initialReport] = await Promise.all([
+      syncBrowserForRunner(result.runner_id),
+      refreshActorSessions(),
+      refreshSessions().catch((exc) => {
+        setError(exc instanceof Error ? exc.message : String(exc));
+        console.warn("Failed to refresh sessions after creation", exc);
+      }),
+    ]);
+    if (initialReport && activeRunnerIdRef.current === result.runner_id) await client.activateSession(result.runner_id);
+    console.info("Created web session", { runner_id: result.runner_id });
     return result;
   }
 
@@ -308,11 +350,13 @@ export function App() {
       ),
     });
     activeRunnerIdRef.current = result.runner_id;
+    conversation.bindRunner(result.runner_id);
     setStatus(result);
     setSelectedModelName(result.model_name);
     setSelectedModelEffort(normalizeModelEffort(result.model_effort, models.find((model) => model.model_name === result.model_name)));
     await syncBrowserForRunner(result.runner_id);
-    await refreshActorSessions({ updateRootMessages: true });
+    const report = await refreshActorSessions();
+    if (report) await client.activateSession(result.runner_id);
   }
 
   async function switchRuntime(modelName: string, modelEffort: ModelEffort): Promise<void> {
@@ -375,13 +419,12 @@ export function App() {
     }
   }
 
-  async function refreshActorSessions(options: { updateRootMessages?: boolean } = {}): Promise<ActiveAgentsReport | null> {
+  async function refreshActorSessions(): Promise<ActiveAgentsReport | null> {
     try {
       const report = await client.describeActiveAgents();
+      if (report.runner_id !== activeRunnerIdRef.current) return null;
+      conversation.applySnapshot(report);
       setActiveAgentsReport(report);
-      if (options.updateRootMessages) {
-        conversation.replaceMessages(loadRootMessages(report));
-      }
       return report;
     } catch (exc) {
       // A transport failure must not erase the transcript or the last usable
@@ -407,7 +450,7 @@ export function App() {
       setError(exc instanceof Error ? exc.message : String(exc));
       return "retry";
     }
-    const outcome = await conversation.sendMessage(trimmed, agentModeOverride);
+    const outcome = await conversation.sendMessage(trimmed, agentModeOverride, activeRunnerIdRef.current);
     if (outcome === "failed") return "retry";
     if (outcome === "completed") {
       try {
@@ -424,14 +467,20 @@ export function App() {
 
   async function sendComposerText(
     text: string,
-    fromQueue = false,
   ): Promise<"consumed" | "retry"> {
     const trimmed = text.trim();
     if (!trimmed) return "consumed";
-    if (activeActorName) {
+    // /clear always belongs to the whole session, including in a child view.
+    // A failed startup may leave that view visible after the gateway switched
+    // Runners. Its next ordinary input must not target an actor from that old
+    // report, even if an identically named actor exists in the new Runner.
+    const actorTarget = webActorMessageTarget(
+      trimmed, activeActorName, actorSessionsReport?.runner_id, activeRunnerIdRef.current,
+    );
+    if (actorTarget) {
       setError("");
       try {
-        const result = await client.sendAgentMessage({ agent_name: activeActorName, message: trimmed });
+        const result = await client.sendAgentMessage({ agent_name: actorTarget, message: trimmed });
         if (!result.accepted) {
           setError(`Actor message rejected: ${result.error || result.status || "not_live"}`);
         }
@@ -439,14 +488,6 @@ export function App() {
       } catch (exc) {
         setError(exc instanceof Error ? exc.message : String(exc));
       }
-      return "consumed";
-    }
-    // A previous transport failure is display state, not a conversation lock.
-    // The next real stream_started action clears it.  Treating streamFailed as
-    // busy here while also blocking the queue consumer on streamFailed creates
-    // a closed loop in which no later message can ever start.
-    if (!fromQueue && (streaming || queuedMessages.length > 0)) {
-      setQueuedMessages((prev) => [...prev, trimmed]);
       return "consumed";
     }
     if (trimmed.startsWith("/")) {
@@ -459,7 +500,8 @@ export function App() {
   async function runSlashCommand(commandText: string): Promise<void> {
     if (streaming) return;
     setError("");
-    setActiveActorName(null);
+    // Keep a child transcript visible until /clear has actually succeeded.
+    if (!isClearCommand(commandText)) setActiveActorName(null);
     try {
       const result = await executeWebCommand(commandText, client, {
         baseDir: bootstrap?.base_dir || baseDir,
@@ -467,6 +509,9 @@ export function App() {
         sessions,
         models,
       });
+      if (result.newSession) {
+        await newRunner();
+      }
       if (result.clearMessages) {
         conversation.clearMessages();
       } else if (result.blocks.length > 0) {
@@ -808,12 +853,17 @@ export function App() {
         selectedModelEffort={selectedModelEffort}
         messages={visibleMessages}
         streaming={streaming}
+        stopping={conversation.stopping}
+        workflowProgress={Object.values(conversation.workflowProgress).filter((progress) => !selectedActor || progress.agent_id === selectedActor.agent_id)}
         actorBusy={activeActorBusy}
         queuedMessages={queuedMessages}
         runtimeSwitching={runtimeSwitching}
         error={error}
         pendingAsk={pendingAsk}
-        onSend={(text) => void sendComposerText(text)}
+        onSend={(text) => void composerQueueRef.current?.submit(
+          text,
+          text.trim().startsWith("/") && (!activeActorName || isClearCommand(text)),
+        )}
         onCancel={() => {
           if (activeActorName) {
             void client.interruptAgent({ agent_name: activeActorName }).then(() => refreshActorSessions()).catch((exc) => {
@@ -841,7 +891,7 @@ export function App() {
         activeActorName={activeActorName}
         actorSessionsReport={actorSessionsReport}
         activeView={activeView}
-        onNewRunner={() => void newRunner({ clearMessages: true })}
+        onNewRunner={() => void composerQueueRef.current?.submit("/clear", true)}
         onSelectView={selectView}
         onResumeRunner={(runnerId) => void resumeRunner(runnerId)}
         onSelectSubactor={(actorName) => setActiveActorName(actorName)}
@@ -886,10 +936,4 @@ export function App() {
       )}
     </div>
   );
-}
-
-function loadRootMessages(report: ActiveAgentsReport | null): MessageBlock[] {
-  const rootActor = findRootActor(report);
-  if (!rootActor) return [];
-  return presentActiveAgent(rootActor).slice(1);
 }

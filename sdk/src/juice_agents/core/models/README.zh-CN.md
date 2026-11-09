@@ -8,8 +8,8 @@
 
 | 模块 | 接口契约 | 实现 |
 | --- | --- | --- |
-| `chat_models.py` | `BaseChatModel.generate(...) -> dict` | `ChatModel(backend=...)` |
-| `reward_models.py` | `BaseRewardModel.evaluate_batch(...) -> dict` | `GenerativeRewardModel` |
+| `chat_models.py` | `await BaseChatModel.generate(...) -> dict` | `ChatModel(backend=...)` |
+| `reward_models.py` | `await BaseRewardModel.evaluate_batch(...) -> dict` | `GenerativeRewardModel` |
 
 ```python
 from juice_agents.core.models.chat_models import BaseChatModel, ChatModel
@@ -31,33 +31,71 @@ Agent ── ChatModel(backend).generate() ──> provider SDK ──> 候选�
 `doubao` 或 `anthropic`，SDK 差异在类内部处理：
 
 ```python
+import asyncio
 import os
 
 from juice_agents.core.models.chat_models import ChatModel
 
-model = ChatModel(
-    model_name="your-model",
-    backend="openai",
-    api_base="https://api.openai.com/v1",
-    api_key=os.environ["OPENAI_API_KEY"],
-)
-response = model.generate([
-    {"role": "system", "content": "简洁回答。"},
-    {"role": "user", "content": "计算 6 * 7"},
-])
-print(response["content"])
+async def main():
+    async with ChatModel(
+        model_name="your-model", backend="openai",
+        api_key=os.environ["OPENAI_API_KEY"],
+    ) as model:
+        response = await model.generate([
+            {"role": "system", "content": "简洁回答。"},
+            {"role": "user", "content": "计算 6 * 7"},
+        ])
+        print(response["content"])
+
+asyncio.run(main())
 ```
 
-`api_base`、`api_key` 为可选 SDK 配置。也可在 `from openai import OpenAI` 后使用
-`ChatModel(model_name="your-model", client=OpenAI())` 注入与 backend 对应的原生 client。
-`thinking=None` 默认关闭思考；`max_retry_times=3`、`wait_time=1` 控制空响应、连接/超时、
-HTTP 408/409/429 及 5xx 错误的重试。其他 HTTP 错误和未知异常立即失败，不根据错误正文
-关键词猜测是否重试。Anthropic 支持 `max_tokens=4096` 和 `effort_config=None`；输出预算
-超过 8192 token 时优先使用可用的流式接口，无取消令牌的高强度推理和摘要调用也能遵守
-SDK 长请求限制。较低预算默认沿用阻塞接口，传入取消令牌时改为流式；仅有取消令牌时
-创建取消 watcher。
-`generate(messages, stop_sequence=None, *, cancel_event=None)` 保持统一响应、取消和
-provider 缓存处理。
+`api_base`、`api_key` 是可选 SDK 配置。内置模型方法都是原生协程；下文带
+`await` 的片段放在异步函数中执行。使用 `async with model` 或
+`await model.aclose()` 关闭模型创建的连接。只接受与 backend 对应的官方异步
+SDK 客户端，例如 `AsyncOpenAI`；注入的连接仍由调用方管理。模型的创建、使用和关闭
+应位于同一事件循环，禁止每次请求分别 `asyncio.run()`；只在应用异步入口运行一次。
+
+`generate(messages, stop_sequence=None, *, stream=False)` 返回完整的统一结果。
+`stream=True` 只控制 SDK 传输，保留取消前收到的用量，不会把方法变成迭代器。
+Anthropic 输出预算超过 8192 token 时始终流式传输。`thinking=None` 默认关闭思考；
+Anthropic 还接受 `max_tokens=4096`、`effort_config=None`。
+
+`max_retry_times=3` 表示**空响应**最多尝试三次，`wait_time=1` 是其异步等待间隔。
+网络、超时、限流及 HTTP 错误只由官方 SDK 重试，避免双层网络重试；未知异常直接抛出。
+
+取消运行 `generate()` / `evaluate_batch()` 的 Task，再等待其完成即可中断本次请求，
+覆盖响应头、流读取、SDK 退避和空响应重试等待。流关闭后才传播
+`asyncio.CancelledError`，异常携带已知 `usage_calls`；并发调用的取消和用量相互独立。
+真实 TCP/SSE 测试位于 `tests/core/models/test_request_cancellation.py`。
+
+模型内部没有 SDK 同步代理或专用循环。运行时 Agent 通过 `ModelManager.acall()`
+直接 await 生成、评分和压缩；Manager 负责事件、用量和框架自建连接，注入的 SDK
+客户端由调用方管理。Runner 的同步/异步入口共享持久执行循环；直接使用模型时，
+调用方在自己的同一循环完成请求和释放。
+
+### 图片输入
+
+OpenAI/Ark 聊天请求的 `image_url.url` 接受本地文件路径、HTTP(S) URL 或
+已有的 base64 data URL：
+
+```python
+response = await model.generate([{
+    "role": "user",
+    "content": [
+        {"type": "text", "text": "描述这张图片。"},
+        {"type": "image_url", "image_url": {"url": "/path/to/photo.jpg"}},
+    ],
+}])
+```
+
+发送时，本地文件转换为 `data:<实际 MIME>;base64,...`；HTTP(S) 链接原样保留，
+不在本地下载；已有 data URL 不重复编码。MIME 按图片内容识别，不依赖文件扩展名。
+文件缺失或不是有效图片时，在调用 provider 前报错。转换不修改原消息与会话状态，
+用户图片、工具观测、附件和恢复的会话仍保留原始路径。
+图片编辑共用 `agent/agent_type.py` 中的 `image_to_api_source()`；图片编码集中在
+该函数，请求转换留在模型层。功能测试位于 `tests/core/models/test_image_transport.py`，
+使用真实 SDK 与模拟 HTTP。
 
 ## 奖励模型
 
@@ -68,17 +106,17 @@ import os
 
 from juice_agents.core.models.reward_models import GenerativeRewardModel
 
-scorer = GenerativeRewardModel(
+async with GenerativeRewardModel(
     model_name="your-model",
     backend="openai",
     api_base="https://api.openai.com/v1",
     api_key=os.environ["OPENAI_API_KEY"],
-)
-result = scorer.evaluate_batch(
-    context=[{"role": "user", "content": "计算 6 * 7"}],
-    actions=[{"role": "assistant", "content": "42"}],
-)
-scores = result["scores"]
+) as scorer:
+    result = await scorer.evaluate_batch(
+        context=[{"role": "user", "content": "计算 6 * 7"}],
+        actions=[{"role": "assistant", "content": "42"}],
+    )
+    scores = result["scores"]
 ```
 
 首次非空批次才创建并复用 SDK client。`backend` 支持 `openai`（默认）、`doubao`
@@ -88,14 +126,15 @@ Anthropic 输出。也可直接注入与 backend 对应的原生 SDK client：
 ```python
 import os
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 from juice_agents.core.models.reward_models import GenerativeRewardModel
 
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-scorer = GenerativeRewardModel(model_name="your-model", client=client)
+async with AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"]) as client:
+    scorer = GenerativeRewardModel(model_name="your-model", client=client)
+    result = await scorer.evaluate_batch(context=[], actions=[{"content": "42"}])
 ```
 
-`client` 必须提供原生 SDK API，不能传入仅提供 `generate()` 的包装对象。
+`client` 必须提供原生异步 SDK API，调用方在所属循环关闭注入的客户端。
 
 需要复用现有模型目录、连接和凭证配置时，使用独立配置入口：
 
@@ -110,6 +149,12 @@ scorer = GenerativeRewardModel.from_config(
 评分器的 `model_name` 保留逻辑名称 `judge`。`from_config` 在首个非空批次通过
 `load_runtime_model_config` 读取 backend、凭证、地址和 provider 模型名，创建并
 复用独立 SDK client；构造及空批次均不解析配置或创建 client。
+
+聊天与 GRM 都从 `models` 选择条目，并引用共享 `providers`；图片条目仅放在
+`image_models`。各自的选择和 SDK client 相互独立。空闲时调用
+`await scorer.reload_config(context)` 关闭并清除目录型连接，下个非空批次才重建，保留逻辑
+模型选择，不改变直接传入的 client。Runner 显式配置重载会刷新已绑定 GRM，
+保留探索候选数。
 
 通过模型目录创建的聊天模型和奖励模型复用[统一配置层级](../config/README.zh-CN.md)：基础配置 → 用户配置 → 项目配置 → 临时覆盖；凭据优先级为进程环境、项目 `.env`、`~/.juice/.env`。传递同一上下文可保证模型和工具使用目标 workspace 的凭据，且不向进程环境导出密钥。
 
@@ -129,6 +174,14 @@ thinking 设置，也不共享 Agent 的推理强度。
 `evaluate_batch`，调用未实现的基类方法时抛出 `NotImplementedError`。
 策略使用这一评分接口，专用奖励模型或本地评分规则也可独立接入。
 
+`await evaluate_batch(..., stream=False)` 与生成采用相同的 Task 取消与清理约定；
+`stream=True` 时保留流中已报告的部分用量。
+
+生成、评分、压缩复用一次调用范围内的包装器。公开 `model_start` / `model_end`
+以同一 `model_call_id` 配对，通过 `purpose="generation"`、`"scoring"`、
+`"compression"` 区分用途。可观察的调用明细保留在 `usage_calls` 中；SDK 内部网络重试不可见。
+回调与 Agent 身份不写入共享模型实例，避免并行调用串扰。
+
 ## 返回契约
 
 Models 只返回本次调用的用量，不收集、累计或持久化，模型实例不保存可变的用量历史。
@@ -139,7 +192,7 @@ Models 只返回本次调用的用量，不收集、累计或持久化，模型�
 | `GenerativeRewardModel.evaluate_batch(...)` | `scores`、`usage`、`usage_calls` |
 
 ```python
-result = scorer.evaluate_batch(context=[], actions=[{"content": "42"}])
+result = await scorer.evaluate_batch(context=[], actions=[{"content": "42"}])
 print(result["scores"])       # 按输入顺序为每个候选返回一个有限数值。
 print(result["usage"])        # 最后响应的归一化用量，缺失为 None。
 print(result["usage_calls"])  # 本次调用可观测的 SDK 尝试明细。
@@ -152,7 +205,7 @@ print(result["usage_calls"])  # 本次调用可观测的 SDK 尝试明细。
 
 空评分批次返回 `{"scores": [], "usage": None, "usage_calls": []}`。
 一次批量请求对应一次 SDK 尝试，不按候选数重复计算。Agent 收集生成及评分用量，
-转交 `AgentManager` 持久化和汇总，见 [Runner](../runner/README.zh-CN.md#token-统计)。
+转交 `ModelManager` 持久化和汇总，见 [Runner](../runner/README.zh-CN.md#token-统计)。
 SDK 内部透明重试或服务端未报告的用量无法准确还原；未知用量不是零账单，
 不做 token 估算或费用计算。
 
@@ -160,6 +213,6 @@ SDK 内部透明重试或服务端未报告的用量无法准确还原；未知�
 
 - `BaseChatModel` 承担公共生成生命周期；SDK 构造与 backend 差异集中在 `chat_models.py` 的 `ChatModel` 内，调用方通过唯一具体类的 `backend` 选择实现。保持各 backend 的响应、重试、取消、缓存及 thinking 行为。
 - `reasoning_content` 与 `content` 分开返回。ChatModel 和 GRM 复用 `core/utils.py` 中的纯转换函数 `normalize_token_usage()`，模型包也导出它；保留 `provider_usage`，不保存记录状态。
-- 返回本次调用所有可观测尝试的 `usage_calls`，抛异常前同样附上明细。Agent 收集后转交 `AgentManager` 持久化及汇总，Models 不保存实例级用量历史。
+- 返回本次调用所有可观测尝试的 `usage_calls`，抛异常前同样附上明细。Agent 收集后转交 `ModelManager` 持久化及汇总，Models 不保存实例级用量历史。
 - 奖励模型提示词、provider 调用和分数解析集中在 `models/reward_models.py`；策略使用注入的评分器并负责选择规则。模型目录的配置类型仅在 `TYPE_CHECKING` 下导入，避免模型与目录初始化时循环依赖。
 - 聊天生成与评分功能测试放在 `tests/core/models/`；Agent 选择和 Gateway 配置测试保留在各调用方模块。

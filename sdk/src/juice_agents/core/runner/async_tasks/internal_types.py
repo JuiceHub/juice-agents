@@ -12,28 +12,6 @@ AsyncTaskStatus = Literal["pending", "running", "completed", "failed", "killed"]
 # custom configuration templates.
 RunnerScopeKind = str
 RunnerScopeStatus = Literal["running", "finalizing", "finalized"]
-RunnerAgentKind = Literal[
-    "teamlead",
-    "teammate",
-    "group_manager",
-    "group_worker",
-    "agent_owner",
-]
-RunnerAgentStatus = Literal["active", "idle", "shutdown_requested", "shutdown"]
-
-
-class RunnerAgentState(TypedDict, total=False):
-    """共享 agent 控制态。"""
-
-    agent_id: str
-    agent_name: str
-    agent_kind: RunnerAgentKind
-    status: RunnerAgentStatus
-    current_async_task_id: str
-    last_error: str
-    metadata: dict[str, Any]
-
-
 class AsyncTaskStateBase(TypedDict, total=False):
     """后台异步任务的公共字段。"""
 
@@ -84,7 +62,6 @@ class AsyncTaskRuntimeState(TypedDict, total=False):
     scope_kind: RunnerScopeKind
     scope_status: RunnerScopeStatus
     scope_meta: dict[str, Any]
-    agents: dict[str, RunnerAgentState]
     async_tasks: list[AsyncTaskState]
 
 
@@ -106,9 +83,6 @@ __all__ = [
     "AsyncTaskStateBase",
     "AsyncTaskStatus",
     "AsyncTaskNotification",
-    "RunnerAgentKind",
-    "RunnerAgentState",
-    "RunnerAgentStatus",
     "AsyncTaskRuntimeState",
     "RunnerScopeKind",
     "RunnerScopeStatus",

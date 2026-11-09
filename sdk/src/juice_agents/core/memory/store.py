@@ -210,19 +210,19 @@ class MemoryStore:
         """Count persisted managed agent sessions changed after the last dream.
 
         The count is intentionally file based and cheap: it scans session files under
-        `.juice/runners/*/agents/*/session.json` and excludes the live runner.
+        `.juice/sessions/*/agents/*/session.json` and excludes the live runner.
         """
 
         workspace = self.root.parent.parent
-        runners_dir = workspace / ".juice" / "runners"
-        if not runners_dir.exists():
+        sessions_dir = workspace / ".juice" / "sessions"
+        if not sessions_dir.exists():
             return 0
         cutoff = float(since_ts or 0.0)
         excluded = str(exclude_runner_id or "").strip()
         count = 0
-        for session_path in runners_dir.glob("*/agents/*/session.json"):
+        for session_path in sessions_dir.glob("*/agents/*/session.json"):
             try:
-                runner_id = session_path.relative_to(runners_dir).parts[0]
+                runner_id = session_path.relative_to(sessions_dir).parts[0]
             except (IndexError, ValueError):
                 continue
             if excluded and runner_id == excluded:

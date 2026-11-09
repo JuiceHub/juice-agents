@@ -4,6 +4,9 @@
 
 `sdk/src/juice_agents/core/memory` 提供 workspace-local 持久记忆能力。它管理当前 workspace 下的 `.juice/memory/`，保存项目约定、用户偏好与跨会话仍有价值的事实。
 
+dream 候选数量统计 `.juice/sessions/*/agents/*/session.json` 中上次 dream 后更新的
+Agent 快照，并排除活动 Runner；历史 `.juice/runners/` 快照不参与统计。
+
 ## 能力边界
 
 | 模块 | 职责 |

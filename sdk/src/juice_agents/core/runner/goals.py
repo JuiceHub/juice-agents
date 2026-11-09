@@ -17,6 +17,7 @@ import time
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from juice_agents.core.utils import parse_model_json
+from juice_agents.core.managers.models import ModelManager
 
 GoalStatus = Literal["active", "paused", "completed", "budget_limited"]
 
@@ -314,11 +315,13 @@ def run_goal_evaluator(runner: GoalHost, evidence: dict[str, Any]) -> dict[str, 
         "should_continue, progress_fingerprint."
     )
     user = json.dumps(evidence, ensure_ascii=False, default=str)
-    response = model.generate(
-        [
+    manager = getattr(runner, "model_manager", None)
+    call = manager.call if manager is not None else ModelManager.invoke_sync
+    response = call(
+        model, "generate", purpose="generation", args=([
             {"role": "system", "content": system},
             {"role": "user", "content": user},
-        ]
+        ],),
     )
     parsed = parse_model_json(_model_content(response), expected_type=dict, field_name="goal_evaluator")
     return dict(parsed)

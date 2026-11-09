@@ -2,20 +2,42 @@
 # Run the source checkout without changing the user's project environment.
 set -euo pipefail
 
+fail() { printf 'juice: %s\n' "$*" >&2; exit 1; }
+# A shell can retain a deleted cwd. Diagnose it before Python or Node starts;
+# choosing another directory here would silently change the user's workspace.
+pwd -P >/dev/null 2>&1 || fail "Current working directory is unavailable. Run cd to an existing directory and retry."
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 PYTHON_BIN="${JUICE_PYTHON_PATH:-$(command -v python || true)}"
 NODE_BIN="${JUICE_NODE_PATH:-$(command -v node || true)}"
 FRONTEND_DIR="$SCRIPT_DIR/frontend"
 
-fail() { printf 'juice: %s\n' "$*" >&2; exit 1; }
 [[ -x "$PYTHON_BIN" ]] || fail "Python path is invalid: $PYTHON_BIN. Activate juice-agents and rerun $SCRIPT_DIR/install-juice."
 [[ -x "$NODE_BIN" ]] || fail "Node path is invalid: $NODE_BIN. Restore Node and rerun $SCRIPT_DIR/install-juice."
 export JUICE_PYTHON_PATH="$PYTHON_BIN"
 # Only module lookup is extended. PATH remains exactly the user's project PATH,
 # so Shell tools can use project virtual environments and executable wrappers.
 export PYTHONPATH="$SCRIPT_DIR/sdk/src:$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
-if ! "$PYTHON_BIN" -P -c 'import juice_agents; import adapters.stdio_gateway.entry' >/dev/null; then
-    fail "Python dependencies are missing. Run: conda activate juice-agents; python -m pip install -e '$SCRIPT_DIR/sdk'"
+if "$PYTHON_BIN" -P -c '
+import sys
+import traceback
+
+try:
+    import juice_agents
+    import adapters.stdio_gateway.entry
+except ModuleNotFoundError:
+    # Reserve a distinct status for missing modules so filesystem and other
+    # initialization errors retain their real cause instead of suggesting pip.
+    traceback.print_exc()
+    sys.exit(78)
+' >/dev/null; then
+    :
+else
+    python_status=$?
+    if [[ "$python_status" -eq 78 ]]; then
+        fail "Python dependencies are missing. Run: conda activate juice-agents; python -m pip install -e '$SCRIPT_DIR/sdk'"
+    fi
+    fail "Python startup failed. See the error above."
 fi
 if ! "$NODE_BIN" "$FRONTEND_DIR/check-cli-dependencies.mjs" "$FRONTEND_DIR"; then
     fail "Frontend dependencies are missing or stale. Run: cd '$FRONTEND_DIR' && npm ci"

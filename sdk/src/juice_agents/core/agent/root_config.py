@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from typing import Any, Mapping
 
 from juice_agents.core.registry.agents.types import AgentConfig
 from juice_agents.core.registry.tools.types import ToolRef
@@ -94,12 +95,39 @@ def build_root_declaration() -> AgentConfig:
     return AgentConfig.from_dict(get_general_config())
 
 
+def apply_root_feature_flags(
+    config: AgentConfig,
+    runtime_config: Mapping[str, Any],
+    *,
+    mode_id: str = "agent",
+) -> AgentConfig:
+    """Apply the same opt-in image and opt-out browser switches everywhere.
+
+    Only the effective copy changes. In particular, a saved image tool cannot
+    bypass the switch, and Plan mode never exposes image generation.
+    """
+
+    browser = runtime_config.get("browser", {})
+    image = runtime_config.get("image", {})
+    browser_enabled = not isinstance(browser, dict) or browser.get("enabled", True) is not False
+    image_enabled = isinstance(image, dict) and image.get("enabled", False) is True and mode_id != "plan"
+    tools = [
+        ref for ref in config.tools
+        if ref.name != "generate_edit_image"
+        and (browser_enabled or not ref.name.startswith("browser_"))
+    ]
+    if image_enabled:
+        tools.append(ToolRef(name="generate_edit_image"))
+    return replace(config, tools=tuple(tools))
+
+
 def build_root_config(
     *,
     mode_id: str,
     plan_file: str | Path,
     managed_agent_names: tuple[str, ...] | list[str] | None = None,
     declaration: AgentConfig | None = None,
+    runtime_config: Mapping[str, Any] | None = None,
 ) -> AgentConfig:
     """Build the effective root configuration for one Runner mode.
 
@@ -148,7 +176,7 @@ def build_root_config(
         # Plan-specific references intentionally replace any default ref with
         # the same name (notably agent_tool's read_only_only setting).
         tools_by_name[ref.name] = ref
-    return replace(
+    result = replace(
         declared,
         instructions=instructions,
         tools=tuple(tools_by_name.values()),
@@ -163,6 +191,7 @@ def build_root_config(
             else tuple(managed_agent_names)
         ),
     )
+    return apply_root_feature_flags(result, runtime_config or {}, mode_id=normalized_mode)
 
 
-__all__ = ["build_root_config", "build_root_declaration"]
+__all__ = ["apply_root_feature_flags", "build_root_config", "build_root_declaration"]

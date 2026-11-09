@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+import asyncio
+
+import json
 import re
 import threading
 import time
@@ -200,6 +203,25 @@ def test_parallel_propagates_first_failure(tmp_path: Path) -> None:
         _ctx(tmp_path, FakeDispatcher()).parallel([lambda: 1, boom])
 
 
+def test_parallel_failure_cancels_siblings_and_waits_without_stopping_parent(tmp_path: Path) -> None:
+    parent, started, finished = threading.Event(), threading.Event(), threading.Event()
+    ctx = _ctx(tmp_path, FakeDispatcher(), cancel_event=parent)
+
+    def running() -> None:
+        started.set()
+        assert ctx._cancel_event.wait(5)
+        finished.set()
+
+    def failing() -> None:
+        assert started.wait(5)
+        raise RuntimeError("child failed")
+
+    with pytest.raises(RuntimeError, match="child failed"):
+        ctx.parallel([running, failing])
+    assert finished.is_set()
+    assert not parent.is_set()
+
+
 def test_pipeline_runs_each_item_through_all_stages(tmp_path: Path) -> None:
     ctx = _ctx(tmp_path, FakeDispatcher())
     assert ctx.pipeline([1, 2, 3], lambda x: x + 1, lambda x: x * 2) == [4, 6, 8]
@@ -213,18 +235,24 @@ def test_cancel_stops_at_next_agent_boundary(tmp_path: Path) -> None:
     with pytest.raises(WorkflowCancelledError):
         ctx.agent("second", instructions="R", tools=[])
     assert len(dispatcher.calls) == 1
-    # 取消信号原样传给内部 agent，供 AgentManager 在 step 边界中断。
-    assert dispatcher.calls[0]["cancel_event"] is cancel
+    # A private token follows caller cancellation without stopping its parent.
+    assert dispatcher.calls[0]["cancel_event"] is not cancel
+    assert dispatcher.calls[0]["cancel_event"].is_set()
 
 
 def test_cancel_interrupts_parallel_wait(tmp_path: Path) -> None:
     cancel = threading.Event()
     ctx = _ctx(tmp_path, FakeDispatcher(), cancel_event=cancel)
     threading.Timer(0.1, cancel.set).start()
-    started = time.monotonic()
+    finished = threading.Event()
+
+    def running() -> None:
+        assert ctx._cancel_event.wait(5)
+        finished.set()
+
     with pytest.raises(WorkflowCancelledError):
-        ctx.parallel([lambda: time.sleep(1.0)])
-    assert time.monotonic() - started < 0.9
+        ctx.parallel([running])
+    assert finished.is_set()  # Terminal cancellation waits for foreground cleanup.
 
 
 def test_timeout_is_checked_at_boundaries(tmp_path: Path) -> None:
@@ -242,7 +270,9 @@ def test_progress_events_carry_phase_and_counts(tmp_path: Path) -> None:
     assert {e["phase"] for e in completed} == {"Research"}
     assert sorted(e["completed"] for e in completed) == [1, 2, 3]
     assert all(e["total"] == 3 for e in completed[-1:])
-    assert events[0] == {"event": "phase_started", "phase": "Research", "completed": 0, "total": 0, "detail": "Research"}
+    assert events[0] == {"event": "phase_started", "phase": "Research", "completed": 0, "total": 0, "detail": "Research",
+                         "workflow_call_id": "", "call_id": "", "owner_agent_id": "", "owner_agent_name": "root",
+                         "round_id": None, "step_num": None}
 
 
 # -- artifact --------------------------------------------------------------------------
@@ -286,7 +316,6 @@ def test_registry_parses_metadata_and_loads_run(tmp_path: Path) -> None:
     [
         ("WORKFLOW_METADATA = {'name': 'x'}\n", "run(ctx, args)"),
         ("def run(ctx, args):\n    return 1\n", "WORKFLOW_METADATA"),
-        ("WORKFLOW_METADATA = {'name': 'x'}\nasync def run(ctx, args):\n    return 1\n", "同步"),
         ("import importlib\nWORKFLOW_METADATA = {'name': 'x'}\ndef run(ctx, args):\n    return 1\n", "importlib"),
         ("WORKFLOW_METADATA = {'name': 'x'}\ndef run(ctx, args):\n    return getattr(ctx, 'a')\n", "getattr"),
         ("WORKFLOW_METADATA = {'name': 'x'}\ndef run(ctx, args):\n    return ctx.__class__\n", "dunder"),
@@ -373,7 +402,7 @@ def _research_responder(rounds_with_gaps: int):
     （算作一个来源 → unverified → gap），之后的来源各自独立，claim 得以 verified。
     """
 
-    state = {"research_round": 0}
+    rounds_by_topic: dict[str, int] = {}
     lock = threading.Lock()
 
     def respond(config: AgentConfig, task: str) -> Any:
@@ -383,9 +412,13 @@ def _research_responder(rounds_with_gaps: int):
         if role.startswith("You are a research supervisor. Plan"):
             return {"topics": [{"id": "t1", "question": "q1"}, {"id": "t2", "question": "q2"}]}
         if role.startswith("You are a focused researcher"):
+            topic_id = json.loads(task)["topic"]["id"]
             with lock:
-                state["research_round"] += 1
-                index = state["research_round"]
+                rounds_by_topic[topic_id] = rounds_by_topic.get(topic_id, 0) + 1
+                # Future completion order must not swap source identities:
+                # dedupe consumes results in topic order, and the duplicate
+                # location below intentionally refers to topic one's source.
+                index = (rounds_by_topic[topic_id] - 1) * 2 + int(topic_id[1:])
             key = "same" if index <= rounds_with_gaps * 2 else f"k{index}"
             return {
                 "sources": [
@@ -406,7 +439,7 @@ def test_deep_research_runs_rounds_until_gaps_close(tmp_path: Path) -> None:
 
     dispatcher = FakeDispatcher(responder=_research_responder(rounds_with_gaps=1))
     ctx = _ctx(tmp_path, dispatcher, tools=deep_research.WORKFLOW_METADATA["tools"], read_only=True)
-    result = deep_research.run(ctx, {"question": "compare A and B", "source_mode": "web"})
+    result = asyncio.run(deep_research.run(ctx, {"question": "compare A and B", "source_mode": "web"}))
 
     stats = result["stats"]
     # 第 1 轮全是单来源 claim → gaps → 第 2 轮两个独立来源支持 Fact A → 收敛。
@@ -437,9 +470,9 @@ def test_deep_research_stops_at_round_limit(tmp_path: Path) -> None:
 
     dispatcher = FakeDispatcher(responder=_research_responder(rounds_with_gaps=99))
     ctx = _ctx(tmp_path, dispatcher, tools=deep_research.WORKFLOW_METADATA["tools"], read_only=True)
-    result = deep_research.run(
+    result = asyncio.run(deep_research.run(
         ctx, {"question": "compare A and B", "source_mode": "web", "limits": {"max_research_rounds": 2}}
-    )
+    ))
     assert result["stats"]["rounds"] == 2
     assert result["verified_claims"] == []
 
@@ -456,4 +489,4 @@ def test_deep_research_rejects_invalid_args(tmp_path: Path, args: dict[str, Any]
     from juice_agents.core.workflow.builtins import deep_research
 
     with pytest.raises(ValueError, match=message):
-        deep_research.run(_ctx(tmp_path, FakeDispatcher()), args)
+        asyncio.run(deep_research.run(_ctx(tmp_path, FakeDispatcher()), args))

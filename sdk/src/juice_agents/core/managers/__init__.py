@@ -11,6 +11,19 @@ from importlib import import_module
 from typing import Any
 
 _EXPORTS = {
+    "AGENT_SNAPSHOT_SCHEMA_VERSION": (".agents", "AGENT_SNAPSHOT_SCHEMA_VERSION"),
+    "AgentAttachmentsProvider": (".agents", "AgentAttachmentsProvider"),
+    "AgentExecutionInterrupted": (".agents", "AgentExecutionInterrupted"),
+    "AgentLifecycle": (".agents", "AgentLifecycle"),
+    "AgentManager": (".agents", "AgentManager"),
+    "AgentManagerCallbacks": (".agents", "AgentManagerCallbacks"),
+    "AgentSnapshot": (".agents", "AgentSnapshot"),
+    "AgentSnapshotStore": (".agents", "AgentSnapshotStore"),
+    "AgentStatus": (".agents", "AgentStatus"),
+    "JsonAgentSnapshotStore": (".agents", "JsonAgentSnapshotStore"),
+    "ManagedAgent": (".agents", "ManagedAgent"),
+
+    "ModelManager": (".models", "ModelManager"),
     "AsyncTaskManager": (".async_tasks", "AsyncTaskManager"),
     "TaskEventSink": (".async_tasks", "TaskEventSink"),
     "WorkflowRunManager": (".workflows", "WorkflowRunManager"),

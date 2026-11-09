@@ -10,12 +10,16 @@ import type {
   ActiveAgentSnapshot,
   RunnerStreamEvent,
   SessionStatus,
+  ToolCallDisplay,
 } from "@juice-agents/shared/gateway/types";
 import {
   INTERRUPT_MESSAGE,
   presentActiveAgent as presentSharedActiveAgent,
   presentStreamEvent as presentSharedStreamEvent,
   presentStreamStep as presentSharedStreamStep,
+  normalizeToolStatus,
+  presentToolLifecycle,
+  selectKeyParameters,
   type MessageBlock as SharedMessageBlock,
 } from "@juice-agents/shared/presenter/stream";
 
@@ -61,17 +65,9 @@ export interface IntroPanelModel {
   metaLines: string[];
 }
 
-export function presentStreamStep(step: ActionStep): MessageBlock[] {
-  return presentSharedStreamStep(step as any) as MessageBlock[];
-}
-
-export function presentStreamEvent(event: RunnerStreamEvent): MessageBlock[] {
-  return presentSharedStreamEvent(event as any) as MessageBlock[];
-}
-
-export function presentActiveAgent(agent: ActiveAgentSnapshot | null | undefined): MessageBlock[] {
-  return presentSharedActiveAgent(agent as any) as MessageBlock[];
-}
+export const presentStreamStep = presentSharedStreamStep;
+export const presentStreamEvent = presentSharedStreamEvent;
+export const presentActiveAgent = presentSharedActiveAgent;
 
 export function formatModeLabel(status: SessionStatus): string {
   // agent/plan 的 protocol 标签对用户最有辨识度；Team/Group 仍沿用同一默认值。

@@ -22,6 +22,11 @@ The managed Agent identity comes from
 `RunnerContext.agent_id → AgentManager`; editable declarations and tool
 constructor arguments are never authorization proof.
 
+Approval requests use `RunnerContext.ask_user()` to carry Agent, round and
+parent cancellation identities. Cancelling a round wakes its own and synchronous
+child approvals; independent background approvals remain pending. A tool starts
+only after approval succeeds.
+
 ## Development conventions
 
 - `policy.py` centralizes allow, ask, and deny decisions. Read-only boundaries and Agent-target restrictions come from serializable `RunnerConfig.ToolPolicy`; do not branch on mode names.

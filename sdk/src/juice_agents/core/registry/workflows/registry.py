@@ -91,10 +91,8 @@ def _metadata_literal(tree: ast.Module, *, path: Path, source: str, content: str
     payload: dict[str, Any] | None = None
     has_run = False
     for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == "run":
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "run":
             has_run = True
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "run":
-            raise ValueError(f"workflow 的 run(ctx, args) 必须是同步函数: {path}")
         if not isinstance(node, (ast.Assign, ast.AnnAssign)):
             continue
         targets = node.targets if isinstance(node, ast.Assign) else [node.target]

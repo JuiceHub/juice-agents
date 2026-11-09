@@ -6,7 +6,6 @@ import {
   MAX_TOOL_PREVIEW_LINES,
   formatToolHeader,
   formatToolOutputPreview,
-  pickPrimaryToolParameter,
 } from "./toolOutputFormatter.js";
 
 const baseToolCall = {
@@ -16,10 +15,10 @@ const baseToolCall = {
   parameters: { path: "/workspace/app.tsx" },
 } as const;
 
-test("formatToolHeader renders ▸ Ran <name>(arg=val) for success", () => {
+test("formatToolHeader renders ✓ Completed <name>(arg=val) for success", () => {
   const header = formatToolHeader({ ...baseToolCall });
-  assert.equal(header.glyph, "▸");
-  assert.equal(header.label, "Ran read");
+  assert.equal(header.glyph, "✓");
+  assert.equal(header.label, "Completed read");
   assert.equal(header.inlineParams, "(path: /workspace/app.tsx)");
   assert.equal(header.failed, false);
 });
@@ -42,13 +41,13 @@ test("formatToolHeader truncates long inline params with an ellipsis", () => {
   assert.ok(header.inlineParams.length <= 11 + MAX_INLINE_PARAM_CHARS + 1);
 });
 
-test("formatToolHeader keeps only the first line of multi-line param values", () => {
+test("formatToolHeader marks omitted multiline parameter content with an ellipsis", () => {
   const header = formatToolHeader({
     ...baseToolCall,
     name: "shell",
     parameters: { command: "echo first\necho second" },
   });
-  assert.equal(header.inlineParams, "(command: echo first)");
+  assert.equal(header.inlineParams, "(command: echo first…)");
 });
 
 test("formatToolHeader returns empty inlineParams when no non-empty parameters exist", () => {
@@ -81,24 +80,4 @@ test("formatToolOutputPreview returns empty for empty input and trims trailing w
   const trailing = formatToolOutputPreview("a\nb\n\n   \n");
   assert.deepEqual(trailing.lines, ["a", "b"]);
   assert.equal(trailing.truncatedCount, 0);
-});
-
-test("pickPrimaryToolParameter returns first multiline or long param, else null", () => {
-  const single = pickPrimaryToolParameter({
-    ...baseToolCall,
-    parameters: { path: "/short" },
-  });
-  assert.equal(single, null);
-
-  const multiline = pickPrimaryToolParameter({
-    ...baseToolCall,
-    parameters: { command: "echo a\necho b" },
-  });
-  assert.deepEqual(multiline, { key: "command", value: "echo a\necho b" });
-
-  const longSingleLine = pickPrimaryToolParameter({
-    ...baseToolCall,
-    parameters: { code: "x".repeat(MAX_INLINE_PARAM_CHARS + 5) },
-  });
-  assert.ok(longSingleLine && longSingleLine.key === "code");
 });

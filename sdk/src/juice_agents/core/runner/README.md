@@ -2,7 +2,7 @@
 
 > [简体中文](README.zh-CN.md)
 
-`Runner` is the unified entry point for one conversation request. It does not retain live Agent, Tool, Workflow, or background-task instances; Managers own those mutable objects. Registry resolves and freshly constructs static declarations.
+`Runner` is the unified entry point for a persistent conversation and its autonomous rounds. It does not retain live Agent, Tool, Workflow, or background-task instances; Managers own those mutable objects. Registry resolves and freshly constructs static declarations.
 
 ```text
 Agent / Tool / Workflow declarations
@@ -11,11 +11,52 @@ Agent / Tool / Workflow declarations
            Registry
               │ fresh objects only
               ▼
-Runner ── owns ──► AgentManager      session · snapshot · stream · cancel · release
+Runner ── owns ──► AgentManager      inbox · round scheduling · session · cancel · release
   │               ToolManager        runtime binding · permissions · audit
   │               WorkflowRunManager    workflow call · artifacts
   └──────────────► AsyncTaskManager  task state · workers · notification · recovery
 ```
+
+## Round results and public events
+
+`run()` returns successful output or raises `RoundFailedError / RoundCancelledError`
+with the committed `.result`. `run_round()` returns `RoundResult` for every terminal
+outcome. Instance status is separate from round success, failure or cancellation.
+
+Public events use `kind + data` with stable event, Agent, round and step identity.
+Subscribe with `subscribe_events()`; `round_end.data.result` is authoritative.
+Closing an observer only detaches it; `cancel_round()` saves stop intent and awaits
+execution cleanup before a terminal event, while `stop()/close()` stop the Runner.
+`describe_agent_sessions(agent_id=...)` reads selected history on demand. Recovery
+validates Runner v6 / Agent v2 / Context v3 before writing, preserving unsupported files.
+See the SDK [event table](../../../../README.md#round-results-and-event-contract).
+
+## Public entry points
+
+```python
+from juice_agents import Runner
+
+runner = Runner.create(base_dir=".", runner_config="agent")
+try:
+    runner.set_ask_handler(handler)
+    print(runner.run("Review this project"))
+    runner_id = runner.runner_id
+finally:
+    runner.close()
+
+runner = Runner.resume(base_dir=".", runner_id=runner_id)
+try:
+    runner.set_ask_handler(handler)
+    print(runner.run("Continue the review"))
+finally:
+    runner.close()
+```
+
+`handler` is the application's user interaction callback. Bind it after both
+creation and resume; callbacks are process-local and are never persisted.
+Pass shared launch settings as explicit `runtime_config_path` and
+`runtime_overrides` arguments. Callers own the Runner lifecycle; no client or
+factory wrapper is required.
 
 ## Configuration and modes
 
@@ -42,8 +83,8 @@ Plan Mode is root-owned: `plans/root.md` is the only formal plan artifact and
 only a Manager-verified root may write it or request approval. Team Mode uses
 `TeamManager` for the selected Team's current task board, messages, members and
 finish state. New Teams have no automatic members; selecting an existing Team
-reuses its member definitions with a new board. The Runner schedules eligible,
-dependency-ready member turns through `AsyncTaskManager`; member sessions stay
+reuses its member definitions with a new board. TeamManager schedules eligible,
+dependency-ready member turns through `AgentManager.post()`; member sessions stay
 in `AgentManager` until `team_finish` releases them.
 
 ```python
@@ -61,7 +102,7 @@ for event in runner.stream("Review this change"):
 
 `Runner.create()` accepts declarations only. Passing a live `MultiStepAgent`
 or an old runner schema is rejected. Root creation is lazy: the first request
-calls `AgentManager.acquire_root()`.
+or explicit `activate()` calls `AgentManager.acquire_root()`.
 
 ## Agent and tool call path
 
@@ -70,6 +111,23 @@ The workspace is `base_dir`, never the framework checkout or `.juice` itself.
 credentials; `runtime_config_path` selects the base layer and `runtime_overrides`
 adds transient launch values. `reconfigure(runtime_overrides=...)` reacquires
 Agents at an idle boundary while keeping sessions, Runner ID and the Team board.
+Use `runner.reconfigure(reload_config=True)` after editing YAML or credentials.
+It rereads configuration, rebuilds catalog-backed clients, and preserves history,
+the selected GRM and exploration breadth. Ordinary mode/model changes retain
+the scorer's existing lazy client. These choices remain process-local.
+
+```python
+# Hosts that persist settings can reserve the same idle gate as stream().
+with runner.configuration_boundary():
+    save_project_settings()
+    runner.reconfigure(reload_config=True)
+```
+
+The boundary rejects active requests, workers and pending Team work before the
+host writes. Image tool mounting shares the SDK builder's `image.enabled` flag;
+Plan mode always excludes it. Image selection follows `image.model_name`,
+independently of chat and GRM.
+
 Registry binds workspace defaults when tools are instantiated, including tools
 added at runtime; portable Agent declarations never store injected machine paths.
 
@@ -120,16 +178,62 @@ restores its session, binds the runtime context, then checkpoints it.
 
 - `persistent` Agents retain their live instance and session until released.
 - `functional` Agents are checkpointed and released after their request.
-- `stop()` cooperatively cancels Managers; `close()` releases their resources.
+- `cancel_round(round_id)` durably cancels only that round and synchronous children. Independent async tasks use `async_task_stop`; later messages can wake the Agent again.
+- `stop()` closes scheduling; `close()` also releases Manager resources.
+- Shutdown waits for started calls to finish their cancellation cleanup before
+  subscriptions and execution pools are released.
 - `resume()` accepts only the current Runner manifest schema; historical Runner
   manifest schemas are not migrated or resumed.
 
-Runner state is rooted at `.juice/runners/<runner_id>/`. The manifest stores
+Runner state is rooted at `.juice/sessions/<runner_id>/`. The manifest stores
 the serialized `RunnerConfig`, selected Team and mode-local disabled Agents;
-Agent runtime snapshots live under `agents/`. The formal plan artifact is
+Agent runtime snapshots live under `agents/<agent_id>/`: `manifest.json`, `session.json` (context and round checkpoint), and `inbox.json` (unconfirmed messages). The formal plan artifact is
 always `plans/root.md`.
 Managers own task and tool runtime records and workflow artifacts; workflow calls
 do not have resumable run state.
+
+Resume rebuilds the Manager composition under the target Runner directory, binding
+root and child Agent snapshots and task records to that session. Transcript inspection
+is read-only and does not acquire Agents. First-request previews reuse the transcript
+export; invalid context trees produce a warning and session lists fall back to the Runner ID.
+
+## Durable messages and autonomous rounds
+
+```python
+runner = Runner.resume(base_dir=".", runner_id=runner_id)
+runner.set_ask_handler(handler)
+unsubscribe = runner.subscribe_events(handle)  # Includes background wakeups.
+runner.activate()                     # Idempotent; bind listeners and Ask first.
+try:
+    receipt = runner.post(runner.root_agent_id, {
+        "message_id": "producer-stable-id",
+        "attachment_type": "agent_user_message",
+        "payload": {"text": "Check the completed task"},
+    })
+    # receipt includes agent_id, message_id, round_id and delivery status.
+finally:
+    runner.close()
+    unsubscribe()  # Keep observing until started calls have finished cleanup.
+```
+
+`create()` and `resume()` keep scheduling disabled. `run()` and `stream()` activate
+automatically; background hosts explicitly activate after binding callbacks.
+`stream()` waits for the submitted input's round and returns immediately when
+that round ends. `round_start` / `round_end` carry independent round IDs and all
+events carry an `event_id` shared by stream and subscription copies.
+
+User input, Team assignment/message/broadcast and async completion share the
+same durable inbox. A running Agent receives input at its next safe step; input
+arriving after final result commit starts the next round. One Agent executes
+rounds serially; different Agents run concurrently. Completing a round makes a
+persistent Agent idle immediately even while independent async tasks continue.
+
+Recovery reconciles stable IDs against committed context before activation and
+resumes only `active` checkpoints with the remaining step budget. Replaying a
+committed ID never appends it again. Only one active Runner process may schedule
+a session. This does not guarantee exactly-once tool side effects or resurrect
+lost async processes. Functional Agents must complete work within their call;
+they may call other Agents synchronously but cannot detach background work.
 
 ## Token usage
 
@@ -149,10 +253,10 @@ Each group contains:
 | `input_tokens`, `output_tokens`, `total_tokens` | Sums of reported, known counts |
 | `missing_usage_requests` | Calls with missing or incomplete usage |
 
-`Runner.token_usage()` delegates to `AgentManager`, the sole owner of usage
+`Runner.token_usage()` delegates to `ModelManager`, the sole owner of usage
 collection, persistence, and aggregation. Agent and strategy code explicitly
 report model results or exceptions; records live in
-`.juice/runners/<runner_id>/agents/model_usage.jsonl`, without prompts or
+`.juice/sessions/<runner_id>/agents/model_usage.jsonl`, without prompts or
 transcripts. Each record contains `kind`, `backend`, `model_name`, `agent_id`,
 `agent_name`, `usage`, and `request_id`.
 
@@ -180,7 +284,7 @@ to failures; Models do not maintain totals.
 | `config.py` | `RunnerConfig`, `AgentBinding`, capability and policy templates |
 | `execution/context.py` | narrow Agent-to-Runner capability bridge |
 | `persistence/store.py` | Runner manifest and directory layout |
-| `core/agent/manager.py` | managed Agent lifecycle and snapshots |
+| `core/managers/agents/manager.py` | managed Agent lifecycle and snapshots |
 | `core/managers/` | Tool, Workflow and AsyncTask runtime ownership |
 
 When changing this boundary, add architectural tests that prove Registry has no
@@ -189,8 +293,16 @@ execute domain objects.
 
 ## Development conventions
 
+`arun/arun_round/astream/ainvoke_agent/aclose` are native async SDK entry points;
+`acreate/aresume` move construction and recovery I/O outside the host loop.
+`execution/async_bridge.py` binds SDK boundaries to one persistent runtime loop.
+Agents directly await ModelManager; inbox workers and background jobs are
+coroutines. TeamManager owns member dispatch, result reconciliation and finish.
+Synchronous APIs adapt complete operations. Never close a shared model client
+merely to cancel one round.
+
 - `RunnerConfig` is serializable data. Built-in and custom modes share `stream()`, `run()`, and `stop()`; do not register a dynamic factory, callback, or separate loop. Runner may keep request locks, cancellation state, and listeners, but never live Agent, Tool, Workflow, or Task objects.
 - Validate a mode target before applying it, and change modes only when root, background tasks, and Workflows are idle. Preserve the Runner ID and snapshot; reject a busy change and any unfinished Team work. Reject old manifest schemas explicitly instead of migrating them.
-- Persist Team task state before emitting events. Schedule member turns through the shared `AsyncTaskManager`, checkpoint sessions through `AgentManager`, and acknowledge inbox IDs only after the receiving step is saved. The request stream waits for active member calls and emits `team_update` before `round_end`.
+- Persist Team/async business records before posting stable message IDs. Schedule every persistent round through `AgentManager`; confirm producer delivery only after the context and round checkpoint commit. A request stream waits for its own round; subscriptions receive later autonomous rounds.
 - `AgentManager.acquire()` loads a snapshot, constructs a fresh Registry object, restores its session, binds context, and checkpoints. `stop()` cancels cooperatively; `close()` releases resources. Terminal and recovery logs include Runner, Agent/task/Workflow IDs and the reason. Persistence contains data only, never live Python objects.
 - Put boundary, lifecycle, and layout tests in `tests/core/runner/`, covering the shared execution chain, concurrency, cancellation, recovery, and old-schema rejection across built-in modes.

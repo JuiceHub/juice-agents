@@ -1,7 +1,7 @@
 import React, { useMemo, useRef, useState } from "react";
 import { ArrowUp, CheckCircle2, Copy, Square, XCircle } from "lucide-react";
-import type { AskOption, AskRequest, PluginInfo, RuntimeModelInfo, SessionStatus, SkillInfo } from "@juice-agents/shared/gateway/types";
-import type { MessageBlock } from "@juice-agents/shared/presenter/stream";
+import type { AskOption, AskRequest, PluginInfo, RuntimeModelInfo, SessionStatus, SkillInfo, RunnerLifecycleEvent } from "@juice-agents/shared/gateway/types";
+import { normalizeToolStatus, type MessageBlock } from "@juice-agents/shared/presenter/stream";
 import { messageBlockToText } from "@juice-agents/shared/presenter/command";
 import { MarkdownContent } from "./MarkdownContent.js";
 import {
@@ -43,6 +43,8 @@ interface ThreadViewProps {
   selectedModelEffort: ModelEffort;
   messages: MessageBlock[];
   streaming: boolean;
+  stopping?: boolean;
+  workflowProgress?: RunnerLifecycleEvent[];
   actorBusy?: boolean;
   queuedMessages: string[];
   runtimeSwitching: boolean;
@@ -98,7 +100,13 @@ export function ThreadView(props: ThreadViewProps) {
             <MessageArticle key={message.id || index} message={message} onOpenFile={props.onOpenFile} />
           ))
         )}
-        {props.streaming ? <div className="thinking-placeholder">Thinking...</div> : null}
+        {props.streaming ? <div className="thinking-placeholder">{props.stopping ? "正在停止…" : "Thinking..."}</div> : null}
+        {(props.workflowProgress || []).map((progress, index) => (
+          <div className="thinking-placeholder" key={progress.call_id || progress.workflow_run_id || index}>
+            {[progress.workflow_name, progress.detail || progress.node?.replaceAll("_", " "),
+              progress.total ? `${progress.completed || 0}/${progress.total}` : ""].filter(Boolean).join(" · ")}
+          </div>
+        ))}
         {props.error ? <div className="error-banner">{props.error}</div> : null}
       </section>
 
@@ -246,7 +254,11 @@ function ToolCallCard({ message }: { message: MessageBlock }) {
   const toolCall = message.toolCall;
   if (!toolCall) return <div className="message-body">{message.text}</div>;
   const entries = Object.entries(toolCall.parameters || {});
-  const failed = toolCall.status === "error";
+  // Saved CodeAct wrappers carry results/errors with the call itself. Keep
+  // them visible inside the existing expandable tool details after resume.
+  if (toolCall.observation) entries.push(["Result", toolCall.observation]);
+  if (toolCall.error && !toolCall.observation?.includes(toolCall.error)) entries.push(["Error", toolCall.error]);
+  const failed = ["failed", "denied"].includes(normalizeToolStatus(toolCall.status));
   return (
     <details className="tool-call-card">
       <summary className="tool-call-summary">
@@ -258,8 +270,8 @@ function ToolCallCard({ message }: { message: MessageBlock }) {
       </summary>
       {entries.length > 0 ? (
         <dl className="tool-call-params">
-          {entries.map(([key, value]) => (
-            <div className="tool-call-param" key={`${toolCall.name}-${key}`}>
+          {entries.map(([key, value], index) => (
+            <div className="tool-call-param" key={`${toolCall.name}-${index}-${key}`}>
               <dt>{key}</dt>
               <dd>{value || "(empty)"}</dd>
             </div>

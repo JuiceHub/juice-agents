@@ -191,7 +191,7 @@ function browserPreviewTab(
 }
 
 export function derivePreviewIntent(event: RunnerStreamEvent): PreviewIntent | null {
-  const step = event.action_step;
+  const step = event.kind === "step_end" ? event.data.step : null;
   if (!step) return null;
 
   const joined = [

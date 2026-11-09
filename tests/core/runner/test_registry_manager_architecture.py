@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from juice_agents.core.agent.context import ActionStep, ContextTree
-from juice_agents.core.prebuilt import create_prebuilt_runner
-from juice_agents.core.runner import Runner
+from juice_agents import Runner
 from juice_agents.core.runner.config import AgentBinding, ModeRegistry, RunnerConfig, mode_registry
 from juice_agents.core.runner.persistence.store import build_layout
 
@@ -70,9 +70,9 @@ def test_builtin_modes_share_the_same_runner_manager_path(tmp_path: Path, mode_i
 
     events = list(runner.stream("hello"))
     assert registry.instantiated == [mode_registry.resolve(mode_id).root_binding.agent_name]
-    assert [event["kind"] for event in events] == ["action_step", "round_end"]
+    assert [event["kind"] for event in events] == ["message_received", "agent_state", "round_start", "step_start", "step_end", "agent_state", "round_end"]
     assert {event["mode_id"] for event in events} == {mode_id}
-    assert events[-1]["output"] == f"done:{mode_registry.resolve(mode_id).root_binding.agent_name}"
+    assert events[-1]["data"]["result"]["output"] == f"done:{mode_registry.resolve(mode_id).root_binding.agent_name}"
     assert runner.describe_agent_sessions()["agents"][0]["agent_name"] == mode_registry.resolve(mode_id).root_binding.agent_name
 
 
@@ -111,35 +111,42 @@ def test_failed_lazy_root_acquisition_releases_the_request_gate(tmp_path: Path) 
         list(runner.stream("first"))
 
     runner.agent_manager.registry = registry  # type: ignore[assignment]
-    assert list(runner.stream("second"))[-1]["output"] == "done:root"
+    assert list(runner.stream("second"))[-1]["data"]["result"]["output"] == "done:root"
 
 
 def test_runner_queues_user_messages_as_agent_attachments(tmp_path: Path) -> None:
     runner, _ = _runner(tmp_path, "agent")
     list(runner.stream("initialize root"))
 
-    result = runner.queue_agent_user_message(
-        agent_name=runner.root_agent_name,
-        message="Inspect the failing tests.",
-    )
-    managed = runner.agent_manager.get_by_name(runner.root_agent_name)
-    attachments = runner._attachments_for(managed, 1)
+    ended = threading.Event()
+    unsubscribe = runner.subscribe(lambda event: ended.set() if event.get("kind") == "round_end" else None)
+    try:
+        result = runner.queue_agent_user_message(
+            agent_name=runner.root_agent_name,
+            message="Inspect the failing tests.",
+        )
+        assert result["accepted"] and result["message_id"] and result["round_id"]
+        assert ended.wait(5)
+        snapshot = runner.agent_manager.load_snapshot(runner.root_agent_id)
+        attachments = [
+            attachment for node in snapshot["session"]["nodes"].values()
+            for attachment in node.get("step", {}).get("attachments", [])
+            if attachment.get("message_id") == result["message_id"]
+        ]
+        assert len(attachments) == 1
+        assert attachments[0]["attachment_type"] == "agent_user_message"
+        assert attachments[0]["payload"]["text"] == "Inspect the failing tests."
+    finally:
+        unsubscribe()
+        runner.close()
 
-    assert result == {
-        "accepted": True,
-        "agent_name": runner.root_agent_name,
-        "delivery": "agent_attachment",
-    }
-    assert attachments[0]["attachment_type"] == "agent_user_message"
-    assert attachments[0]["payload"]["agent_name"] == runner.root_agent_name
-    assert attachments[0]["payload"]["text"] == "Inspect the failing tests."
 
 
 @pytest.mark.parametrize("mode_id", ["agent", "plan", "group", "team"])
-def test_prebuilt_factory_keeps_builtin_declarations_in_memory(tmp_path: Path, mode_id: str) -> None:
+def test_runner_creation_keeps_builtin_declarations_in_memory(tmp_path: Path, mode_id: str) -> None:
     """Resource defaults resolve without writes or constructing live Agents."""
 
-    runner = create_prebuilt_runner(runner_config=mode_id, base_dir=tmp_path)
+    runner = Runner.create(runner_config=mode_id, base_dir=tmp_path)
     assert not (tmp_path / ".juice" / "agents").exists()
     assert runner.agent_registry.load_config("root").name == "root"
     assert not runner.agent_manager.live_agents
@@ -151,7 +158,7 @@ def test_prebuilt_factory_keeps_builtin_declarations_in_memory(tmp_path: Path, m
 def test_builtin_modes_construct_root_from_an_effective_agent_config(tmp_path: Path, mode_id: str) -> None:
     """Mode-specific overlays do not become the canonical Registry declaration."""
 
-    runner = create_prebuilt_runner(runner_config=mode_id, base_dir=tmp_path)
+    runner = Runner.create(runner_config=mode_id, base_dir=tmp_path)
     try:
         instance = runner.agent_registry.instantiate(runner.root_config, model=object())
         assert instance.name == "root"
@@ -227,7 +234,7 @@ def test_mode_switch_rejects_active_work_without_mutating_current_mode(tmp_path:
 def test_unload_state_is_runner_and_mode_local_and_can_be_reactivated(tmp_path: Path) -> None:
     """Unload changes effective availability without rewriting Agent YAML."""
 
-    runner = create_prebuilt_runner(runner_config="agent", base_dir=tmp_path)
+    runner = Runner.create(runner_config="agent", base_dir=tmp_path)
     try:
         original = runner.agent_registry.load_config("explore").to_dict()
         assert {item["name"] for item in runner.list_available_agents()["agents"]} >= {"general", "explore"}

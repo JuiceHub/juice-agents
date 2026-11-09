@@ -56,16 +56,18 @@ def test_launcher_missing_dependencies_does_not_mutate_installation(tmp_path: Pa
     shutil.copy2(ROOT / "juice", checkout / "juice")
     # Python fails before frontend lookup; a failed dependency check must only
     # explain the repair, never install packages or delete node_modules.
-    failing_python = tmp_path / "missing-python-dependencies"
-    failing_python.write_text("#!/bin/bash\nexit 1\n", encoding="utf-8")
-    failing_python.chmod(0o755)
-    env = {**os.environ, "JUICE_PYTHON_PATH": str(failing_python),
+    package = checkout / "sdk" / "src" / "juice_agents"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("import juice_missing_test_dependency\n", encoding="utf-8")
+    env = {**os.environ, "JUICE_PYTHON_PATH": sys.executable,
            "JUICE_NODE_PATH": shutil.which("node") or ""}
     result = subprocess.run([str(checkout / "juice")], cwd=tmp_path, env=env,
                             capture_output=True, text=True)
     assert result.returncode != 0
     assert "pip install -e" in result.stderr
-    assert sorted(path.name for path in checkout.iterdir()) == ["juice"]
+    assert "juice_missing_test_dependency" in result.stderr
+    assert sorted(path.name for path in checkout.iterdir()) == ["juice", "sdk"]
+    shutil.rmtree(checkout / "sdk")
     for name in ("sdk", "adapters"):
         (checkout / name).symlink_to(ROOT / name, target_is_directory=True)
     frontend = checkout / "frontend"
@@ -81,6 +83,42 @@ def test_launcher_missing_dependencies_does_not_mutate_installation(tmp_path: Pa
     assert "npm ci" in missing_frontend.stderr
     assert sentinel.read_text(encoding="utf-8") == "keep"
     assert not (frontend / "package-lock.json").exists()
+
+
+def test_launcher_reports_import_runtime_errors_without_dependency_advice(tmp_path: Path) -> None:
+    """A filesystem failure during import must retain its traceback and cause."""
+    checkout = tmp_path / "runtime failure"
+    package = checkout / "sdk" / "src" / "juice_agents"
+    package.mkdir(parents=True)
+    shutil.copy2(ROOT / "juice", checkout / "juice")
+    (package / "__init__.py").write_text(
+        'raise FileNotFoundError("import-time filesystem failure")\n', encoding="utf-8"
+    )
+    env = {**os.environ, "JUICE_PYTHON_PATH": sys.executable,
+           "JUICE_NODE_PATH": shutil.which("node") or ""}
+    result = subprocess.run([str(checkout / "juice")], cwd=tmp_path, env=env,
+                            capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "FileNotFoundError: import-time filesystem failure" in result.stderr
+    assert "Python startup failed" in result.stderr
+    assert "dependencies are missing" not in result.stderr
+    assert "pip install" not in result.stderr
+
+
+def test_launcher_rejects_deleted_current_directory(tmp_path: Path) -> None:
+    """Remove only the child's cwd, then execute the real source launcher."""
+    deleted_workspace = tmp_path / "deleted project"
+    deleted_workspace.mkdir()
+    result = subprocess.run(
+        ["/bin/bash", "-c", 'cd "$1" && rmdir "$1" && exec "$2"',
+         "deleted-cwd-test", str(deleted_workspace), str(ROOT / "juice")],
+        cwd=tmp_path, capture_output=True, text=True,
+    )
+    assert result.returncode != 0
+    assert "Current working directory is unavailable" in result.stderr
+    assert "cd to an existing directory" in result.stderr
+    assert "dependencies are missing" not in result.stderr
+    assert "Traceback" not in result.stderr
 
 
 def test_launcher_rejects_invalid_workspace_and_reserved_worktree(tmp_path: Path) -> None:
@@ -112,8 +150,9 @@ def test_installed_cli_opens_project_catalog_and_exits_without_model_credentials
         encoding="utf-8",
     )
     (project / ".juice" / "config.yaml").write_text(
-        "models:\n  cli_catalog_probe:\n    backend: openai\n    provider_model_name: offline\n    api_base: http://127.0.0.1:1/v1\n"
-        "    api_key_env: JUICE_UNUSED_TEST_KEY\n", encoding="utf-8"
+        "providers:\n  offline:\n    backend: openai\n    api_base: http://127.0.0.1:1/v1\n"
+        "    api_key_env: JUICE_UNUSED_TEST_KEY\nmodels:\n  cli_catalog_probe:\n"
+        "    provider: offline\n    provider_model_name: offline\n", encoding="utf-8"
     )
     env = {**os.environ, "PATH": "/usr/bin:/bin", "HOME": str(tmp_path),
            "TERM": "xterm-256color", "JUICE_NO_ANIMATION": "1", "NO_COLOR": "1",
@@ -154,7 +193,7 @@ def test_installed_cli_opens_project_catalog_and_exits_without_model_credentials
         os.write(master, b"\r")
         child.wait(timeout=15)
         assert child.returncode == 0
-        assert not (project / ".juice" / "runners").exists(), "Catalog queries must remain cold"
+        assert not (project / ".juice" / "sessions").exists(), "Catalog queries must remain cold"
     finally:
         if child.poll() is None:
             child.kill()

@@ -407,7 +407,13 @@ class PermissionEngine:
     def _ask_user(self, action: PermissionAction) -> None:
         """向用户发起审批交互。"""
 
-        ask_user = getattr(self.runner, "ask_user", None)
+        # The Agent context owns execution identity, including the ancestor
+        # cancellation scope for synchronous calls. Bypassing it leaves gateway
+        # approvals detached from their round and impossible to cancel safely.
+        ask_user = getattr(getattr(self.agent, "runner_context", None), "ask_user", None)
+        if not callable(ask_user):
+            # Standalone policy users may supply only a small Runner facade.
+            ask_user = getattr(self.runner, "ask_user", None)
         if not callable(ask_user):
             raise PermissionDenied(f"工具 {action.tool!r} 需要审批，但当前没有用户交互通道")
         request = {

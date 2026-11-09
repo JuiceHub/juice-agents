@@ -13,10 +13,12 @@ import math
 import re
 from abc import ABC, abstractmethod
 from copy import deepcopy
+from contextlib import aclosing
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional
+from uuid import uuid4
 
 from juice_agents.core.agent.attachments import RuntimeAttachment
 from juice_agents.core.runner.types.identity import new_root_agent_id
@@ -36,7 +38,10 @@ except Exception:  # pragma: no cover - 运行时缺失 jsonschema
 
 from juice_agents.core.agent.agent_type import DEFAULT_OBSERVATION_IMAGE_CACHE_DIR, ObservationImage
 from juice_agents.core.config.context import ConfigurationContext
-from .local_python_executor import BASE_BUILTIN_MODULES, LocalPythonExecutor
+from ..managers.models import invoke_model_call
+from ..runner.execution.async_bridge import run_async, iter_sync
+from ..runner.execution.async_io import blocking, invoke
+from .local_python_executor import BASE_BUILTIN_MODULES, CodeOutput, LocalPythonExecutor
 from juice_agents.core.models.chat_models import _EmptyModelResponseError
 from .prompts import (
     DEFAULT_CODEACT_SYSTEM_PROMPT,
@@ -220,9 +225,9 @@ class _RegistryLazyTool(Tool):
         policy_fn = getattr(tool, "execution_policy", None)
         if callable(policy_fn):
             return policy_fn(dict(args), context)
-        from .tools.runtime.executor import ToolExecutionMode, ToolExecutionPolicy
+        from .tools.runtime.executor import ToolExecutionPolicy
 
-        return ToolExecutionPolicy(mode=ToolExecutionMode.SERIAL)
+        return ToolExecutionPolicy()
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         tool = self._instantiate()
@@ -373,32 +378,10 @@ def _extract_block(text: str, tag: str) -> str:
     return ""
 
 
-_THOUGHT_BLOCK_PATTERN = re.compile(r"<thought>.*?</thought>", re.DOTALL | re.IGNORECASE)
-# 闭合符允许是 </actions> 或重复的 <actions>：模型常把闭标签误写成开标签，此形式
-# 意图无歧义（沿用 _extract_block 的既有容错），不值得多花一轮往返让模型重写。
-# 真正的重复块（两个完整闭合对）仍会被计为 2 个而报错，见 _validate_react_protocol。
-_ACTIONS_BLOCK_PATTERN = re.compile(
-    r"<actions>(.*?)(?:</actions>|<actions>)", re.DOTALL | re.IGNORECASE
-)
-
-
-def _strip_thought_blocks(text: str) -> str:
-    """
-    逐块删除所有 ``<thought>...</thought>``，返回仅剩协议外层的残余文本。
-
-    模型经常在 thought 里引用协议名（写出字面量 ``<actions>`` / ``</actions>``），
-    若直接全文定位 actions 会把这些字面量误当成真正的块边界。这里用【非贪婪】
-    逐块删除而非"从首个 <thought> 删到末个 </thought>"的贪婪做法：贪婪会在模型
-    尾部幻觉伪造第二轮（thought + actions）时，把中间真实的 actions 一起吞掉，
-    只剩伪造的那个且数量恰好为 1，导致校验通过并静默执行伪造动作。逐块删除会让
-    这种情况留下 2 个 actions，落到显式协议错误、由模型下一轮自行修复。
-    """
-    return _THOUGHT_BLOCK_PATTERN.sub("", text)
-
-
-def _find_actions_blocks(text: str) -> list[re.Match[str]]:
-    """在已剔除 thought 的文本上定位所有 ``<actions>...</actions>`` 块。"""
-    return list(_ACTIONS_BLOCK_PATTERN.finditer(text))
+# 先跳过完整 thought，再定位外层 actions；JSON 字符串中的标签是数据而非边界。
+_REACT_START_PATTERN = re.compile(r"<thought>.*?</thought>|<actions>", re.DOTALL | re.IGNORECASE)
+_ACTION_TOKEN_PATTERN = re.compile(r'"(?:\\.|[^"\\])*"|</?actions>', re.DOTALL | re.IGNORECASE)
+_EXTRA_ACTION_CLOSES_PATTERN = re.compile(r"(?:\s*</actions>)+\s*", re.IGNORECASE)
 
 
 def _build_react_empty_output_protocol_error() -> ModelOutputProtocolError:
@@ -632,6 +615,9 @@ class MultiStepAgent(ABC):
         self.model = model
         # 只接收 Manager 显式绑定的结果处理器；Agent 不持有累计用量状态。
         self.model_usage_handler: Callable[..., None] | None = None
+        self.event_handler: Callable[[Any], None] | None = None
+        self._active_step_num = 0
+        self._started_tool_call_ids: set[str] = set()
         self.system_prompt_template = system_prompt
         self.prompt_language = normalize_prompt_language(prompt_language)
         # 子智能体关系不再保存为对象列表；运行时只保留 registry 名称引用。
@@ -1124,8 +1110,13 @@ class MultiStepAgent(ABC):
         """
         step.model_output = step.model_output or "异常终止"
         step.error = exc if isinstance(exc, AgentError) else AgentError(str(exc))
-        step.observations = []
-        step.observations_images = []
+        # A protocol check can fail after a tool has finished (for example,
+        # validating CodeAct's submitted value). Keep those completed records
+        # and their canonical observations aligned while reporting the separate
+        # flow error. Generation/parse failures have no tool results to retain.
+        if not step.tool_calls:
+            step.observations = []
+            step.observations_images = []
         step.round_outcome = "continue" if is_recoverable_agent_error(exc) else "failed"
         self._pretty_log("Error", str(step.error))
         return step
@@ -1159,19 +1150,23 @@ class MultiStepAgent(ABC):
         tool_calls: list[dict[str, Any]] = []
         for record in records:
             name = str(record.get("name") or record.get("tool_name") or "").strip()
-            if not name or name == "submit_output":
+            if not name:
                 continue
             args = record.get("args")
             tool_calls.append(
                 {
                     "name": name,
                     "args": dict(args) if isinstance(args, dict) else {},
-                    "mode": str(record.get("execution_mode") or record.get("mode") or "serial"),
-                    "status": "success" if bool(record.get("succeeded")) else str(record.get("status") or "error"),
+                    "mode": str(record.get("execution_mode") or record.get("mode") or "foreground"),
+                    # A background launch is successful, but its task has not
+                    # completed. Preserve that lifecycle state in saved history.
+                    "status": str(record.get("status") or "failed"),
                     "call_id": str(record.get("call_id") or ""),
                     "task_id": str(record.get("task_id") or record.get("async_task_id") or ""),
+                    "error": record.get("error"),
+                    "execution_time": record.get("duration_seconds"),
                     "observation_index": record.get("observation_index"),
-                    "is_terminal": bool(record.get("is_terminal")),
+                    "is_terminal": name == "submit_output" or bool(record.get("is_terminal")),
                     "max_observation_chars": record.get("max_observation_chars"),
                 }
             )
@@ -1305,11 +1300,14 @@ class MultiStepAgent(ABC):
             step.usage = None
 
     def build_messages(self) -> list[dict[str, Any]]:
+        return run_async(self.abuild_messages())
+
+    async def abuild_messages(self) -> list[dict[str, Any]]:
         # 压缩策略处理
         if self.context_compression_strategy is not None:
             if self.context_compression_strategy.should_compress(self.context):
-                self.context = self.context_compression_strategy.compress(
-                    self.context, on_model_usage=self._report_model_usage,
+                self.context = await self.context_compression_strategy.acompress(
+                    self.context, on_model_usage=self._report_model_usage, model_call=self._acall_model,
                 )
             messages = self.context.to_messages()
             self._pending_request_bytes = self._messages_utf8_bytes(messages)
@@ -1330,13 +1328,15 @@ class MultiStepAgent(ABC):
                 preserve_recent_actions=int(compact_config["preserve_recent_actions"]),
             )
             try:
-                self.context = strategy.compress(self.context, on_model_usage=self._report_model_usage)
+                self.context = await strategy.acompress(self.context, on_model_usage=self._report_model_usage, model_call=self._acall_model)
                 logger.info(
                     "会话 compact 成功: agent=%s estimated_tokens=%s trigger_tokens=%s",
                     self.name,
                     canonical_tokens,
                     trigger_tokens,
                 )
+            except StreamCancelled:
+                raise
             except Exception:
                 # 摘要失败不破坏 canonical；当前轮继续走 remain 投影。
                 logger.exception(
@@ -1402,7 +1402,21 @@ class MultiStepAgent(ABC):
             agent_mode=str(getattr(getattr(runner_context, "runner", None), "agent_mode", "") or ""),
             permission_check=lambda tool, args: check_agent_tool_permission(self, tool, dict(args)),
             plan_check=_plan_check,
+            on_tool_start=self._emit_tool_start if self.event_handler is not None else None,
         )
+
+    def _emit_tool_start(self, action: ResolvedToolAction, call_id: str) -> None:
+        """Called by the worker only when the actual tool invocation begins."""
+        from .context.steps import ActionEvent
+
+        self._started_tool_call_ids.add(call_id)
+        if self.event_handler is not None:
+            self.event_handler(ActionEvent(
+                step_num=self._active_step_num,
+                event_type="tool_start",
+                data={"call_id": call_id, "tool_name": action.name,
+                      "tool_args": dict(action.args), "tool_index": action.order},
+            ))
 
     def _execute_tools(self, actions: Any, *, context: ToolExecutionContext | None = None) -> list[ToolExecutionResult]:
         """Delegate a batch to the Runner-owned ToolManager.
@@ -1426,45 +1440,70 @@ class MultiStepAgent(ABC):
         execute = getattr(runner_context, "execute_tool_action", None)
         if not callable(execute):
             raise RuntimeError("Agent 执行工具需要 AgentManager 绑定的 RunnerContext")
-        return execute(action, order=order, context=self._tool_execution_context())
+        result = execute(action, order=order, context=self._tool_execution_context())
+        if self.event_handler is not None and result.call_id in self._started_tool_call_ids:
+            from .context.steps import ActionEvent
 
-    @staticmethod
-    def _generate_accepts_cancel_event(generate: Any) -> bool:
-        """Best-effort signature check so old custom models keep working."""
+            self._started_tool_call_ids.discard(result.call_id)
+            observation = "" if result.observation is None else _serialize_submit_output(result.observation)
+            self.event_handler(ActionEvent(
+                step_num=self._active_step_num, event_type="tool_end",
+                data={"call_id": result.call_id, "tool_name": action.name,
+                      "tool_args": dict(action.args), "tool_index": action.order,
+                      "status": result.status, "task_id": result.task_id,
+                      "observation": observation, "error": result.error,
+                      "execution_time": result.duration_seconds},
+            ))
+        return result
 
-        try:
-            signature = inspect.signature(generate)
-        except (TypeError, ValueError):
-            return True
-        return "cancel_event" in signature.parameters or any(
-            param.kind == inspect.Parameter.VAR_KEYWORD
-            for param in signature.parameters.values()
+    def _execute_tools_streaming(self, actions: Any) -> Iterator[Any]:
+        """Keep scheduling on the Runner request thread while forwarding events."""
+
+        runner_context = getattr(self, "runner_context", None)
+        execute = getattr(runner_context, "execute_tools_streaming", None)
+        if not callable(execute):
+            raise RuntimeError("Agent 执行工具需要 AgentManager 绑定的 RunnerContext")
+        return execute(actions, context=self._tool_execution_context())
+
+    def _emit_model_event(self, kind: str, data: dict[str, Any]) -> None:
+        """Forward model boundaries through this Agent's Manager binding."""
+        from .context.steps import ActionEvent
+
+        if self.event_handler is not None:
+            self.event_handler(ActionEvent(
+                step_num=self._active_step_num, event_type=kind, data=data,
+            ))
+
+    def _call_model(self, model: Any, method: str, **kwargs: Any) -> Any:
+        return run_async(self._acall_model(model, method, **kwargs))
+
+    async def _acall_model(
+        self, model: Any, method: str, *, purpose: str,
+        args: tuple[Any, ...] = (), kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        """Use one wrapper for generation, candidate scoring and compression."""
+        self._check_cancelled()
+        manager = getattr(self, "model_manager", None)
+        call = manager.acall if manager is not None else invoke_model_call
+        return await call(
+            model, method, purpose=purpose, args=args, kwargs=kwargs,
+            cancel_event=self._runner_cancel_event(),
+            on_model_usage=self._report_model_usage, on_event=self._emit_model_event,
         )
 
-    def _generate_model(
+    def _generate_model(self, messages: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
+        return run_async(self._agenerate_model(messages, **kwargs))
+
+    async def _agenerate_model(
         self,
         messages: list[dict[str, Any]],
         *,
         stop_sequence: list[str] | None | object = _MISSING,
     ) -> dict[str, Any]:
-        """Call the model with the runner cancellation token when supported."""
-
-        self._check_cancelled()
-        generate = self.model.generate
-        kwargs: dict[str, Any] = {}
-        if stop_sequence is not _MISSING:
-            kwargs["stop_sequence"] = stop_sequence
-        cancel_event = self._runner_cancel_event()
-        if cancel_event is not None and self._generate_accepts_cancel_event(generate):
-            kwargs["cancel_event"] = cancel_event
-        try:
-            response = generate(messages, **kwargs)
-        except Exception as exc:
-            self._report_model_usage(kind="generation", model=self.model, error=exc)
-            raise
-        self._report_model_usage(kind="generation", model=self.model, response=response)
-        self._check_cancelled()
-        return response
+        kwargs = {} if stop_sequence is _MISSING else {"stop_sequence": stop_sequence}
+        return await self._acall_model(
+            self.model, "generate", purpose="generation", args=(messages,), kwargs=kwargs,
+        )
 
     def _report_model_usage(self, **result: Any) -> None:
         """显式转交调用结果；账本和持久化均由 Manager 的运行时绑定负责。"""
@@ -1476,9 +1515,9 @@ class MultiStepAgent(ABC):
         """复用各 Agent 的协议解析，只校验并返回执行参数，不执行任何动作。"""
         raise NotImplementedError
 
-    def _select_step_candidate(
+    async def _aselect_step_candidate(
         self, step: ActionStep, messages: list[dict[str, Any]]
-    ) -> Iterator[Any]:
+    ) -> tuple[Any, Any, Exception | None]:
         """从同一消息快照生成候选；选中后才允许调用方进入执行阶段。
 
         candidates 是内部事件，由 Manager 在恢复此生成器前统一落树和持久化。
@@ -1492,11 +1531,11 @@ class MultiStepAgent(ABC):
         candidates: list[ActionStep] = []
         parsed: list[Any] = []
         for _ in range(count):
-            candidate = ActionStep(step_num=step.step_num, model_output="")
+            candidate = ActionStep(step_num=step.step_num, model_output="", round_id=step.round_id, step_id=step.step_id)
             try:
                 # 多候选各自持有消息副本，防止自定义模型修改传入列表后影响后续采样。
                 # 线性路径沿用原调用，不添加请求或改动模型采样接口。
-                response = self._generate_model(deepcopy(messages) if count > 1 else messages)
+                response = await self._agenerate_model(deepcopy(messages) if count > 1 else messages)
             except _EmptyModelResponseError as exc:
                 # 模型层已耗尽空响应重试。将其作为无效候选，允许其他有效候选胜出；
                 # 若最终仍选到空输出，各协议解析会生成原来的可恢复错误。
@@ -1517,17 +1556,18 @@ class MultiStepAgent(ABC):
 
         selection_error: Exception | None = None
         try:
-            selected, scores = strategy.select(
+            selected, scores = await invoke(getattr(strategy, "aselect", strategy.select),
                 context=deepcopy(messages), candidates=candidates,
-                on_model_usage=self._report_model_usage,
+                on_model_usage=self._report_model_usage, model_call=self._acall_model,
             )
         except Exception as exc:
             # 评分失败仍保留本步所有已生成输出，但在落树后立即报错，绝不执行。
             selected, scores, selection_error = 0, [None] * count, exc
         step.__dict__.update(candidates[selected].__dict__)
         candidates[selected] = step
+        candidate_event = None
         if count > 1:
-            yield ActionEvent(
+            candidate_event = ActionEvent(
                 step_num=step.step_num,
                 event_type="candidates",
                 data={
@@ -1541,10 +1581,7 @@ class MultiStepAgent(ABC):
         # Scoring and Manager checkpoint callbacks can outlive the last model
         # request and observe cancellation themselves.  Check their boundary
         # before returning any tool/code parameters to the execution phase.
-        self._check_cancelled()
-        if selection_error is not None:
-            raise selection_error
-        return parsed[selected]
+        return parsed[selected], candidate_event, selection_error
 
     def _reset_tool_runtime_state(self) -> None:
         """
@@ -1559,10 +1596,13 @@ class MultiStepAgent(ABC):
             except Exception:  # pragma: no cover - 运行时保护
                 logger.warning("重置工具运行时状态失败: agent=%s tool=%s", self.name, tool.name)
 
-    @abstractmethod
-    def step(self, step: ActionStep) -> ActionStep:
-        """执行单步推理。"""
+    def step(self, step: ActionStep) -> Iterator[Any]:
+        """同步 SDK 入口；内置执行逻辑统一在 astep 中。"""
+        return iter_sync(self.astep(step))
+
+    async def astep(self, step: ActionStep):
         raise NotImplementedError
+        yield  # async-generator contract for subclasses
 
     @abstractmethod
     def init_system_prompt(self) -> str:
@@ -1684,29 +1724,35 @@ class ReActAgent(MultiStepAgent):
         static_template, dynamic_template = get_react_prompt_segments(self.prompt_language)
         return self._render_segments_with_context(static_template, dynamic_template)
 
-    def _validate_react_protocol(self, content: str) -> str:
+    def _validate_react_protocol(self, content: str) -> tuple[str, str]:
         """
-        校验 ReAct 外层协议，并返回唯一 ``<actions>`` 块的原始内容。
+        提取唯一动作块，并返回其内容和可安全回放的模型输出。
 
-        剔除 thought 后要求：actions 块恰好 1 个，且其后不得有非空残留。后者对齐
-        提示词里 "不要在 </actions> 后继续输出内容" 的约束——只查数量挡不住模型在
-        唯一 actions 之后追加伪造的 ``<attachments>`` / 工具观测，那些内容会随
-        ``step.model_output`` 回放并被下一轮当成真实历史。
+        仅容错结尾连续重复的闭合标签；任何其他尾随内容都必须拒绝，避免把伪造的
+        下一轮动作或观测当作真实历史。JSON 字符串和前面的 thought 原样保留。
         """
-        residual = _strip_thought_blocks(content)
-        blocks = _find_actions_blocks(residual)
-        if not blocks:
+        opening = next(
+            (match for match in _REACT_START_PATTERN.finditer(content)
+             if match.group().lower() == "<actions>"),
+            None,
+        )
+        closing = None
+        if opening is not None:
+            # 使用正则先跳过 JSON 字符串，再识别标签；保留历史上把闭合标签
+            # 误写成 <actions> 的容错，真实的第二个动作块仍会被尾部校验拒绝。
+            closing = next(
+                (match for match in _ACTION_TOKEN_PATTERN.finditer(content, opening.end())
+                 if not match.group().startswith('"')),
+                None,
+            )
+        if opening is None or closing is None:
             raise self._build_action_validation_error(
                 "模型输出缺少必需的 <actions> 块。即使当前步没有工具调用，"
                 "也必须输出 <actions>[]</actions> 表示空动作列表。"
             )
-        if len(blocks) > 1:
-            raise self._build_action_validation_error(
-                f"模型输出包含 {len(blocks)} 个 <actions> 块，每步只允许一个。"
-                "请只保留本步真正要执行的动作，删除其余 <actions> 块。"
-            )
-        trailing = residual[blocks[0].end():].strip()
-        if trailing:
+        trailing = content[closing.end():]
+        if trailing.strip() and not _EXTRA_ACTION_CLOSES_PATTERN.fullmatch(trailing):
+            trailing = trailing.strip()
             preview = trailing[:200]
             ellipsis = "..." if len(trailing) > 200 else ""
             raise self._build_action_validation_error(
@@ -1714,10 +1760,12 @@ class ReActAgent(MultiStepAgent):
                 "或伪造的工具观测）。请在 </actions> 处结束本步输出。"
                 f"实际多余的内容为：{preview}{ellipsis}"
             )
-        return blocks[0].group(1)
+        # 原始响应仍写入诊断日志；安全修复后的输出供事件和后续上下文使用。
+        normalized = content[:closing.end()] if trailing.strip() else content
+        return content[opening.end():closing.start()], normalized
 
     def parse_actions(self, model_output: str) -> List[Dict[str, Any]]:
-        actions_block = self._validate_react_protocol(model_output)
+        actions_block, _ = self._validate_react_protocol(model_output)
         stripped_actions = actions_block.strip()
         if not stripped_actions:
             return []
@@ -1982,7 +2030,10 @@ class ReActAgent(MultiStepAgent):
         self._current_execution_records = list(results)
         for spec, result in zip(action_specs, results):
             texts, imgs = self._split_result(result.observation)
-            if result.status not in {"completed", "background"} and result.error:
+            if result.status not in {"completed", "background"} and result.error and not texts:
+                # A failed receipt can still contain useful tool output. Keep
+                # that output intact; synthesize an observation only for errors
+                # caught before a tool could return one (for example, a raise).
                 if result.status == "denied" and not _policy_allows_tool(self, spec["target"]):
                     texts = [_policy_denial_message(spec["name"])]
                 elif result.status == "failed":
@@ -2005,7 +2056,7 @@ class ReActAgent(MultiStepAgent):
                     "name": spec["name"],
                     "args": dict(spec["args"]),
                     "mode": result.status,
-                    "execution_mode": result.policy.mode.value if result.policy else "serial",
+                    "execution_mode": result.policy.mode.value if result.policy else "foreground",
                     "succeeded": result.ok,
                     "is_terminal": bool(spec["is_terminal"]),
                     "max_observation_chars": spec["max_observation_chars"],
@@ -2034,123 +2085,120 @@ class ReActAgent(MultiStepAgent):
                 observations.append(block)
         return observations, images, execution_records, terminal_output
 
-    def process_actions_streaming(
-        self, action_specs: List[dict[str, Any]], step_num: int
-    ) -> Iterator[Any]:
-        """逐个执行一次工具，yield 事件，再通过生成器返回同一批结果的聚合值。"""
+    def process_actions_streaming(self, action_specs, step_num):
+        """同步扩展入口；调度及结果投影统一由异步实现处理。"""
+        completed = []
+        yield from iter_sync(self.aprocess_actions_streaming(action_specs, step_num, completed))
+        return completed[0]
+
+    async def aprocess_actions_streaming(
+        self, action_specs: List[dict[str, Any]], step_num: int, completed: list
+    ):
+        """整批调度 actions；事件按完成顺序流出，结果按模型顺序聚合。
+
+        每个工具的返回值只投影一次。完成事件可以先展示较快的结果，而
+        observation 索引必须在整批收齐后按 action 顺序分配，避免结果错配。
+        """
         from .context.steps import ActionEvent
-        import time
 
         if not action_specs:
-            return [], [], [], _NO_SUBMIT_OUTPUT
+            completed.append(([], [], [], _NO_SUBMIT_OUTPUT))
+            return
 
         results: list[ToolExecutionResult] = []
-        observations: list[str] = []
-        images: list[ObservationImage] = []
-        records: list[dict[str, Any]] = []
-        terminal_output: Any = _NO_SUBMIT_OUTPUT
-
-        for idx, spec in enumerate(action_specs):
-            # Yield 工具开始事件
-            yield ActionEvent(
-                step_num=step_num,
-                event_type="tool_start",
-                data={
-                    "tool_name": spec["name"],
-                    "tool_args": dict(spec["args"]),
-                    "tool_index": idx,
-                },
-            )
-
-            # 执行单个工具
-            start_time = time.time()
-            resolved_action = ResolvedToolAction(
+        specs_by_order = {int(spec["order"]): spec for spec in action_specs}
+        projections: dict[int, tuple[list[str], list[ObservationImage], list[dict[str, Any]], Any]] = {}
+        resolved = [
+            ResolvedToolAction(
                 tool=spec["target"],
                 args=dict(spec["args"]),
                 order=int(spec["order"]),
                 max_observation_chars=spec.get("max_observation_chars"),
             )
+            for spec in action_specs
+        ]
+        stream = self.runner_context.aexecute_tools_streaming(
+            resolved, context=self._tool_execution_context(),
+        )
+        try:
+            async for event in stream:
+                order = event.action.order
+                spec = specs_by_order[order]
+                if event.result is None:
+                    if self.event_handler is not None:
+                        continue
+                    yield ActionEvent(
+                        step_num=step_num,
+                        event_type="tool_start",
+                        data={
+                            "call_id": event.call_id,
+                            "tool_name": spec["name"],
+                            "tool_args": dict(spec["args"]),
+                            "tool_index": order,
+                        },
+                    )
+                    continue
 
-            try:
-                result = self._execute_tool_action(resolved_action, order=idx)
+                result = event.result
                 results.append(result)
-                execution_time = time.time() - start_time
-                # 只投影已有返回值；持久化随后仍使用这里的 result。
-                texts, result_images, result_records, output = self._collect_action_results([spec], [result])
-                for record in result_records:
-                    if record["observation_index"] is not None:
-                        record["observation_index"] += len(observations)
-                observations.extend(texts)
-                images.extend(result_images)
-                records.extend(result_records)
-                if output is not _NO_SUBMIT_OUTPUT:
-                    terminal_output = output
-                observation_text = "\n".join(texts)
-                error_text = str(result.error) if result.error else None
-
-                # Yield 工具完成事件
+                projection = await blocking(self._collect_action_results, [spec], [result])
+                projections[order] = projection
+                if self.event_handler is not None and result.call_id not in self._started_tool_call_ids:
+                    continue
+                self._started_tool_call_ids.discard(result.call_id)
                 yield ActionEvent(
                     step_num=step_num,
                     event_type="tool_end",
                     data={
+                        "call_id": result.call_id,
                         "tool_name": spec["name"],
-                        "tool_index": idx,
-                        "observation": observation_text,
-                        "error": error_text,
-                        "execution_time": execution_time,
+                        "tool_args": dict(spec["args"]),
+                        "tool_index": order,
+                        "status": result.status,
+                        "task_id": result.task_id,
+                        "observation": "\n".join(projection[0]),
+                        "error": str(result.error) if result.error else None,
+                        "execution_time": result.duration_seconds,
                     },
                 )
-            except Exception as exc:
-                execution_time = time.time() - start_time
-                logger.exception("工具执行异常 tool=%s", spec["name"])
-                yield ActionEvent(
-                    step_num=step_num,
-                    event_type="tool_end",
-                    data={
-                        "tool_name": spec["name"],
-                        "tool_index": idx,
-                        "observation": "",
-                        "error": str(exc),
-                        "execution_time": execution_time,
-                    },
-                )
-                # 基础设施异常不能静默吞掉；否则缺失的结果会错配到后续工具。
-                raise
+        except Exception:
+            logger.exception("整批工具执行异常 agent=%s step=%s", self.name, step_num)
+            raise
+        finally:
+            # Closing propagates through RunnerContext/ToolManager so submitted
+            # work is drained and audited before the request leaves this step.
+            await stream.aclose()
 
-        self._current_execution_records = results
-        return observations, images, records, terminal_output
+        observations: list[str] = []
+        images: list[ObservationImage] = []
+        records: list[dict[str, Any]] = []
+        terminal_output: Any = _NO_SUBMIT_OUTPUT
+        for spec in action_specs:
+            texts, result_images, result_records, output = projections[int(spec["order"])]
+            for record in result_records:
+                if record["observation_index"] is not None:
+                    record["observation_index"] += len(observations)
+            observations.extend(texts)
+            images.extend(result_images)
+            records.extend(result_records)
+            if output is not _NO_SUBMIT_OUTPUT:
+                terminal_output = output
 
-    @staticmethod
-    def _tool_call_records_for_display(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        tool_calls: list[dict[str, Any]] = []
-        for record in records:
-            name = str(record.get("name") or record.get("tool_name") or "").strip()
-            if not name or name == "submit_output":
-                continue
-            args = record.get("args")
-            tool_calls.append(
-                {
-                    "name": name,
-                    "args": dict(args) if isinstance(args, dict) else {},
-                    "mode": str(record.get("execution_mode") or record.get("mode") or "serial"),
-                    "status": "success" if bool(record.get("succeeded")) else str(record.get("status") or "error"),
-                    "call_id": str(record.get("call_id") or ""),
-                    "task_id": str(record.get("task_id") or record.get("async_task_id") or ""),
-                    "observation_index": record.get("observation_index"),
-                    "is_terminal": bool(record.get("is_terminal")),
-                    "max_observation_chars": record.get("max_observation_chars"),
-                }
-            )
-        return tool_calls
+        self._current_execution_records = sorted(results, key=lambda result: result.order)
+        completed.append((observations, images, records, terminal_output))
 
     def _parse_candidate(self, step: ActionStep) -> list[dict[str, Any]]:
         if not step.model_output.strip():
             raise _build_react_empty_output_protocol_error()
         action_specs = self._resolve_action_targets(self.parse_actions(step.model_output))
         self._validate_actions_protocol(action_specs)
+        _, normalized = self._validate_react_protocol(step.model_output)
+        if normalized != step.model_output:
+            logger.info("已修复 ReAct 输出末尾重复的 actions 闭合标签")
+            step.model_output = normalized
         return action_specs
 
-    def step(self, step: ActionStep) -> Iterator[Any]:
+    async def astep(self, step: ActionStep):
         """
         执行单步推理，yield 流式事件。
 
@@ -2160,8 +2208,13 @@ class ReActAgent(MultiStepAgent):
         from .context.steps import ActionEvent
 
         self._prepare_step_execution()
-        messages = self.build_messages()
-        action_specs = yield from self._select_step_candidate(step, messages)
+        messages = await self.abuild_messages()
+        action_specs, candidates_event, selection_error = await self._aselect_step_candidate(step, messages)
+        if candidates_event is not None:
+            yield candidates_event
+        self._check_cancelled()
+        if selection_error is not None:
+            raise selection_error
 
         # 对未继承 BaseChatModel 的自定义裸 generate(...) 模型，仍保留旧兜底，
         # 这样不要求所有外部模型立刻实现同样的空响应重试协议。
@@ -2183,9 +2236,11 @@ class ReActAgent(MultiStepAgent):
             raise step.error
 
         # → Yield 工具执行的流式事件
-        observations, observation_images, execution_records, terminal_output = yield from (
-            self.process_actions_streaming(action_specs, step.step_num)
-        )
+        completed = []
+        async with aclosing(self.aprocess_actions_streaming(action_specs, step.step_num, completed)) as events:
+            async for event in events:
+                yield event
+        observations, observation_images, execution_records, terminal_output = completed[0]
         if not action_specs:
             # 空 actions 与普通步一致：给出 observation 后进入下一步，由 max_steps 兜底。
             observations = [_EMPTY_ACTIONS_OBSERVATION]
@@ -2355,7 +2410,7 @@ class CodeActAgent(MultiStepAgent):
                 )
         return wrapped
 
-    def step(self, step: ActionStep) -> Iterator[Any]:
+    async def astep(self, step: ActionStep):
         """
         执行单步推理，yield 流式事件。
 
@@ -2366,8 +2421,13 @@ class CodeActAgent(MultiStepAgent):
         import time
 
         self._prepare_step_execution()
-        messages = self.build_messages()
-        code_block = yield from self._select_step_candidate(step, messages)
+        messages = await self.abuild_messages()
+        code_block, candidates_event, selection_error = await self._aselect_step_candidate(step, messages)
+        if candidates_event is not None:
+            yield candidates_event
+        self._check_cancelled()
+        if selection_error is not None:
+            raise selection_error
 
         # 自定义裸 generate(...) 模型仍走这里的旧兜底；
         # 只有 BaseChatModel 体系才会在模型层先做空响应重试。
@@ -2388,11 +2448,15 @@ class CodeActAgent(MultiStepAgent):
         if step.error is not None:
             raise step.error
 
-        # → Yield 代码执行开始事件
+        # The Python wrapper is one visible call, separate from the tools it
+        # invokes. Allocate its identity before streaming so both events and
+        # the durable record refer to exactly the same code execution.
+        call_id = uuid4().hex
         yield ActionEvent(
             step_num=step.step_num,
             event_type="tool_start",
             data={
+                "call_id": call_id,
                 "tool_name": "Python",
                 "tool_args": {"code": code_block},
                 "tool_index": 0,
@@ -2403,8 +2467,37 @@ class CodeActAgent(MultiStepAgent):
         start_time = time.time()
         self._codeact_action_order = 0
         self._current_execution_records = []
-        code_output = self.executor(code_block)
+        try:
+            code_output = await self.runner_context.arun_code(self.executor, code_block)
+        except StreamCancelled as exc:
+            elapsed = time.time() - start_time
+            step.tool_calls = [{
+                "name": "Python", "args": {"code": code_block}, "mode": "foreground",
+                "status": "cancelled", "call_id": call_id, "error": str(exc),
+                "execution_time": elapsed, "observation_index": None,
+            }] + self._tool_call_records_for_display([
+                record.to_dict() for record in self._current_execution_records
+            ])
+            yield ActionEvent(step_num=step.step_num, event_type="tool_end", data={
+                "call_id": call_id, "tool_name": "Python", "tool_args": {"code": code_block},
+                "tool_index": 0, "status": "cancelled", "error": str(exc),
+                "observation": "", "execution_time": elapsed,
+            })
+            raise
+        except Exception as exc:
+            # Executors normally return CodeOutput.error. Treat an unexpected
+            # execution exception the same way so the tool record owns the
+            # failure and the model can repair it on the following step.
+            logger.exception("CodeAct 执行器异常 agent=%s step=%s", self.name, step.step_num)
+            code_output = CodeOutput(
+                output=None,
+                logs="",
+                error=f"{type(exc).__name__}: {exc}",
+                submitted=False,
+                observation_images=[],
+            )
         execution_time = time.time() - start_time
+        cancelled = bool(self._runner_cancel_event() is not None and self._runner_cancel_event().is_set())
 
         # executor 会分别返回标准输出/错误、最终返回值和图片；这里把它们拆回
         # session 能消费的 observation 结构，保持日志和回放一致。
@@ -2431,16 +2524,17 @@ class CodeActAgent(MultiStepAgent):
             step_num=step.step_num,
             event_type="tool_end",
             data={
+                "call_id": call_id,
                 "tool_name": "Python",
+                "tool_args": {"code": code_block},
                 "tool_index": 0,
+                "status": "cancelled" if cancelled else "failed" if code_output.error else "completed",
+                "is_terminal": code_output.submitted,
                 "observation": observation_text,
                 "error": code_output.error if code_output.error else None,
                 "execution_time": execution_time,
             },
         )
-
-        if code_output.submitted:
-            _validate_submit_output_payload(code_result, self.output_schema)
 
         self._finalize_step_artifacts(
             step,
@@ -2452,14 +2546,33 @@ class CodeActAgent(MultiStepAgent):
                 [CODEACT_OBSERVATION_PROJECTION_CHARS] if observation_text else []
             ),
         )
-        step.tool_calls = self._tool_call_records_for_display(
+        # Persist the wrapper's existing execution status and error instead of
+        # copying tool failures to step.error. The observation remains the sole
+        # model feedback; this display record also preserves history rendering.
+        step.tool_calls = [{
+            "name": "Python",
+            "args": {"code": code_block},
+            "mode": "foreground",
+            "status": "cancelled" if cancelled else "failed" if code_output.error else "completed",
+            "is_terminal": code_output.submitted,
+            "call_id": call_id,
+            "error": code_output.error or None,
+            "execution_time": execution_time,
+            "observation_index": 0 if observation_text else None,
+        }] + self._tool_call_records_for_display(
             [
                 record.to_dict()
                 for record in self._current_execution_records
                 if str(record.tool_name or "") != "add_image"
             ]
         )
+        if cancelled:
+            self._check_cancelled()
         if code_output.submitted:
+            # The code already finished successfully. Persist its tool result
+            # before validating the submission protocol so a schema error stays
+            # a separate step.error rather than rewriting Python as failed.
+            _validate_submit_output_payload(code_result, self.output_schema)
             step.round_outcome = "submitted"
             step.output = code_result
         else:

@@ -1,4 +1,4 @@
-"""Runner 原生 async task registry、scope store 与 agent lifecycle。"""
+"""Runner 原生 async task registry、scope store 。"""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import concurrent.futures
 import copy
 import json
 import logging
-import subprocess
 import threading
 import time
 import weakref
@@ -15,41 +14,31 @@ from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 
-# `concurrent.futures` exposes ThreadPoolExecutor lazily.  Resolve the public
-# class before registering our shutdown hook, which also loads
-# ``concurrent.futures.thread`` and registers its ``_python_exit`` hook first.
-# ``threading._shutdown`` invokes hooks in reverse order, so our hook can set
-# the cooperative stop event before futures tries to join non-daemon workers.
-from concurrent.futures import ThreadPoolExecutor
+import asyncio
+
+from ..execution.async_bridge import runtime
 
 from juice_agents.core.runner.workspace import RuntimeWorkspace
 from juice_agents.core.utils import sanitize_path_component
+from juice_agents.core.registry.common.store import atomic_write_text
 
 from .kinds import to_public_kind
 from .store import (
     build_scoped_async_task_output_dir,
     load_async_tasks_store,
+    read_async_task_output,
     write_async_tasks_store,
 )
 from ..execution.event_queue import RunnerEventQueue
 from .internal_types import (
     AsyncTaskKind,
     AsyncTaskState as InternalAsyncTaskState,
-    RunnerAgentKind,
-    RunnerAgentState,
     AsyncTaskRuntimeState,
-    TeammateAsyncTaskState,
 )
-from .lifecycle import (
-    build_agent_state,
-    close_async_task,
-    set_agent_status,
-    set_teammate_shutdown,
-)
+from .lifecycle import close_async_task
 from ..types.definitions import AsyncTaskState
 
 from .executor import _AsyncTaskExecutorMixin
-from .teammates import _AsyncTaskTeammatesMixin
 from .launchers import _AsyncTaskLaunchersMixin
 
 logger = logging.getLogger(__name__)
@@ -57,7 +46,7 @@ logger = logging.getLogger(__name__)
 _ASYNC_TASK_ACTIVE_STATUSES = {"pending", "running"}
 
 # 所有存活的 registry 弱引用。调用方漏掉 stop() 时（脚本直接丢弃 runner、测试跑完不收尾），
-# 靠下面的 hook 兜底回收线程池。
+# 靠下面的 hook 兜底回收后台任务。
 _LIVE_RUNTIMES: weakref.WeakSet = weakref.WeakSet()
 
 
@@ -66,7 +55,7 @@ def _shutdown_live_runtimes() -> None:
         try:
             runtime.shutdown(wait=True, timeout_seconds=2.0)
         except Exception:  # 停机阶段不能抛，否则盖掉真正的退出路径
-            logger.debug("退出时回收线程池失败", exc_info=True)
+            logger.debug("退出时回收后台任务失败", exc_info=True)
 
 
 # 必须走 threading._register_atexit，不能用 atexit.register：
@@ -103,7 +92,6 @@ def _to_public_async_task(async_task: dict[str, Any]) -> AsyncTaskState:
 
 class _AsyncTaskRuntime(
     _AsyncTaskExecutorMixin,
-    _AsyncTaskTeammatesMixin,
     _AsyncTaskLaunchersMixin,
 ):
     """单个 Runner 或 Team scope 内的后台异步任务注册表。"""
@@ -115,24 +103,19 @@ class _AsyncTaskRuntime(
         runtime_workspace: RuntimeWorkspace | None = None,
         default_base_dir: str | Path | None = None,
         max_workers: int = 8,
-        public_sync: Callable[[list[AsyncTaskState], dict[str, dict[str, Any]]], None] | None = None,
         outputs_dir: str | Path | None = None,
     ) -> None:
         self.event_queue = event_queue
         self.runtime_workspace = runtime_workspace or RuntimeWorkspace(workspace_dir=None)
         self.default_base_dir = Path(default_base_dir or Path.cwd()).resolve()
-        self._executor = ThreadPoolExecutor(max_workers=max(1, max_workers))
+        self._max_workers = max(1, max_workers)
+        self._slots = None
         self._shutdown_complete = False
-        # 进程级停机信号。长生命周期的 worker（teammate loop）必须在轮询时检查它：
-        # 这是「不依赖磁盘状态、不依赖调用方记得调 stop()」的唯一可靠退出条件。
-        self._shutdown_event = threading.Event()
         _LIVE_RUNTIMES.add(self)
         self._async_tasks: dict[str, InternalAsyncTaskState] = {}
-        self._agents: dict[str, RunnerAgentState] = {}
         self._futures: dict[str, concurrent.futures.Future[Any]] = {}
-        self._processes: dict[str, subprocess.Popen[str]] = {}
-        # 通用线程任务的协作式取消信号：stop 时 set，runner 回调在边界自行检查。
-        # 线程无法被强杀，这是让运行中的任务（如 workflow）尽快停下的唯一方式。
+        # 每个任务独立取消令牌；协程收到信号后 cancel 并等待 finally。
+        # 同步扩展则在边界协作取消，不能强杀其工作线程。
         self._cancel_events: dict[str, threading.Event] = {}
         self._lock = threading.RLock()
         self._store_path: Path | None = None
@@ -140,8 +123,48 @@ class _AsyncTaskRuntime(
         self._scope_kind = "agent"
         self._scope_status = "running"
         self._scope_meta: dict[str, Any] = {}
-        self._public_sync = public_sync
         self._outputs_dir = None if outputs_dir is None else Path(outputs_dir).resolve()
+
+    def _submit_async_task(self, async_task_id, runner, summary_builder):
+        event = self.cancel_event_for(async_task_id)
+
+        class Completion(concurrent.futures.Future):
+            def cancel(self):
+                event.set()
+                return False
+
+        completion = Completion()
+        completion.set_running_or_notify_cancel()
+
+        async def execute():
+            if self._slots is None:
+                self._slots = asyncio.Semaphore(self._max_workers)
+            try:
+                acquire = asyncio.create_task(self._slots.acquire())
+                try:
+                    while not acquire.done() and not event.is_set():
+                        await asyncio.wait((acquire,), timeout=0.02)
+                    if event.is_set() and not acquire.done():
+                        acquire.cancel()
+                        await asyncio.gather(acquire, return_exceptions=True)
+                        result = None
+                    else:
+                        await acquire
+                        try:
+                            result = await self._arun_async_task(async_task_id, runner, summary_builder)
+                        finally:
+                            self._slots.release()
+                finally:
+                    if not acquire.done():
+                        acquire.cancel()
+                        await asyncio.gather(acquire, return_exceptions=True)
+            except BaseException as exc:
+                completion.set_exception(exc)
+            else:
+                completion.set_result(result)
+
+        asyncio.run_coroutine_threadsafe(execute(), runtime().loop)
+        return completion
 
     @property
     def store_path(self) -> str:
@@ -149,15 +172,6 @@ class _AsyncTaskRuntime(
 
     def _next_async_task_id(self, kind: AsyncTaskKind, owner_agent_name: str) -> str:
         safe_owner = sanitize_path_component(owner_agent_name, fallback="agent")
-        if kind == "teammate":
-            count = sum(
-                1
-                for item in self._async_tasks.values()
-                if isinstance(item, dict)
-                and str(item.get("kind") or "").strip() == "teammate"
-                and str((item.get("metadata") or {}).get("agent_name") or "").strip() == owner_agent_name
-            )
-            return f"teammate_{safe_owner}_{count + 1:04d}"
         safe_kind = sanitize_path_component(kind, fallback="task")
         return f"{safe_kind}_{safe_owner}_{uuid4().hex[:12]}"
 
@@ -184,7 +198,6 @@ class _AsyncTaskRuntime(
             "scope_kind": self._scope_kind,
             "scope_status": self._scope_status,
             "scope_meta": copy.deepcopy(self._scope_meta),
-            "agents": copy.deepcopy(self._agents),
             "async_tasks": [copy.deepcopy(item) for item in self._async_tasks.values()],
         }
 
@@ -193,11 +206,6 @@ class _AsyncTaskRuntime(
         if self._store_path is not None:
             payload = self._snapshot_store_locked()
             write_async_tasks_store(self._store_path, payload)
-        if self._public_sync is not None:
-            self._public_sync(
-                [_to_public_async_task(item) for item in self._async_tasks.values()],
-                copy.deepcopy(self._agents),
-            )
         return payload
 
     def _merge_async_task_fields(
@@ -238,20 +246,6 @@ class _AsyncTaskRuntime(
         log_path = output_dir / filename
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text(str(content or ""), encoding="utf-8")
-
-    def _require_agent_locked(self, agent_name: str) -> RunnerAgentState:
-        normalized_agent_name = str(agent_name or "").strip()
-        agent = self._agents.get(normalized_agent_name)
-        if not normalized_agent_name or agent is None:
-            raise ValueError(f"未注册 agent: {agent_name}")
-        return agent
-
-    def _current_agent_async_task_locked(self, agent: RunnerAgentState) -> InternalAsyncTaskState | None:
-        current_async_task_id = str(agent.get("current_async_task_id") or "").strip()
-        if not current_async_task_id:
-            return None
-        async_task = self._async_tasks.get(current_async_task_id)
-        return async_task if isinstance(async_task, dict) else None
 
     def _build_async_task(
         self,
@@ -306,19 +300,12 @@ class _AsyncTaskRuntime(
                 if isinstance(item, dict) and str(item.get("async_task_id") or "").strip()
             }
             persisted_async_tasks.update(copy.deepcopy(self._async_tasks))
-            persisted_agents = {
-                str(agent_name): copy.deepcopy(agent)
-                for agent_name, agent in dict(loaded.get("agents") or {}).items()
-                if str(agent_name or "").strip()
-            }
-            persisted_agents.update(copy.deepcopy(self._agents))
             self._store_path = bound_store_path
             self._scope_id = str(loaded.get("scope_id") or scope_id).strip()
             self._scope_kind = str(loaded.get("scope_kind") or scope_kind).strip() or "agent"
             self._scope_status = str(loaded.get("scope_status") or "running").strip() or "running"
             self._scope_meta = dict(loaded.get("scope_meta") or {})
             self._async_tasks = persisted_async_tasks
-            self._agents = persisted_agents
             self._persist_locked()
             snapshot = self._snapshot_store_locked()
         self.requeue_pending_notifications()
@@ -329,9 +316,7 @@ class _AsyncTaskRuntime(
 
         with self._lock:
             self._async_tasks = {}
-            self._agents = {}
             self._futures = {}
-            self._processes = {}
             self._cancel_events = {}
             self._scope_status = "running"
             self._persist_locked()
@@ -341,11 +326,6 @@ class _AsyncTaskRuntime(
         with self._lock:
             item = self._async_tasks.get(str(async_task_id or "").strip())
             return copy.deepcopy(item) if isinstance(item, dict) else None
-
-    def get_agent(self, agent_name: str) -> RunnerAgentState | None:
-        with self._lock:
-            agent = self._agents.get(str(agent_name or "").strip())
-            return copy.deepcopy(agent) if isinstance(agent, dict) else None
 
     def list_async_tasks(
         self,
@@ -400,11 +380,6 @@ class _AsyncTaskRuntime(
                     return True
         return False
 
-    def is_shutting_down(self) -> bool:
-        """线程池是否已进入停机。长生命周期的轮询 worker 必须据此退出循环。"""
-
-        return self._shutdown_event.is_set()
-
     def is_async_task_cancelled(self, async_task_id: str) -> bool:
         """Return whether an async task was externally closed before its runner finished."""
 
@@ -445,15 +420,12 @@ class _AsyncTaskRuntime(
 
         return self.public_active_async_tasks(owner_agent_id=owner_agent_id)
 
-    def shutdown(self, *, wait: bool = True, timeout_seconds: float = 5.0) -> bool:
-        """释放线程池。返回 True 表示所有 worker 已退出。
+    def shutdown(self, *, wait: bool = True, timeout_seconds: float | None = 5.0) -> bool:
+        """停止任务调度。返回 True 表示所有协程与同步扩展已收尾。
 
-        ThreadPoolExecutor 的 worker 是非 daemon 线程，且 concurrent.futures 注册了
-        `_python_exit` atexit hook 去 join 它们。所以只要还有 worker 没退出，解释器就会
-        永久卡在退出阶段 —— 进程既不报错也不退出。teammate loop 是 `while True`，
-        正是这种「不会自己结束」的 worker，必须显式回收。
-
-        幂等：重复调用安全，第二次直接返回上次的结果。
+        Each task has a cooperative cancel token. Futures that have not
+        started are cancelled; live workers observe their token at safe steps.
+        Repeated shutdown is safe and joins workers only up to the deadline.
         """
 
         with self._lock:
@@ -461,35 +433,22 @@ class _AsyncTaskRuntime(
                 return True
             pending = [future for future in self._futures.values() if not future.done()]
 
-        # 先发停机信号：轮询型 worker（teammate loop）靠它退出。只 cancel future 是不够的，
-        # cancel 对「已经在跑」的任务无效。
-        self._shutdown_event.set()
+        with self._lock:
+            for event in self._cancel_events.values():
+                event.set()
 
         for future in pending:
             future.cancel()
 
-        # shutdown(wait=False) 只关闭队列、不 join，由下面的 join 控制超时，
-        # 避免在这里被一个不肯退出的 worker 无限期挂住。
-        self._executor.shutdown(wait=False)
-
-        # 以「worker 线程是否真的退出」为准，而不是只看 self._futures：
-        # 阻塞解释器退出的是线程本身，而 _futures 只记录了走 registry 提交的那部分任务。
-        drained = True
-        if wait:
-            deadline_left = max(0.0, float(timeout_seconds))
-            for thread in list(getattr(self._executor, "_threads", ()) or ()):
-                if not thread.is_alive():
-                    continue
-                thread.join(timeout=deadline_left)
-                if thread.is_alive():
-                    drained = False
-                    break
-            if not drained:
-                logger.warning(
-                    "线程池关闭超时，仍有 worker 未退出：scope_id=%s。"
-                    "解释器退出时可能被 atexit join 阻塞。",
-                    self._scope_id or "-",
-                )
+        # Future 只在协程及其同步扩展清理完毕后结束，不能用 Task.cancel
+        # 的提交回执代替真正的完成信号。
+        if wait and pending:
+            _, unfinished = concurrent.futures.wait(
+                pending, timeout=None if timeout_seconds is None else max(0.0, float(timeout_seconds)),
+            )
+            drained = not unfinished
+        else:
+            drained = not pending
 
         with self._lock:
             # 只有真正收干净才记为已完成，否则下次调用还要再试一遍。
@@ -502,14 +461,13 @@ class _AsyncTaskRuntime(
 
         Python cannot safely kill an arbitrary running thread, so this method enforces
         the store contract immediately and asks supported runtimes to stop cooperatively:
-        shell subprocesses are terminated, teammate loops receive shutdown_requested,
-        and generic worker futures are cancelled when still pending. `_run_async_task`
+        shell subprocess groups are terminated and task tokens request cancellation. `_arun_async_task`
         checks the killed state before committing any late result.
         """
 
         normalized_reason = str(reason or "runner_stopped").strip() or "runner_stopped"
         stopped: list[InternalAsyncTaskState] = []
-        processes: list[subprocess.Popen[str]] = []
+        notifications: list[tuple[InternalAsyncTaskState, dict[str, Any]]] = []
         futures_to_wait: list[concurrent.futures.Future[Any]] = []
         with self._lock:
             for async_task_id, async_task in list(self._async_tasks.items()):
@@ -520,34 +478,17 @@ class _AsyncTaskRuntime(
                     future.cancel()
                     futures_to_wait.append(future)
                 self._signal_cancel_locked(async_task_id)
-                process = self._processes.get(async_task_id)
-                if process is not None and process.poll() is None:
-                    processes.append(process)
-                if str(async_task.get("kind") or "").strip() == "teammate":
-                    set_teammate_shutdown(async_task, requested=True)
                 closed = close_async_task(async_task, status="killed", reason=normalized_reason)
-                self._store_async_task_locked(closed)
+                event = self._prepare_notification_locked(
+                    closed, status="killed",
+                    summary=f"后台任务已停止：{closed.get('description') or closed['async_task_id']}",
+                    extra_payload={"closed_reason": normalized_reason},
+                )
+                notifications.append((closed, event))
                 stopped.append(copy.deepcopy(closed))
-                owner_name = str(closed.get("owner_agent_name") or "").strip()
-                agent = self._agents.get(owner_name)
-                if isinstance(agent, dict) and str(agent.get("current_async_task_id") or "").strip() == async_task_id:
-                    agent["current_async_task_id"] = ""
-                    if str(closed.get("kind") or "").strip() == "teammate":
-                        set_agent_status(agent, "shutdown")
-                    else:
-                        set_agent_status(agent, "idle")
             if stopped:
                 self._persist_locked()
 
-        for process in processes:
-            try:
-                process.terminate()
-                process.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=1.0)
-            except Exception:
-                logger.exception("停止后台进程失败")
         if futures_to_wait:
             concurrent.futures.wait(
                 futures_to_wait,
@@ -557,15 +498,8 @@ class _AsyncTaskRuntime(
         # Cancellation is a terminal result just like completion/failure.  It
         # must be persisted as a pending notification before consumers resume,
         # otherwise a process restart can silently lose the kill outcome.
-        for async_task in stopped:
-            self._emit_notification(
-                async_task,
-                status="killed",
-                summary=(
-                    f"后台任务已停止：{async_task.get('description') or async_task['async_task_id']}"
-                ),
-                extra_payload={"closed_reason": normalized_reason},
-            )
+        for async_task, event in notifications:
+            self._deliver_notification(async_task, event)
         return [_to_public_async_task(item) for item in stopped]
 
     def cancel_event_for(self, async_task_id: str) -> threading.Event:
@@ -596,9 +530,9 @@ class _AsyncTaskRuntime(
             return None
         normalized_reason = str(reason or "agent_requested").strip() or "agent_requested"
 
-        process_to_kill: subprocess.Popen[str] | None = None
         future_to_cancel: concurrent.futures.Future[Any] | None = None
         closed: InternalAsyncTaskState | None = None
+        event: dict[str, Any] | None = None
         with self._lock:
             async_task = self._async_tasks.get(normalized_task_id)
             if not isinstance(async_task, dict):
@@ -610,75 +544,20 @@ class _AsyncTaskRuntime(
             if future_to_cancel is not None and not future_to_cancel.done():
                 future_to_cancel.cancel()
             self._signal_cancel_locked(normalized_task_id)
-            process_to_kill = self._processes.get(normalized_task_id)
-            if str(async_task.get("kind") or "").strip() == "teammate":
-                set_teammate_shutdown(async_task, requested=True)
             closed = close_async_task(async_task, status="killed", reason=normalized_reason)
-            self._store_async_task_locked(closed)
-            owner_name = str(closed.get("owner_agent_name") or "").strip()
-            agent = self._agents.get(owner_name)
-            if isinstance(agent, dict) and str(agent.get("current_async_task_id") or "").strip() == normalized_task_id:
-                agent["current_async_task_id"] = ""
-                if str(closed.get("kind") or "").strip() == "teammate":
-                    set_agent_status(agent, "shutdown")
-                else:
-                    set_agent_status(agent, "idle")
+            event = self._prepare_notification_locked(
+                closed, status="killed",
+                summary=f"后台任务已停止：{closed.get('description') or closed['async_task_id']}",
+                extra_payload={"closed_reason": normalized_reason},
+            )
             self._persist_locked()
 
-        if process_to_kill is not None and process_to_kill.poll() is None:
-            try:
-                process_to_kill.terminate()
-                process_to_kill.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                process_to_kill.kill()
-                process_to_kill.wait(timeout=1.0)
-            except Exception:
-                logger.exception("停止后台进程失败: async_task_id=%s", normalized_task_id)
         if future_to_cancel is not None:
             concurrent.futures.wait([future_to_cancel],
                                     timeout=max(0.0, float(wait_timeout_seconds)))
-        if closed is not None:
-            self._emit_notification(
-                closed,
-                status="killed",
-                summary=(
-                    f"后台任务已停止：{closed.get('description') or closed['async_task_id']}"
-                ),
-                extra_payload={"closed_reason": normalized_reason},
-            )
+        if closed is not None and event is not None:
+            self._deliver_notification(closed, event)
         return _to_public_async_task(closed) if closed else None
-
-    def register_agent(
-        self,
-        *,
-        agent_name: str,
-        agent_id: str,
-        agent_kind: RunnerAgentKind,
-        metadata: dict[str, Any] | None = None,
-    ) -> RunnerAgentState:
-        normalized_agent_name = str(agent_name or "").strip()
-        if not normalized_agent_name:
-            raise ValueError("agent_name 不能为空")
-        with self._lock:
-            current = self._agents.get(normalized_agent_name)
-            if isinstance(current, dict):
-                agent = copy.deepcopy(current)
-                agent["agent_id"] = str(agent_id or "").strip()
-                agent["agent_name"] = normalized_agent_name
-                agent["agent_kind"] = str(agent_kind or "").strip()
-                merged_metadata = dict(agent.get("metadata") or {})
-                merged_metadata.update(dict(metadata or {}))
-                agent["metadata"] = merged_metadata
-            else:
-                agent = build_agent_state(
-                    agent_id=str(agent_id or "").strip(),
-                    agent_name=normalized_agent_name,
-                    agent_kind=str(agent_kind or "").strip(),
-                    metadata=metadata,
-                )
-            self._agents[normalized_agent_name] = agent
-            self._persist_locked()
-            return copy.deepcopy(agent)
 
     def _append_async_task_output(self, output_dir: Path, line: dict[str, Any]) -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -693,7 +572,7 @@ class _AsyncTaskRuntime(
         else:
             entries = []
         entries.append(line)
-        events_path.write_text(json.dumps(entries, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
+        atomic_write_text(events_path, json.dumps(entries, ensure_ascii=False, indent=2, default=str) + "\n")
 
     def persist(self) -> None:
         with self._lock:
@@ -705,13 +584,6 @@ class _AsyncTaskRuntime(
             self._persist_locked()
             return copy.deepcopy(normalized)
 
-    def upsert_persisted_agent(self, agent_name: str, agent_state: RunnerAgentState) -> RunnerAgentState:
-        with self._lock:
-            normalized_name = str(agent_name or "").strip()
-            self._agents[normalized_name] = copy.deepcopy(dict(agent_state))
-            self._persist_locked()
-            return copy.deepcopy(self._agents[normalized_name])
-
     def _emit_notification(
         self,
         async_task: InternalAsyncTaskState,
@@ -720,6 +592,24 @@ class _AsyncTaskRuntime(
         summary: str,
         extra_payload: dict[str, Any] | None = None,
     ) -> None:
+        """Persist the exact notification before calling a potentially failing sink."""
+        with self._lock:
+            current = copy.deepcopy(self._async_tasks.get(str(async_task.get("async_task_id"))) or async_task)
+            event = self._prepare_notification_locked(
+                current, status=status, summary=summary, extra_payload=extra_payload,
+            )
+            self._persist_locked()
+        self._deliver_notification(current, event)
+
+    def _prepare_notification_locked(
+        self,
+        async_task: InternalAsyncTaskState,
+        *,
+        status: str,
+        summary: str,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Stage a terminal task and its notification in the same transaction."""
         public_async_task = _to_public_async_task(async_task)
         created_at = time.time()
         event_id = f"evt_{uuid4().hex}"
@@ -744,22 +634,43 @@ class _AsyncTaskRuntime(
             "created_at": created_at,
             "payload": payload,
         }
-        # 先把 pending 通知写进 task manifest，再把事件送入内存队列。
-        # 因此即使进程在两步之间退出，resume 仍能从 manifest 重新唤醒。
-        with self._lock:
-            current = copy.deepcopy(self._async_tasks.get(public_async_task["async_task_id"]) or async_task)
-            current["notification"] = {
-                "event_id": event_id,
-                "state": "pending",
-                "created_at": created_at,
-                "delivered_at": None,
-            }
-            self._store_async_task_locked(current)
-            self._persist_locked()
-        self.event_queue.enqueue(str(async_task.get("owner_agent_id") or ""), event)
+        async_task["notification"] = {
+            "event_id": event_id,
+            "state": "pending",
+            "created_at": created_at,
+            "delivered_at": None,
+            "delivery_error": "",
+            "event": copy.deepcopy(event),
+        }
+        self._store_async_task_locked(async_task)
+        return event
+
+    def _deliver_notification(self, async_task: InternalAsyncTaskState, event: dict[str, Any]) -> bool:
+        """A sink failure leaves a visible pending record for later replay.
+
+        Delivery never changes a completed task into a failed task. Inbox
+        persistence and acknowledgement form a separate transaction boundary.
+        """
+        owner_id = str(async_task.get("owner_agent_id") or "")
+        try:
+            self.event_queue.enqueue(owner_id, copy.deepcopy(event))
+            logger.info("async_notification_received scope_id=%s agent_id=%s async_task_id=%s message_id=%s",
+                        self._scope_id, owner_id, async_task.get("async_task_id"), event["event_id"])
+            return True
+        except Exception as exc:
+            logger.exception("async_notification_delivery_failed scope_id=%s agent_id=%s async_task_id=%s message_id=%s",
+                             self._scope_id, owner_id, async_task.get("async_task_id"), event["event_id"])
+            with self._lock:
+                current = self._async_tasks.get(str(async_task.get("async_task_id")))
+                notification = {} if current is None else dict(current.get("notification") or {})
+                if notification.get("event_id") == event["event_id"] and notification.get("state") == "pending":
+                    notification["delivery_error"] = str(exc)
+                    current["notification"] = notification
+                    self._persist_locked()
+            return False
 
     def mark_notifications_delivered(self, event_ids: set[str]) -> None:
-        """在模型成功完成使用这些附件的 step 后确认通知。"""
+        """Confirm only after the receiving context and round checkpoint commit."""
 
         normalized_ids = {str(item or "").strip() for item in event_ids if str(item or "").strip()}
         if not normalized_ids:
@@ -781,12 +692,14 @@ class _AsyncTaskRuntime(
                     "delivered_at": delivered_at,
                 }
                 self._async_tasks[task_id] = updated
+                logger.info("async_notification_acknowledged scope_id=%s agent_id=%s async_task_id=%s message_id=%s",
+                            self._scope_id, async_task.get("owner_agent_id"), task_id, notification.get("event_id"))
                 changed = True
             if changed:
                 self._persist_locked()
 
     def requeue_pending_notifications(self) -> int:
-        """恢复时按 event_id 重放未确认通知；EventQueue 自身负责去重。"""
+        """Replay exact durable content; the Agent inbox deduplicates message IDs."""
 
         events: list[tuple[str, dict[str, Any]]] = []
         with self._lock:
@@ -795,29 +708,42 @@ class _AsyncTaskRuntime(
                 if str(notification.get("state") or "") != "pending":
                     continue
                 public_task = _to_public_async_task(async_task)
+                event = notification.get("event")
+                if not isinstance(event, dict):
+                    # Older registries stored only notification metadata. Recover
+                    # the stable result reference and result body when available.
+                    output = read_async_task_output(str(public_task["output_dir"]))
+                    payload = {
+                        "async_task_id": public_task["async_task_id"],
+                        "status": public_task["status"],
+                        "summary": "后台任务已有可消费结果",
+                        "output_dir": public_task["output_dir"],
+                        "kind": public_task["type"],
+                        "max_observation_chars": dict(async_task.get("metadata") or {}).get("max_observation_chars"),
+                    }
+                    if output.get("latest_result") is not None:
+                        payload["result"] = output["latest_result"]
+                    if public_task.get("error"):
+                        payload["error"] = public_task["error"]
+                    event = {
+                        "event_id": str(notification.get("event_id") or ""),
+                        "event_type": "async_task_notification",
+                        "created_at": float(notification.get("created_at") or 0.0),
+                        "payload": payload,
+                    }
+                    notification["event"] = copy.deepcopy(event)
+                    async_task["notification"] = notification
                 events.append(
                     (
                         str(async_task.get("owner_agent_id") or ""),
-                        {
-                            "event_id": str(notification.get("event_id") or ""),
-                            "event_type": "async_task_notification",
-                            "created_at": float(notification.get("created_at") or 0.0),
-                            "payload": {
-                                "async_task_id": public_task["async_task_id"],
-                                "status": public_task["status"],
-                                "summary": "后台任务已有可消费结果",
-                                "output_dir": public_task["output_dir"],
-                                "kind": public_task["type"],
-                                "max_observation_chars": dict(
-                                    async_task.get("metadata") or {}
-                                ).get("max_observation_chars"),
-                            },
-                        },
+                        copy.deepcopy(event),
                     )
                 )
+            if events:
+                self._persist_locked()
         for owner_id, event in events:
             if owner_id and event["event_id"]:
-                self.event_queue.enqueue(owner_id, event)
+                self._deliver_notification({"owner_agent_id": owner_id, "async_task_id": event["payload"]["async_task_id"]}, event)
         return len(events)
 
     def mark_scope_finalizing(self, reason: str = "") -> AsyncTaskRuntimeState:

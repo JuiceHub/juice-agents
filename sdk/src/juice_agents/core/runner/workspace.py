@@ -1,5 +1,5 @@
 """
-Runner / prebuilt 共享的 workspace 辅助工具。
+Runner 的 workspace 辅助工具。
 
 该模块统一收口 workspace 目录推导和运行时路径计算。
 配置管理逻辑已移至 ConfigurationContext，绑定逻辑已移至 workspace_binding.py。

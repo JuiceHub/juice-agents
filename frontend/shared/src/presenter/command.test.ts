@@ -35,7 +35,7 @@ test("list-style command presenters return table display and text fallback", () 
       agent_mode: "agent",
       root_agent_name: "root",
       updated_at: "2026-05-20T00:00:00Z",
-      root_dir: "/tmp/work/.juice/runners/runner-1",
+      root_dir: "/tmp/work/.juice/sessions/runner-1",
       first_user_request_preview: "Implement readable runner titles",
     },
   ]);

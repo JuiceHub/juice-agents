@@ -9,6 +9,10 @@ from copy import deepcopy
 from dataclasses import replace
 from typing import Any, Callable
 
+from ...managers.models import invoke_model_call
+from ...runner.execution.async_bridge import run_async
+from ...runner.execution.async_io import blocking, invoke
+from ...runner.execution.cancellation import StreamCancelled
 from .content import (
     DEFAULT_COMPACT_CONTINUATION_TEMPLATE,
     DEFAULT_OMITTED_OBSERVATION_PLACEHOLDER,
@@ -42,12 +46,15 @@ def clone_step(step: AgentStep) -> AgentStep:
     if isinstance(step, TaskStep):
         return TaskStep(
             task=step.task,
+            round_id=step.round_id,
             task_images=list(step.task_images),
             attachments=[dict(item) for item in step.attachments if isinstance(item, dict)],
         )
     elif isinstance(step, ActionStep):
         return ActionStep(
             step_num=step.step_num,
+            round_id=step.round_id,
+            step_id=step.step_id,
             model_output=step.model_output,
             thought=step.thought,
             tool_calls=[dict(item) for item in step.tool_calls if isinstance(item, dict)],
@@ -78,8 +85,13 @@ class CompressStrategy(ABC):
     @abstractmethod
     def compress(
         self, tree: ContextTree, *, on_model_usage: Callable[..., None] | None = None,
+        model_call: Callable[..., Any] | None = None,
     ) -> ContextTree:
         """执行压缩，返回新的 ContextTree（不修改原 tree）。"""
+
+    async def acompress(self, tree: ContextTree, **kwargs: Any) -> ContextTree:
+        """同步自定义策略在线程中运行；内置 Compact 覆盖为原生协程。"""
+        return await blocking(self.compress, tree, **kwargs)
 
 
 class NoCompressStrategy(CompressStrategy):
@@ -90,6 +102,7 @@ class NoCompressStrategy(CompressStrategy):
 
     def compress(
         self, tree: ContextTree, *, on_model_usage: Callable[..., None] | None = None,
+        model_call: Callable[..., Any] | None = None,
     ) -> ContextTree:
         return clone_context_tree(tree)
 
@@ -111,6 +124,7 @@ class RemainCompressStrategy(CompressStrategy):
 
     def compress(
         self, tree: ContextTree, *, on_model_usage: Callable[..., None] | None = None,
+        model_call: Callable[..., Any] | None = None,
     ) -> ContextTree:
         logger.info("压缩会话: strategy=remain, k=%s", self.k)
         action_step_indices = [
@@ -177,17 +191,23 @@ class CompactCompressStrategy(CompressStrategy):
             return False
         return True
 
-    def compress(
+    def compress(self, tree: ContextTree, **kwargs: Any) -> ContextTree:
+        """同步入口只适配完整压缩调用。"""
+        return run_async(self.acompress(tree, **kwargs))
+
+    async def acompress(
         self, tree: ContextTree, *, on_model_usage: Callable[..., None] | None = None,
+        model_call: Callable[..., Any] | None = None,
     ) -> ContextTree:
         """执行压缩"""
         if self.incremental:
-            return self._incremental_compress(tree, on_model_usage=on_model_usage)
+            return await self._incremental_compress(tree, on_model_usage=on_model_usage, model_call=model_call)
         else:
-            return self._replace_compress(tree, on_model_usage=on_model_usage)
+            return await self._replace_compress(tree, on_model_usage=on_model_usage, model_call=model_call)
 
-    def _replace_compress(
+    async def _replace_compress(
         self, tree: ContextTree, *, on_model_usage: Callable[..., None] | None = None,
+        model_call: Callable[..., Any] | None = None,
     ) -> ContextTree:
         """Return a compacted copy while retaining auditable proposals.
 
@@ -197,10 +217,11 @@ class CompactCompressStrategy(CompressStrategy):
         """
         copied = clone_context_tree(tree)
         copied.tree_id = f"{tree.tree_id}_compacted"
-        return self._incremental_compress(copied, on_model_usage=on_model_usage)
+        return await self._incremental_compress(copied, on_model_usage=on_model_usage, model_call=model_call)
 
-    def _incremental_compress(
+    async def _incremental_compress(
         self, tree: ContextTree, *, on_model_usage: Callable[..., None] | None = None,
+        model_call: Callable[..., Any] | None = None,
     ) -> ContextTree:
         """增量压缩：在树上添加摘要分支，保留原始历史"""
         import time
@@ -233,12 +254,12 @@ class CompactCompressStrategy(CompressStrategy):
             raise ValueError("无法在当前上下文路径找到压缩分割点")
 
         # 4. 生成摘要
-        summary_text = _summarize_steps(
+        summary_text = await _summarize_steps(
             tree=tree,
             steps=prefix_steps,
             compression_model=self.compression_model,
             compact_instructions=self.compact_instructions,
-            on_model_usage=on_model_usage,
+            on_model_usage=on_model_usage, model_call=model_call,
         )
         continuation_text = self.continuation_template.format(summary=summary_text)
 
@@ -431,13 +452,14 @@ def _tail_has_context_activity(step: ActionStep) -> bool:
     return bool(step.error or step.attachments)
 
 
-def _summarize_steps(
+async def _summarize_steps(
     *,
     tree: ContextTree,
     steps: list[AgentStep],
     compression_model: Any,
     compact_instructions: str,
     on_model_usage: Callable[..., None] | None = None,
+    model_call: Callable[..., Any] | None = None,
 ) -> str:
     transcript = _build_transcript_for_steps(tree, steps)
     system_for_compress = _DEFAULT_SUMMARY_SYSTEM_PROMPT
@@ -450,15 +472,21 @@ def _summarize_steps(
     ]
 
     try:
-        response = compression_model.generate(summarizer_messages)
-    except Exception as exc:  # pragma: no cover - 运行时保护
-        if on_model_usage is not None:
-            on_model_usage(kind="generation", model=compression_model, error=exc)
+        if model_call is not None:
+            response = await invoke(model_call,
+                compression_model, "generate", purpose="compression", args=(summarizer_messages,),
+            )
+        else:
+            response = await invoke_model_call(
+                compression_model, "generate", purpose="compression", args=(summarizer_messages,),
+                on_model_usage=on_model_usage,
+            )
+    except StreamCancelled:
+        raise
+    except Exception as exc:
         logger.exception("压缩模型生成摘要失败")
         raise RuntimeError("compact 压缩模型调用失败") from exc
 
-    if on_model_usage is not None:
-        on_model_usage(kind="generation", model=compression_model, response=response)
     response_content = response.get("content", "") if isinstance(response, dict) else str(response)
     summary_text = _extract_summary_from_content(response_content)
     if not summary_text:

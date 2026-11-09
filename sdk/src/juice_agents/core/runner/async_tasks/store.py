@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 from juice_agents.core.utils import sanitize_path_component
+from juice_agents.core.registry.common.store import atomic_write_text
 
-from .internal_types import AsyncTaskState, RunnerAgentState, AsyncTaskRuntimeState
+from .internal_types import AsyncTaskState, AsyncTaskRuntimeState
 from .kinds import ASYNC_TASK_KINDS as _ASYNC_TASK_KINDS, PUBLIC_TO_ASYNC_TASK_KIND
 
 _SCOPE_STATUSES = {"running", "finalizing", "finalized"}
-_AGENT_STATUSES = {"active", "idle", "shutdown_requested", "shutdown"}
 _ASYNC_TASK_STATUSES = {"pending", "running", "completed", "failed", "killed"}
 _DEFAULT_SCOPE_KIND = "agent"
 
@@ -28,7 +29,7 @@ def _read_json(path: Path, *, default: Any) -> Any:
 
 def _write_json(path: Path, payload: Any) -> Any:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
     return payload
 
 
@@ -49,24 +50,7 @@ def blank_async_tasks_store(
         "scope_kind": normalized_scope_kind,
         "scope_status": "running",
         "scope_meta": dict(scope_meta or {}),
-        "agents": {},
         "async_tasks": [],
-    }
-
-
-def _normalize_agent_state(agent_name: str, raw: dict[str, Any]) -> RunnerAgentState:
-    agent = dict(raw or {})
-    status = str(agent.get("status") or "active").strip()
-    if status not in _AGENT_STATUSES:
-        status = "active"
-    return {
-        "agent_id": str(agent.get("agent_id") or "").strip(),
-        "agent_name": str(agent.get("agent_name") or agent_name).strip(),
-        "agent_kind": str(agent.get("agent_kind") or "").strip(),
-        "status": status,
-        "current_async_task_id": str(agent.get("current_async_task_id") or "").strip(),
-        "last_error": str(agent.get("last_error") or "").strip(),
-        "metadata": dict(agent.get("metadata") or {}),
     }
 
 
@@ -109,6 +93,10 @@ def _normalize_async_task_state(raw: dict[str, Any]) -> AsyncTaskState:
                 if notification.get("delivered_at") is None
                 else float(notification.get("delivered_at") or 0.0)
             ),
+            # Preserve the complete original payload. Reconstructing from the
+            # task projection loses results, errors and the caller's summary.
+            "event": deepcopy(notification.get("event")),
+            "delivery_error": str(notification.get("delivery_error") or ""),
         }
     return {
         "async_task_id": async_task_id,
@@ -136,11 +124,6 @@ def normalize_async_tasks_store(
     scope_status = str(store.get("scope_status") or "running").strip()
     if scope_status not in _SCOPE_STATUSES:
         scope_status = "running"
-    agents = {
-        str(agent_name): _normalize_agent_state(str(agent_name), dict(agent or {}))
-        for agent_name, agent in dict(store.get("agents") or {}).items()
-        if str(agent_name or "").strip()
-    }
     raw_tasks = list(store.get("async_tasks") or [])
     async_tasks = [_normalize_async_task_state(item) for item in raw_tasks if isinstance(item, dict)]
     return {
@@ -148,7 +131,6 @@ def normalize_async_tasks_store(
         "scope_kind": scope_kind,
         "scope_status": scope_status,
         "scope_meta": dict(store.get("scope_meta") or {}),
-        "agents": agents,
         "async_tasks": async_tasks,
     }
 

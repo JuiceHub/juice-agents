@@ -55,6 +55,8 @@ def test_sdk_distribution_builds_and_imports_without_repository(tmp_path: Path) 
     assert "runner_config=\"agent\"" in metadata.get_payload()
     assert "juice_agents/py.typed" in names
     assert "juice_agents/core/config/defaults.yaml" in names
+    assert "juice_agents/_client.py" not in names
+    assert not any(name.startswith("juice_agents/core/prebuilt/") for name in names)
     assert not any("/_assets/" in name or "/joke-expert/" in name for name in names)
     assert all(name.startswith("juice_agents/") or ".dist-info/" in name for name in names)
     assert not any("/.juice/" in name or name.endswith("/.env") for name in names)
@@ -73,6 +75,7 @@ def test_sdk_distribution_builds_and_imports_without_repository(tmp_path: Path) 
     assert any(name.endswith("/pyproject.toml") for name in source_names)
     assert any(name.endswith("/juice_agents/core/config/defaults.yaml") for name in source_names)
     assert not any("/adapters/" in name or "/backend/" in name for name in source_names)
+    assert not any(name.endswith("/juice_agents/_client.py") or "/juice_agents/core/prebuilt/" in name for name in source_names)
 
     # A target install with no source checkout on PYTHONPATH catches editable-only
     # imports and package resources that were accidentally omitted from the wheel.
@@ -91,17 +94,47 @@ def test_sdk_distribution_builds_and_imports_without_repository(tmp_path: Path) 
         [
             sys.executable,
             "-c",
-            "from importlib import resources; "
-            "from pathlib import Path; "
-            "import juice_agents; "
-            "from juice_agents.core.config.runtime_config import DEFAULT_RUNTIME_CONFIG_PATH, read_runtime_config; "
-            "from juice_agents.core.registry.skills import SkillRegistry; "
-            "assert Path(juice_agents.__file__).resolve().is_relative_to(Path(__import__('sys').argv[1])); "
-            "assert DEFAULT_RUNTIME_CONFIG_PATH.is_relative_to(Path(__import__('sys').argv[1])); "
-            "assert resources.files('juice_agents.core.config').joinpath('defaults.yaml').is_file(); "
-            "assert read_runtime_config()['models']; "
-            "assert SkillRegistry().builtin_dir is None; "
-            "assert not Path('.juice').exists()",
+            """
+from importlib import resources
+from pathlib import Path
+import sys
+
+import juice_agents
+from juice_agents import Runner
+from juice_agents.core.config.runtime_config import DEFAULT_RUNTIME_CONFIG_PATH, read_runtime_config
+from juice_agents.core.registry.skills import SkillRegistry
+
+installed_root = Path(sys.argv[1])
+assert Path(juice_agents.__file__).resolve().is_relative_to(installed_root)
+assert DEFAULT_RUNTIME_CONFIG_PATH.is_relative_to(installed_root)
+assert resources.files("juice_agents.core.config").joinpath("defaults.yaml").is_file()
+assert read_runtime_config()["models"]
+assert SkillRegistry().builtin_dir is None
+assert not hasattr(juice_agents, "Juice")
+
+# Construct and restore real sessions in the isolated wheel install. No source
+# tree or API credentials are needed because root construction remains lazy.
+workspace = Path.cwd() / "project"
+workspace.mkdir()
+for mode in ("agent", "plan", "group", "team"):
+    runner = Runner.create(base_dir=workspace, runner_config=mode)
+    runner_id = runner.runner_id
+    try:
+        assert runner.layout.manifest_path.is_file()
+        assert runner.agent_registry.load_config("root").name == "root"
+        assert not runner.agent_manager.live_agents
+    finally:
+        runner.close()
+    restored = Runner.resume(base_dir=workspace, runner_id=runner_id)
+    try:
+        assert restored.runner_id == runner_id
+        assert restored.mode_id == mode
+        assert restored.base_dir == workspace
+        assert not restored.agent_manager.live_agents
+    finally:
+        restored.close()
+assert not Path(".juice").exists()
+""",
             str(target),
         ],
         cwd=tmp_path,

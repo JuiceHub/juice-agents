@@ -16,7 +16,6 @@ import pytest
 from juice_agents.core.agent.tools.runtime import (
     Tool,
     ToolExecutionContext,
-    ToolExecutionMode,
     ToolExecutionPolicy,
 )
 from juice_agents.core.config.context import ConfigurationContext
@@ -30,7 +29,7 @@ class _EchoTool(Tool):
 
     def execution_policy(self, args: dict[str, Any], context: Any) -> ToolExecutionPolicy:
         del args, context
-        return ToolExecutionPolicy(mode=ToolExecutionMode.PARALLEL_SAFE)
+        return ToolExecutionPolicy()
 
     def forward(self, value: str) -> dict[str, str]:
         return {"value": value}
@@ -212,26 +211,21 @@ def test_async_task_manager_owns_background_shell_creation(tmp_path: Path) -> No
         manager.release()
 
 
-def test_async_task_manager_persists_agent_runtime_state(tmp_path: Path) -> None:
-    """The private task store follows the manager's agent-only vocabulary."""
-
+def test_async_task_manager_persists_only_task_ownership(tmp_path: Path) -> None:
+    """AgentManager is the sole owner of live identities and round state."""
     manager = AsyncTaskManager(state_dir=tmp_path / "async", scope_id="scope-agent")
     try:
-        registered = manager.register_agent(
-            agent_name="worker",
-            agent_id="agent:worker",
-            role="persistent",
+        receipt = manager.launch(
+            task_type="local_agent", owner_agent_id="agent:worker", owner_agent_name="worker",
+            description="work", runner=lambda _task, _path: "done", summary_builder=str,
         )
-        assert registered["agent_id"] == "agent:worker"
-
-        task = manager.ensure_persistent_agent("worker", description="durable worker")
-        assert task["owner_agent_name"] == "worker"
-        assert manager.acquire_agent_run("worker", run_id="round-1")
-        assert manager.finish_agent_run("worker", run_id="round-1")
-
+        manager.wait_active_async_tasks(timeout_seconds=3)
+        task = manager.get_task(receipt["async_task_id"])
+        assert task["owner_agent_id"] == "agent:worker"
         persisted = json.loads((tmp_path / "async" / "registry.json").read_text(encoding="utf-8"))
-        assert persisted["agents"]["worker"]["agent_id"] == "agent:worker"
+        assert "agents" not in persisted
         assert "actors" not in persisted
+        assert not hasattr(manager, "acquire_agent_run")
     finally:
         manager.release()
 

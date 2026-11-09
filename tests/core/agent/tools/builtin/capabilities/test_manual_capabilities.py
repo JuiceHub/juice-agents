@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, AsyncMock
 
 import pytest
 
 from adapters.stdio_gateway.runtime import DirectRunnerRuntime
 from juice_agents.core.agent import ReActAgent
+from juice_agents.core.agent.contracts import RoundResult
 from juice_agents.core.agent.attachments import serialize_runtime_attachments_text
 from juice_agents.core.agent.tools.builtin.capabilities.manual_capabilities import (
     ScopedWorkflowRunTool,
@@ -86,8 +87,8 @@ def test_gateway_forwards_explicit_capability_text_to_sdk_runner() -> None:
         runtime = DirectRunnerRuntime(base_dir=workspace, runtime_config_path=config)
         runner = MagicMock()
         runner.root_agent_name = "root_agent"
-        runner.stream.return_value = iter(())
+        runner.arun_round = AsyncMock(return_value=RoundResult("test-round", "completed", output="done"))
         runtime._runner = runner
-        list(runtime.stream_message("$workflow:deep_research compare APIs"))
+        runtime.stream_message("$workflow:deep_research compare APIs")
 
-        runner.stream.assert_called_once_with("$workflow:deep_research compare APIs")
+        runner.arun_round.assert_awaited_once_with("$workflow:deep_research compare APIs", cancel_check=None)

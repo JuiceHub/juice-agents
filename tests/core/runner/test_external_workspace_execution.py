@@ -72,8 +72,8 @@ def test_two_projects_read_edit_test_exit_and_resume(tmp_path, monkeypatch, prot
         ]
         try:
             events = list(runner.stream("Read calculation.py, update VALUE and run its tests."))
-            assert next(event for event in events if event["kind"] == "round_end")["output"] == "updated and verified"
-            observations = [event["action_step"].observations for event in events if event["kind"] == "action_step"]
+            assert next(event for event in events if event["kind"] == "round_end")["data"]["result"]["output"] == "updated and verified"
+            observations = [event["data"]["step"]["observations"] for event in events if event["kind"] == "step_end"]
             shell_result = ast.literal_eval(observations[2][0].removeprefix("[logs]\n"))
             assert shell_result["returncode"] == 0
             assert "OK" in shell_result["stderr"]
@@ -97,9 +97,9 @@ def test_two_projects_read_edit_test_exit_and_resume(tmp_path, monkeypatch, prot
         ]
         try:
             events = list(restored.stream("Read the current project value after resuming."))
-            observations = [event["action_step"].observations for event in events if event["kind"] == "action_step"]
+            observations = [event["data"]["step"]["observations"] for event in events if event["kind"] == "step_end"]
             assert f"VALUE = {expected}" in json.dumps(observations)
-            assert next(event for event in events if event["kind"] == "round_end")["output"] == "restored"
+            assert next(event for event in events if event["kind"] == "round_end")["data"]["result"]["output"] == "restored"
             if protocol == "codeact":
                 result = restored._root().instance.executor("print(open('calculation.py').read())")
                 assert result.error is None

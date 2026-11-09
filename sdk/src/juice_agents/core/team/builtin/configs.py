@@ -21,10 +21,11 @@ DEFAULT_TEAMMATE_INSTRUCTIONS = (
     "you; complete it with team_task_complete and concise evidence. In a "
     "message-only turn, inspect team_task_list and claim ready work if needed. "
     "Use send_message to discuss blockers or results with root or "
-    "other members. Use team_member_stop_request if you need root to close "
+    "other members; recipient='*' broadcasts to current active peers including root. "
+    "Use team_member_stop_request if you need root to close "
     "your session; ordinary message text does not stop it. Incoming messages "
-    "appear as attachments at the start of "
-    "your next turn. The root owns user communication and Team completion."
+    "appear as attachments at the next safe step, or start a new round while idle. "
+    "The root owns user communication and Team completion."
 )
 
 _TEAM_MEMBER_TOOL_NAMES = (
@@ -79,7 +80,7 @@ def _member(
     return base.copy_with(
         allowed_modes=["team"],
         managed_agent_names=[],
-        # TeamManager inbox and task claims span multiple member turns.
+        # AgentManager inbox and Team business claims span member rounds.
         lifecycle="persistent",
     )
 

@@ -55,6 +55,7 @@ SENSITIVE_KEYWORDS = (
 class BrowserPolicy:
     enabled: bool = True
     backend: str = "in_app"
+    executable_path: str | None = None
     default_policy: str = "ask_for_sensitive"
     allow_hosts: tuple[str, ...] = ("localhost", "127.0.0.1")
     block_hosts: tuple[str, ...] = ()
@@ -89,6 +90,7 @@ def load_browser_policy(agent: Any | None = None) -> BrowserPolicy:
     return BrowserPolicy(
         enabled=bool(raw_browser.get("enabled", True)),
         backend=str(raw_browser.get("backend") or "in_app").strip() or "in_app",
+        executable_path=str(raw_browser.get("executable_path") or "").strip() or None,
         default_policy=str(raw_permissions.get("default_policy") or "ask_for_sensitive").strip(),
         allow_hosts=_normalize_hosts(raw_permissions.get("allow_hosts")) or ("localhost", "127.0.0.1"),
         block_hosts=_normalize_hosts(raw_permissions.get("block_hosts")),
@@ -164,6 +166,7 @@ class BrowserToolMixin:
             self._session_key(),
             state_dir=root / "browser_state",
             recording_dir=root / "browser_recordings",
+            executable_path=policy.executable_path,
         )
         session.reconfigure(
             state_dir=Path(policy.storage_state_dir)

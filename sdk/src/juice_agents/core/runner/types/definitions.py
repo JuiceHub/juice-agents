@@ -9,11 +9,11 @@ from __future__ import annotations
 
 from typing import Any, Literal, TypedDict
 
-from juice_agents.core.agent.context import ActionStep
+from juice_agents.core.agent.contracts import PublicEvent as RunnerStreamEvent
 
 PermissionMode = Literal["default", "accept"]
 AgentMode = str
-RunnerStatus = Literal["idle", "running", "waiting", "paused", "failed"]
+RunnerStatus = Literal["idle", "running"]
 AsyncTaskStatus = Literal["pending", "running", "completed", "failed", "killed"]
 AsyncTaskType = Literal["local_agent", "local_bash", "local_workflow"]
 
@@ -61,7 +61,7 @@ class AsyncTaskState(TypedDict, total=False):
 
 
 class RunnerState(TypedDict, total=False):
-    """Schema-5 Runner manifest, excluding all Manager internals."""
+    """Schema-6 Runner manifest, excluding all Manager internals."""
 
     schema_version: int
     runner_id: str
@@ -89,28 +89,9 @@ class Attachment(TypedDict, total=False):
     """A plain request attachment delivered through ``RunnerContext``."""
 
     attachment_type: str
+    message_id: str
     created_at: float
     payload: dict[str, Any]
-
-
-class RunnerStreamEvent(TypedDict, total=False):
-    """The unified event emitted by every declarative Runner config."""
-
-    kind: Literal["action_step", "runner_lifecycle", "round_end", "stream_cancelled"]
-    permission_mode: PermissionMode
-    mode_id: AgentMode
-    runner_id: str
-    agent_name: str | None
-    agent_id: str | None
-    agent_role: str | None
-    step_num: int | None
-    action_step: ActionStep | None
-    lifecycle_event: dict[str, Any] | None
-    round_id: str
-    outcome: Literal["submitted", "failed"]
-    output: Any
-    reason: str
-    stop_reason: str
 
 
 __all__ = [

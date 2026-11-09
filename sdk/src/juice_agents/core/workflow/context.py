@@ -25,13 +25,17 @@ workflow 按「函数」使用：一次调用 = 加载脚本 → ``run(ctx, args
 
 from __future__ import annotations
 
-import concurrent.futures
+import asyncio
+
+from ..runner.execution.async_io import blocking, invoke
+from ..runner.execution.async_bridge import run_async
 import json
 import logging
 import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
+from uuid import uuid4
 
 from juice_agents.core.agent.builtin.configs import build_builtin_agent_config
 from juice_agents.core.registry.agents.types import AgentConfig
@@ -51,6 +55,26 @@ logger = logging.getLogger(__name__)
 _POLL_SECONDS = 0.1
 
 LifecycleCallback = Callable[[dict[str, Any]], None]
+
+
+class _WorkflowCancellation(threading.Event):
+    """A private stop token linked to the caller, without cancelling its round."""
+
+    def __init__(self, parent: threading.Event) -> None:
+        super().__init__()
+        self.parent = parent
+
+    def is_set(self) -> bool:
+        return super().is_set() or self.parent.is_set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while not self.is_set():
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return self.is_set()
+            super().wait(_POLL_SECONDS if remaining is None else min(_POLL_SECONDS, remaining))
+        return True
 
 
 class WorkflowContext:
@@ -73,8 +97,10 @@ class WorkflowContext:
         self.config = config or WorkflowConfig()
         self.config.validate()
         self._lifecycle_callback = lifecycle_callback
+        self._cancel_event = _WorkflowCancellation(build.cancel_event)
         self._started_at = time.monotonic()
-        self._lock = threading.Lock()
+        # 完成计数与其事件快照共用事务；_emit 会在同一线程再次读取快照。
+        self._lock = threading.RLock()
         self._phase = ""
         # 进度计数：当前 phase 内已发起 / 已完成的 agent 调用数，供 CLI 显示 x/y。
         self._phase_started = 0
@@ -83,13 +109,18 @@ class WorkflowContext:
 
     # -- 控制信号 ---------------------------------------------------------------------
 
+    def cancel(self) -> None:
+        """取消当前 workflow 的子工作，保留调用方 round 的独立控制权。"""
+        self._cancel_event.set()
+
     def check_control(self) -> None:
         """在调用边界检查取消与超时。"""
 
-        if self.build.cancel_event.is_set():
+        if self._cancel_event.is_set():
             raise WorkflowCancelledError(f"workflow {self.name} 已取消")
         timeout = self.config.timeout_seconds
         if timeout is not None and time.monotonic() - self._started_at > timeout:
+            self._cancel_event.set()
             raise WorkflowTimeoutError(f"workflow {self.name} 超时（{timeout}s）")
 
     # -- 进度 -------------------------------------------------------------------------
@@ -113,6 +144,12 @@ class WorkflowContext:
         with self._lock:
             payload = {
                 "event": event,
+                "workflow_call_id": self.build.workflow_call_id,
+                "call_id": self.build.workflow_call_id,
+                "owner_agent_id": self.build.owner_agent_id,
+                "owner_agent_name": self.build.owner_agent_name,
+                "round_id": self.build.round_id,
+                "step_num": self.build.step_num,
                 "phase": self._phase,
                 "completed": self._phase_completed,
                 "total": self._phase_started,
@@ -191,7 +228,10 @@ class WorkflowContext:
             lifecycle="functional",
         )
 
-    def agent(
+    def agent(self, task: str | dict[str, Any], **kwargs: Any) -> Any:
+        return run_async(self.aagent(task, **kwargs))
+
+    async def aagent(
         self,
         task: str | dict[str, Any],
         *,
@@ -210,13 +250,13 @@ class WorkflowContext:
         """
 
         if phase is not None:
-            self.phase(phase)
+            await blocking(self.phase, phase)
         self.check_control()
         if agent is None and not str(instructions or "").strip():
             raise ValueError("ctx.agent 未指定 agent 时必须提供 instructions")
         if max_steps is not None and (isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps <= 0):
             raise ValueError("ctx.agent max_steps 必须为正整数")
-        config = self._agent_config(
+        config = await blocking(self._agent_config,
             agent=None if agent is None else str(agent).strip(),
             instructions=None if instructions is None else str(instructions).strip(),
             tools=None if tools is None else [str(item).strip() for item in tools if str(item).strip()],
@@ -227,24 +267,35 @@ class WorkflowContext:
         with self._lock:
             self._phase_started += 1
             self.agent_calls += 1
-        self._emit("node_started", node=display, detail=display)
+        agent_call_id = uuid4().hex
+        await blocking(self._emit, "node_started", node=display, detail=display, agent_call_id=agent_call_id)
         logger.info(
             "workflow agent start: workflow=%s label=%s base=%s tools=%s",
             self.name, display, agent or "general_subagent", [tool.name for tool in config.tools],
         )
         assert self.build.agent_dispatcher is not None  # _agent_config 已校验
-        raw = self.build.agent_dispatcher.invoke_agent(
-            {
+        try:
+            dispatcher = self.build.agent_dispatcher
+            response = await invoke(getattr(dispatcher, "ainvoke_agent", dispatcher.invoke_agent), {
                 "agent_ref": config,
                 "task": task if isinstance(task, str) else json.dumps(task, ensure_ascii=False, default=str),
                 "owner_agent_name": self.build.owner_agent_name,
-                "cancel_event": self.build.cancel_event,
-                "metadata": {"workflow_name": self.name, "workflow_phase": self._phase, "workflow_label": display},
-            }
-        ).get("output")
-        with self._lock:
-            self._phase_completed += 1
-        self._emit("node_completed", node=display, detail=display)
+                "cancel_event": self._cancel_event,
+                "metadata": {"workflow_name": self.name, "workflow_phase": self._phase,
+                             "workflow_label": display, "workflow_call_id": self.build.workflow_call_id,
+                             "workflow_agent_call_id": agent_call_id},
+            })
+            raw = response["output"]
+        except BaseException as exc:
+            await blocking(self._emit, "node_failed", node=display, detail=str(exc), agent_call_id=agent_call_id)
+            raise
+        def complete() -> None:
+            # 计数与事件快照在同一个短事务内，避免并发完成者看到相同计数。
+            with self._lock:
+                self._phase_completed += 1
+                self._emit("node_completed", node=display, detail=display, agent_call_id=agent_call_id,
+                           execution_agent_id=response.get("agent_id"))
+        await blocking(complete)
         logger.info("workflow agent completed: workflow=%s label=%s", self.name, display)
         if config.output_schema is None:
             return raw
@@ -253,60 +304,50 @@ class WorkflowContext:
 
     # -- 并发 -------------------------------------------------------------------------
 
-    def _wait_all(self, futures: list[concurrent.futures.Future[Any]]) -> list[Any]:
-        """等待全部 future；期间轮询取消信号，失败或取消时撤销尚未开始的任务。"""
-
-        pending = set(futures)
-        try:
-            while pending:
-                done, pending = concurrent.futures.wait(
-                    pending, timeout=_POLL_SECONDS, return_when=concurrent.futures.FIRST_EXCEPTION
-                )
-                for future in done:
-                    error = future.exception()
-                    if error is not None:
-                        raise error
-                self.check_control()
-        except BaseException:
-            for future in pending:
-                future.cancel()
-            raise
-        return [future.result() for future in futures]
-
     def parallel(self, fns: Sequence[Callable[[], Any]]) -> list[Any]:
-        """并发执行一组无参函数，按输入顺序返回结果。"""
+        return run_async(self.aparallel(fns))
 
-        tasks = list(fns)
+    async def aparallel(self, fns: Sequence[Callable[[], Any]]) -> list[Any]:
+        """协程并发有统一上限；任一失败/取消都等待其他子任务收尾。"""
         self.check_control()
-        if not tasks:
-            return []
-        workers = min(self.config.max_workers, len(tasks))
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="juice-workflow")
+        slots = asyncio.Semaphore(self.config.max_workers)
+
+        async def execute(fn):
+            async with slots:
+                self.check_control()
+                return await invoke(fn)
+
+        tasks = [asyncio.create_task(execute(fn)) for fn in fns]
         try:
-            results = self._wait_all([pool.submit(fn) for fn in tasks])
+            pending = set(tasks)
+            while pending:
+                done, pending = await asyncio.wait(pending, timeout=_POLL_SECONDS,
+                                                   return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    task.result()
+                self.check_control()
+            return [task.result() for task in tasks]
         except BaseException:
-            # 不能用 `with`：它在退出时会等待仍在运行的任务，取消就无法及时返回。
-            # 运行中的线程无法强杀，但内部 agent 共享同一个 cancel_event，会在
-            # 下一个 step 边界自行停下。
-            pool.shutdown(wait=False, cancel_futures=True)
+            self._cancel_event.set()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
             raise
-        pool.shutdown(wait=True)
-        return results
 
     def pipeline(self, items: Sequence[Any], *stages: Callable[[Any], Any]) -> list[Any]:
-        """每个 item 独立流过全部 stage；某项完成前一 stage 后立即进入下一 stage。"""
+        return run_async(self.apipeline(items, *stages))
 
+    async def apipeline(self, items: Sequence[Any], *stages: Callable[[Any], Any]) -> list[Any]:
         if not stages:
             raise ValueError("pipeline 至少需要一个 stage")
 
-        def _flow(item: Any) -> Any:
-            value = item
+        async def flow(item):
             for stage in stages:
                 self.check_control()
-                value = stage(value)
-            return value
+                item = await invoke(stage, item)
+            return item
 
-        return self.parallel([lambda item=item: _flow(item) for item in items])
+        return await self.aparallel([lambda item=item: flow(item) for item in items])
 
     # -- 产物 -------------------------------------------------------------------------
 
@@ -329,6 +370,9 @@ class WorkflowContext:
             path.write_text(str(content), encoding="utf-8")
         logger.info("workflow artifact written: workflow=%s path=%s", self.name, path)
         return path
+
+    async def aartifact(self, name: str, content: str | bytes | dict | list) -> Path:
+        return await blocking(self.artifact, name, content)
 
 
 __all__ = ["LifecycleCallback", "WorkflowContext"]

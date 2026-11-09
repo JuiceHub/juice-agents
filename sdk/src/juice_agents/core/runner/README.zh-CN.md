@@ -2,7 +2,7 @@
 
 # Runner
 
-`Runner` 是单个对话请求的统一入口。它不持有 Agent、Tool、Workflow 或后台任务的 live 实例；这些可变对象分别由 Manager 管理。静态声明只由 Registry 解析并构造为全新对象。
+`Runner` 是持久会话和自主 round 的统一入口。它不持有 Agent、Tool、Workflow 或后台任务的 live 实例；这些可变对象分别由 Manager 管理。静态声明只由 Registry 解析并构造为全新对象。
 
 ```text
 Agent / Tool / Workflow 声明
@@ -11,11 +11,49 @@ Agent / Tool / Workflow 声明
            Registry
               │ 仅返回全新对象
               ▼
-Runner ── 持有 ──► AgentManager      session · snapshot · stream · cancel · release
+Runner ── 持有 ──► AgentManager      inbox · round 调度 · session · cancel · release
   │                ToolManager        runtime binding · permissions · audit
   │                WorkflowRunManager    workflow call · artifacts
   └──────────────► AsyncTaskManager   task state · workers · notification · recovery
 ```
+
+
+## 回合结果与公开事件
+
+`run()` 成功返回输出，失败/取消抛出 `RoundFailedError / RoundCancelledError`，
+异常的 `.result` 是已保存的真实结果。`run_round()` 对所有终态返回 `RoundResult`。
+实例状态独立于回合成败。
+
+事件统一为 `kind + data`，携带事件、Agent、回合和步骤身份。
+通过 `subscribe_events()` 订阅，`round_end.data.result` 是权威结果。
+关闭观察流只退订；`cancel_round()` 保存停止意图，执行收尾后才发布结束事件；
+`stop()/close()` 停止整个 Runner。`describe_agent_sessions(agent_id=...)` 按需查看历史。
+恢复写入前校验 Runner v6 / Agent v2 / Context v3，拒绝旧格式且保留原文件。
+
+## 公开入口
+
+```python
+from juice_agents import Runner
+
+runner = Runner.create(base_dir=".", runner_config="agent")
+try:
+    runner.set_ask_handler(handler)
+    print(runner.run("审查这个项目"))
+    runner_id = runner.runner_id
+finally:
+    runner.close()
+
+runner = Runner.resume(base_dir=".", runner_id=runner_id)
+try:
+    runner.set_ask_handler(handler)
+    print(runner.run("继续审查"))
+finally:
+    runner.close()
+```
+
+`handler` 是应用提供的用户交互回调。创建和恢复后都需要重新绑定；回调仅存在于当前
+进程，不参与持久化。共用启动参数通过 `runtime_config_path` 和 `runtime_overrides`
+显式传入。调用方负责 Runner 生命周期，无需额外客户端或工厂包装。
 
 ## 配置与运行模式
 
@@ -26,7 +64,7 @@ Runner ── 持有 ──► AgentManager      session · snapshot · stream �
 
 内置的 `agent`、`plan`、`group`、`team` 共用同一条 `Runner.stream()` 路径，只在 binding、能力、并发和策略等数据上不同。`plan` 增加规划能力和只读工具策略。自定义 mode 通过 `RunnerConfig` 注册，不能安装改变执行流程的动态 factory 或 callback。
 
-Runner 通过 AgentRegistry 读取 root 与成员，按本地声明优先、内置定义兜底解析。创建或恢复 Runner 不生成默认 Agent YAML 或 default Team manifest；首次成功编辑才保存完整本地覆盖，删除覆盖即恢复内置定义。Plan/Team 配置仅应用于内存副本；root 仍不参与子 Agent 发现和分发。mode 切换保留 Runner ID 和 root session snapshot，并在空闲边界刷新有效 root 配置。Plan Mode 由 root 管理：唯一正式计划文件是 `plans/root.md`，只有经 Manager 验证的 root 可以写入或申请审批。Team Mode 由 `TeamManager` 管理所选 Team 的任务板、消息、成员和完成状态。新 Team 不自动添加成员；再次选择已有 Team 时复用成员定义，但使用新的任务板。Runner 通过 `AsyncTaskManager` 调度资格符合且依赖已满足的成员轮次；`team_finish` 释放成员 session 前，`AgentManager` 持有这些 session。
+Runner 通过 AgentRegistry 读取 root 与成员，按本地声明优先、内置定义兜底解析。创建或恢复 Runner 不生成默认 Agent YAML 或 default Team manifest；首次成功编辑才保存完整本地覆盖，删除覆盖即恢复内置定义。Plan/Team 配置仅应用于内存副本；root 仍不参与子 Agent 发现和分发。mode 切换保留 Runner ID 和 root session snapshot，并在空闲边界刷新有效 root 配置。Plan Mode 由 root 管理：唯一正式计划文件是 `plans/root.md`，只有经 Manager 验证的 root 可以写入或申请审批。Team Mode 由 `TeamManager` 管理所选 Team 的任务板、消息、成员和完成状态。新 Team 不自动添加成员；再次选择已有 Team 时复用成员定义，但使用新的任务板。TeamManager 通过 `AgentManager.post()` 调度资格符合且依赖已满足的成员轮次；`team_finish` 释放成员 session 前，`AgentManager` 持有这些 session。
 
 ```python
 from juice_agents.core.runner import AgentBinding, Runner, RunnerConfig
@@ -41,7 +79,7 @@ for event in runner.stream("Review this change"):
     handle(event)
 ```
 
-`Runner.create()` 只接收声明。传入 live `MultiStepAgent` 或旧版 Runner schema 都会被拒绝。root 延迟创建，首个请求才调用 `AgentManager.acquire_root()`。
+`Runner.create()` 只接收声明。传入 live `MultiStepAgent` 或旧版 Runner schema 都会被拒绝。root 延迟创建，首个请求或显式 `activate()` 时调用 `AgentManager.acquire_root()`。
 
 ## Agent 与 Tool 调用路径
 
@@ -50,6 +88,21 @@ workspace 是 `base_dir`，不能传框架仓库或 `.juice` 目录。`Configura
 `runtime_overrides` 只添加本次启动覆盖。`reconfigure(runtime_overrides=...)` 在空闲
 边界重新获取 Agent，保留会话、Runner ID 与 Team 任务板。Registry 在工具实例化时
 绑定 workspace，包括运行时新增工具；可复用 Agent 声明不保存注入的机器绝对路径。
+
+修改 YAML 或凭据后调用 `runner.reconfigure(reload_config=True)`：重新读取配置，
+刷新目录型客户端，同时保留历史、所选 GRM 和探索候选数。普通模式／聊天模型切换
+复用评分器的惰性客户端；GRM 与策略选择仍只保留在当前进程。
+
+```python
+# 保存设置与重载共用请求边界，繁忙时在写入前拒绝。
+with runner.configuration_boundary():
+    save_project_settings()
+    runner.reconfigure(reload_config=True)
+```
+
+请求、后台 worker 或 Team 待办未结束时不能进入该边界。Runner 与 SDK builder
+共用 `image.enabled` 挂载逻辑；Plan 始终禁用生图。图片模型只通过
+`image.model_name` 选择，与聊天和 GRM 独立。
 
 ```text
 ~/.juice/AGENTS[.override].md
@@ -88,10 +141,16 @@ MultiStepAgent
 
 - `persistent` Agent 保留 live 实例和 session，直到被释放。
 - `functional` Agent 在请求结束后保存 checkpoint 并释放。
-- `stop()` 协作式取消 Managers；`close()` 释放资源。
+- `cancel_round(round_id)` 持久化取消该轮及同步子调用，独立异步任务单独停止。
+- `stop()` 关闭调度；`close()` 同时释放 Manager 资源。
+- 关闭时等待已开始的调用完成取消收尾，再解除订阅和释放执行池。
 - `resume()` 只接受当前 Runner manifest schema，不迁移或恢复旧 Runner manifest schema。
 
-Runner 状态根目录为 `.juice/runners/<runner_id>/`。manifest 保存序列化后的 `RunnerConfig`、所选 Team 和 mode 内禁用的 Agent；Agent 运行快照位于 `agents/`。正式计划文件始终是 `plans/root.md`。对应的 Manager 持有任务和工具运行记录及 Workflow 产物；Workflow 调用没有可恢复的运行状态。
+Runner 状态根目录为 `.juice/sessions/<runner_id>/`。manifest 保存序列化后的 `RunnerConfig`、所选 Team 和 mode 内禁用的 Agent；Agent 运行快照位于 `agents/`。正式计划文件始终是 `plans/root.md`。对应的 Manager 持有任务和工具运行记录及 Workflow 产物；Workflow 调用没有可恢复的运行状态。
+
+恢复时在目标 Runner 目录下重建 Managers，根与子 Agent 快照、任务记录均绑定该会话。
+历史展示只读检查已保存的上下文，不 acquire Agent 或写入检查点。首条请求预览共用
+历史导出；上下文树损坏时记录 warning，会话列表回退显示 Runner ID。
 
 ## Token 统计
 
@@ -111,9 +170,9 @@ records = runner.agent_manager.model_usage_records()
 | `input_tokens`、`output_tokens`、`total_tokens` | 已报告的已知 token 数之和 |
 | `missing_usage_requests` | 用量缺失或不完整的调用数 |
 
-`Runner.token_usage()` 仅代理 `AgentManager`，由后者唯一负责用量收集、持久化及汇总。
+`Runner.token_usage()` 仅代理 `ModelManager`，由后者统一负责用量收集、持久化及汇总。
 Agent 和策略显式上报模型返回值或异常中的明细，写入
-`.juice/runners/<runner_id>/agents/model_usage.jsonl`，不含 prompt 或 transcript。
+`.juice/sessions/<runner_id>/agents/model_usage.jsonl`，不含 prompt 或 transcript。
 每条记录包含 `kind`、`backend`、`model_name`、`agent_id`、`agent_name`、`usage`、`request_id`。
 
 同一 Runner 使用一个活跃 Manager，并发工作 Agent 共享它；冷恢复在 Manager 初始化时
@@ -137,15 +196,55 @@ Agent 和策略显式上报模型返回值或异常中的明细，写入
 | `config.py` | `RunnerConfig`、`AgentBinding`、能力和策略模板 |
 | `execution/context.py` | Agent 到 Runner 的受限能力桥接 |
 | `persistence/store.py` | Runner manifest 和目录布局 |
-| `core/agent/manager.py` | Agent 生命周期与快照 |
+| `core/managers/agents/manager.py` | Agent 生命周期与快照 |
 | `core/managers/` | Tool、Workflow 和 AsyncTask 的运行时所有权 |
 
 修改此边界时，增加架构测试证明 Registry 不持有 live 状态、Manager 管理生命周期、Runner 不直接构造或执行领域对象。
 
 ## 开发约定
 
+`arun/arun_round/astream/ainvoke_agent/aclose` 是异步 SDK 入口，`acreate/aresume`
+将构造和恢复 I/O 移出宿主循环。`execution/async_bridge.py` 仅负责 SDK 边界与
+持久运行时循环之间的适配。Agent 直接 await ModelManager，inbox worker 和后台
+任务使用协程。TeamManager 负责成员调度、结果对账和结束收尾；同步 API 适配完整操作。
+取消单个回合只取消请求任务，禁止关闭共享模型连接来取消其他请求。
+
 - `RunnerConfig` 是可序列化数据；内置和自定义 mode 共用 `stream()`、`run()`、`stop()`。不注册动态 factory、callback 或独立循环。Runner 可以持有请求锁、取消状态和监听器，但不能持有 live Agent/Tool/Workflow/Task。
 - 切换 mode 前先校验目标，只能在 root、后台任务和 Workflow 都空闲时应用；保留 Runner ID 与 snapshot。忙碌时拒绝切换，未完成的 Team 工作也阻止切换。旧 manifest schema 明确报错，不自动迁移。
-- Team 任务状态先持久化再发事件；成员轮次由共享 `AsyncTaskManager` 调度，session 由 `AgentManager` checkpoint；接收方 step 保存后才确认消息 ID。请求流需在 `round_end` 前等待活跃成员调用并发出 `team_update`。
+- Team 任务状态先持久化再发事件；成员轮次由 AgentManager 的 Inbox 调度，session 由 AgentManager checkpoint；接收方 step 保存后才确认消息 ID。请求流在自身 `round_end` 返回，后续成员进度由常驻订阅发送 `team_update`。
 - `AgentManager.acquire()` 依次加载 snapshot、通过 Registry 构造新对象、恢复 session、绑定 context 并保存 checkpoint。`stop()` 协作取消，`close()` 释放资源；终态与恢复日志包含 Runner、Agent/任务/Workflow ID 和原因。持久化只含数据，不序列化 live Python 对象。
 - 边界、生命周期和布局测试放在 `tests/core/runner/`，覆盖内置 mode 共用执行链、并发、取消、恢复及拒绝旧 schema。
+
+## 持久消息与自主 round
+
+```python
+runner = Runner.resume(base_dir=".", runner_id=runner_id)
+runner.set_ask_handler(handler)
+unsubscribe = runner.subscribe_events(handle)  # 订阅前台及后续自主 round。
+runner.activate()                     # 监听与 Ask 绑定后启用，可重复调用。
+receipt = runner.post(runner.root_agent_id, {
+    "message_id": "producer-stable-id",
+    "attachment_type": "agent_user_message",
+    "payload": {"text": "检查刚完成的任务"},
+})
+# 关闭时先 runner.close() 等待收尾，再 unsubscribe()。
+```
+
+创建和恢复时调度关闭；SDK `run/stream` 自动激活，纯后台调用显式 `activate()`。
+每个输入返回含 `agent_id/message_id/round_id/status` 的持久回执。前台流只等待自身
+输入对应的 round，后续自动执行由订阅展示。`round_start/round_end` 使用独立
+round ID，同一事件在流和订阅中共享 `event_id`，便于去重。
+
+用户输入、Team 消息、任务分派、广播和异步完成都进入同一 inbox。运行中的 Agent
+在安全步骤接收；最终结果提交后到达的消息交给下一轮。同一 Agent 串行，不同
+Agent 可并行；persistent Agent 在 round 结束后立即 idle，不等待独立异步任务。
+
+`agents/<agent_id>/` 内保存 `manifest.json`、`session.json`（上下文与 round
+检查点）和 `inbox.json`（尚未确认交接的消息）。上下文提交后才确认生产方并删除
+inbox 条目；恢复按稳定 ID 去重，只恢复 `active` round 及其剩余预算。
+`cancel_round(round_id)` 持久化取消该轮及同步子调用；异步任务通过
+`async_task_stop` 单独取消，后续消息仍可唤醒。`close()` 负责资源关闭。
+
+functional Agent 必须在返回前完成本次工作，只能同步调用其他 Agent，不能启动
+脱离本次调用的后台工作。默认单个 Runner 进程拥有会话调度权；持久化不保证工具
+副作用只执行一次，也不会恢复已消失的异步线程或进程。

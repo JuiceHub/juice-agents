@@ -10,45 +10,28 @@ from juice_agents.core.config.context import ConfigurationContext
 from juice_agents.core.registry import AgentRegistry
 
 
-def test_websocket_stream_forwards_team_update() -> None:
+def test_websocket_subscription_forwards_team_update() -> None:
     connection = WebSocketRuntimeConnection(websocket=MagicMock())
-    runtime = MagicMock()
-    runtime.stream_message.return_value = iter(
-        [
-            {
-                "kind": "team_update",
-                "runner_id": "run-1",
-                "mode_id": "team",
-                "team_name": "alpha",
-                "update": {"type": "member_started", "member_name": "writer"},
-                "snapshot": {
-                    "tasks": [{
-                        "task_id": "task-1",
-                        "status": "in_progress",
-                        "eligible_members": ["writer"],
-                        "claimed_by": "writer",
-                        "error": "",
-                    }],
-                    "members": [{"name": "writer", "status": "working"}],
-                    "finished": False,
-                },
-            }
-        ]
-    )
-    connection.runtime = runtime
     emitted = []
     connection._put_threadsafe = emitted.append
-
-    connection._run_stream_worker("request-1", {"message": "start"})
-
+    data = {
+        "team_name": "alpha",
+        "update": {"type": "member_started", "member_name": "writer"},
+        "snapshot": {
+            "tasks": [{"task_id": "task-1", "status": "in_progress", "claimed_by": "writer"}],
+            "members": [{"name": "writer", "status": "working"}],
+            "finished": False,
+        },
+    }
+    connection._publish_runner_event({
+        "kind": "team_update", "event_id": "team-1", "timestamp": 123.5,
+        "runner_id": "run-1", "agent_id": "root-1", "agent_name": "root",
+        "agent_role": "root", "round_id": "round-1", "data": data,
+    })
     assert len(emitted) == 1
-    assert emitted[0]["id"] == "request-1"
+    assert "id" not in emitted[0]
     assert emitted[0]["type"] == "stream_step"
-    assert emitted[0]["payload"]["kind"] == "team_update"
-    assert emitted[0]["payload"]["team_event"]["snapshot"]["members"] == [
-        {"name": "writer", "status": "working"}
-    ]
-    assert emitted[0]["payload"]["team_event"]["snapshot"]["tasks"][0]["claimed_by"] == "writer"
+    assert emitted[0]["payload"]["data"] == data
 
 
 def test_web_team_config_defaults_to_empty_members() -> None:

@@ -34,6 +34,7 @@ DEFAULT_USER_AGENT = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 SUPPORTED_SEARCH_ENGINES = {"duckduckgo", "ddg", "bing", "baidu"}
+_UNSET = object()
 SECURITY_VERIFICATION_MESSAGE = "页面进入安全验证或验证码流程；浏览器工具不会尝试绕过验证。"
 EDITABLE_CANDIDATE_SELECTOR = (
     "input:not([type='hidden']):not([disabled]), "
@@ -133,6 +134,7 @@ class PlaywrightBrowserSession:
         user_agent: str = DEFAULT_USER_AGENT,
         viewport_width: int = 1280,
         viewport_height: int = 900,
+        executable_path: str | Path | None = None,
         state_dir: str | Path = DEFAULT_BROWSER_STATE_DIR,
         recording_dir: str | Path = DEFAULT_BROWSER_RECORDINGS_DIR,
     ) -> None:
@@ -141,6 +143,7 @@ class PlaywrightBrowserSession:
         self.user_agent = str(user_agent or DEFAULT_USER_AGENT)
         self.viewport_width = int(viewport_width)
         self.viewport_height = int(viewport_height)
+        self.executable_path = str(Path(executable_path).expanduser()) if executable_path else None
         self.state_dir = Path(state_dir)
         self.recording_dir = Path(recording_dir)
         self._pw: Any = None
@@ -399,10 +402,15 @@ class PlaywrightBrowserSession:
             if self._pw is None:
                 self._pw = sync_playwright().start()
             if self._browser is None:
-                self._browser = self._pw.chromium.launch(
-                    headless=self.headless,
-                    args=["--no-sandbox", "--disable-dev-shm-usage"],
-                )
+                # An explicit executable lets a workspace reuse an installed browser;
+                # otherwise Playwright keeps selecting its own matching revision.
+                launch_options: dict[str, Any] = {
+                    "headless": self.headless,
+                    "args": ["--no-sandbox", "--disable-dev-shm-usage"],
+                }
+                if self.executable_path:
+                    launch_options["executable_path"] = self.executable_path
+                self._browser = self._pw.chromium.launch(**launch_options)
             self._new_context()
             self._register_page(self._context.new_page(), make_active=True)
             logger.info(
@@ -500,6 +508,7 @@ class PlaywrightBrowserSession:
         user_agent: str | None = None,
         viewport_width: int | None = None,
         viewport_height: int | None = None,
+        executable_path: str | Path | None | object = _UNSET,
         state_dir: str | Path | None = None,
         recording_dir: str | Path | None = None,
     ) -> None:
@@ -518,6 +527,8 @@ class PlaywrightBrowserSession:
             self.viewport_width = int(viewport_width)
         if viewport_height is not None and self._context is None:
             self.viewport_height = int(viewport_height)
+        if executable_path is not _UNSET and self._context is None:
+            self.executable_path = str(Path(str(executable_path)).expanduser()) if executable_path else None
         if state_dir is not None:
             self.state_dir = Path(state_dir)
         if recording_dir is not None:

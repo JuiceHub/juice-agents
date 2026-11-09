@@ -73,7 +73,7 @@ class _Scorer(BaseRewardModel):
         self.error = error
         self.calls: list[dict[str, Any]] = []
 
-    def evaluate_batch(self, *, context: Any, actions: Any) -> dict[str, Any]:
+    def evaluate_batch(self, *, context: Any, actions: Any, cancel_event=None) -> dict[str, Any]:
         self.calls.append(copy.deepcopy({"context": context, "actions": actions}))
         if self.error is not None:
             raise self.error
@@ -102,8 +102,10 @@ def make_harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Ca
 
 def _round(runner: Runner, task: str = "choose") -> tuple[list[Any], list[ActionStep], dict[str, Any]]:
     events = list(runner.stream(task))
-    steps = [event["action_step"] for event in events if event["kind"] == "action_step"]
-    end = next(event for event in events if event["kind"] == "round_end")
+    from juice_agents.core.agent.context.serialization import _deserialize_step
+
+    steps = [_deserialize_step(event["data"]["step"]) for event in events if event["kind"] == "step_end"]
+    end = next(event["data"]["result"] for event in events if event["kind"] == "round_end")
     return events, steps, end
 
 
@@ -176,7 +178,8 @@ def test_candidates_share_context_and_only_selected_branch_continues(make_harnes
     assert len(rejected) == 4
     assert all(node.step.usage and not node.step.observations for node in rejected)
     assert sorted(node.step.usage["output_tokens"] for node in nodes) == list(range(1, 7))
-    assert all(any(node.step is step for node in nodes) for step in steps)
+    assert all(any(node.step.step_id == step.step_id and node.step.model_output == step.model_output
+                   for node in nodes) for step in steps)
 
 
 def test_react_executes_selected_write_once_and_persists_stream_result(make_harness, tmp_path, monkeypatch) -> None:
@@ -212,7 +215,7 @@ def test_react_executes_selected_write_once_and_persists_stream_result(make_harn
     assert len(calls) == 1
     assert chosen.read_text() == "good" and not rejected.exists()
     # The event and checkpoint must reuse the exact same execution outcome.
-    tool_end = next(event["data"] for event in events if event["kind"] == "action_event" and event["event_type"] == "tool_end" and event["data"]["tool_name"] == "write")
+    tool_end = next(event["data"] for event in events if event["kind"] == "tool_end" and event["data"]["tool_name"] == "write")
     assert tool_end["observation"] == steps[0].observations[0]
 
 
@@ -316,7 +319,7 @@ def test_scoring_failure_stops_before_any_action(make_harness, tmp_path, scores,
 
     _events, steps, end = _round(runner)
 
-    assert end["outcome"] == "failed"
+    assert end["status"] == "failed"
     assert steps[-1].error is not None
     assert expected in str(steps[-1].error)
     assert not target.exists()
@@ -348,7 +351,7 @@ def test_serialization_resume_and_reset_keep_only_selected_context(make_harness)
     assert [step.task for step in fresh.context.steps if isinstance(step, TaskStep)] == ["first task", "second task"]
 
     model.outputs[:] = [_submit("reset")]
-    assert runner.agent_manager.run(runner.agent_manager.get("root"), "clean task", reset_session=True) == "reset"
+    assert runner.agent_manager.run(runner.agent_manager.get("root"), "clean task", reset_session=True).unwrap() == "reset"
     assert [step.task for step in fresh.context.steps if isinstance(step, TaskStep)] == ["clean task"]
     assert all("discarded" not in node.step.model_output for node in fresh.context.nodes.values() if isinstance(node.step, ActionStep))
     assert len(fresh.context.active_leaf_ids) == 1

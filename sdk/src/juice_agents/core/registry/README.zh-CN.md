@@ -15,6 +15,11 @@ tools = ToolRegistry(config_context=context)
 read = tools.instantiate("read")  # 相对路径从目标项目解析
 ```
 
+`generate_edit_image` 通过同一上下文解析
+`image.model_name → image_models → providers`，保持项目覆盖和凭据优先级。
+其模型、地址和密钥不使用聊天选择 `model_config_name`；图片配置错误必须明确报错，
+不得回退到聊天凭据。显式注入的图片 SDK client 继续由调用方管理。
+
 `SkillRegistry(workspace_dir=...)` 同时使用目标目录定位 `.juice/skills` 与
 `.agents/skills`。自定义 `local_dir` 只改变可写存储，不会从任意父目录推断项目。
 SDK 不附带内置 Skill；只读 `builtin_dir` 来源由调用方显式传入。发现优先级为本地、
@@ -53,4 +58,8 @@ Agent 声明在 workspace 中使用全局唯一名称，并可选 `allowed_modes
 - 省略 `allowed_modes` 表示全部 mode；显式值必须是非空列表，可包含自定义 mode 名称。Agent 可用性统一复用 `agents.availability.is_agent_available()`。仅在编辑后持久化 `root` 通用声明，不写回本次 Runner 的计划路径或模式叠加配置，也不将它列为子 Agent。
 - Agent 保存前校验工具与 Team 成员约束；删除覆盖前校验有效回退，没有合格回退时报告所有引用 Team 并拒绝删除。私有作用域不回退到全局内置。测试放在 `tests/core/registry/`，覆盖独立校验、全新对象构造和无 live 状态。
 
-内置 Workflow 也遵循首次编辑落盘，未知名称与非法源码在写入前报错。Skill 保留首次编辑复制机制，Plugin 保持只读，Python 内置 Tool 名称不允许同名覆盖。已移除 seed API 和 `fallback_configs` 参数，调用方直接查询 Registry。
+内置 Workflow 也遵循首次编辑落盘，未知名称与非法源码在写入前报错。Skill 保留首次编辑复制机制，Plugin 保持只读，Python 内置 Tool 名称不允许同名覆盖。已移除 seed API 和 `fallback_configs` 参数，调用方直接查询 Registry。会话统一通过 `from juice_agents import Runner` 后调用
+`Runner.create(...)` / `Runner.resume(...)`；资源查询直接使用
+`AgentRegistry.list_configs()` 或 `list_available_agents(...)`。
+
+Workflow 声明同时支持 `def run(ctx, args)` 与 `async def run(ctx, args)`，两者共用校验和源码哈希绑定。

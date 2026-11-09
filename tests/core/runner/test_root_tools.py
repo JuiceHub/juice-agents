@@ -5,6 +5,7 @@ artifacts inside pytest's temporary workspace, with no external provider calls.
 """
 
 from __future__ import annotations
+from juice_agents.core.agent.context.serialization import _deserialize_step
 
 import copy
 import json
@@ -100,8 +101,8 @@ def harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Callabl
 
 def _round(runner: Runner, task: str = "create and use the tool") -> tuple[list[Any], list[Any]]:
     events = list(runner.stream(task))
-    assert next(event for event in events if event["kind"] == "round_end")["output"] == "done"
-    return events, [event["action_step"] for event in events if event["kind"] == "action_step"]
+    assert next(event for event in events if event["kind"] == "round_end")["data"]["result"]["output"] == "done"
+    return events, [_deserialize_step(event["data"]["step"]) for event in events if event["kind"] == "step_end"]
 
 
 @pytest.mark.parametrize("agent_type", ["react", "codeact"])

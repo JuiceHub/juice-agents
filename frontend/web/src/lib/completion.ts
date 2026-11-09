@@ -28,7 +28,7 @@ export const WEB_SLASH_COMMANDS: CompletionCandidate[] = [
   { label: "/plugins", description: "List or view installed plugins" },
   { label: "/permissions", description: "Inspect permission rules" },
   { label: "/sessions", description: "List runner threads" },
-  { label: "/clear", description: "Clear visible transcript" },
+  { label: "/clear", description: "Start a new session with current settings" },
 ];
 
 // 两个维度各自独立补全：/mode 走执行模式，/permissions 走审批策略。

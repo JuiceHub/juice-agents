@@ -53,7 +53,6 @@ class WorkflowToolBase(Tool):
 
 
 class WorkflowListTool(WorkflowToolBase):
-    _execution_mode = "parallel_safe"
     name = "workflow_list"
     is_read_only = True
     description = "列出 builtin 和 workspace-local workflows"
@@ -66,7 +65,6 @@ class WorkflowListTool(WorkflowToolBase):
 
 
 class WorkflowViewTool(WorkflowToolBase):
-    _execution_mode = "parallel_safe"
     name = "workflow_view"
     is_read_only = True
     description = "查看 workflow metadata 和单文件源码"
@@ -203,6 +201,9 @@ class WorkflowRunTool(WorkflowToolBase):
                 dict(args),
                 config,
                 owner_agent_name=str(getattr(self.owner_agent, "name", "") or ""),
+                owner_agent_id=str(getattr(runner_context, "agent_id", "") or ""),
+                round_id=getattr(self.owner_agent, "_active_round_id", None),
+                step_num=getattr(self.owner_agent, "_active_step_num", None),
                 # 前台调用继承当前 stream 的取消信号（Esc / Ctrl+C）。
                 cancel_event=getattr(runner_context, "cancel_event", None),
             )

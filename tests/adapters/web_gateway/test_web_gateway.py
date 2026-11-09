@@ -233,10 +233,10 @@ class WebGatewayTests(unittest.TestCase):
 
             with patch("adapters.web_gateway.app.get_existing_browser_session", return_value=None):
                 empty = client.get("/api/browser/live/preview", params={"base_dir": tmpdir})
-            screenshot_dir = root / ".juice" / "runners" / "abc" / "browser_screenshots"
+            screenshot_dir = root / ".juice" / "sessions" / "abc" / "browser_screenshots"
             screenshot_dir.mkdir(parents=True)
             (screenshot_dir / "page.png").write_bytes(b"png")
-            image_dir = root / ".juice" / "runners" / "other" / "observation_images"
+            image_dir = root / ".juice" / "sessions" / "other" / "observation_images"
             image_dir.mkdir(parents=True)
             (image_dir / "generated.png").write_bytes(b"png")
             with patch("adapters.web_gateway.app.get_existing_browser_session", return_value=None):
@@ -756,7 +756,7 @@ class WebGatewayTests(unittest.TestCase):
         self.assertEqual(cli_sessions, ["archived", "visible"])
 
 def _write_manifest(root: Path, runner_id: str) -> None:
-    runner_root = root / ".juice" / "runners" / runner_id
+    runner_root = root / ".juice" / "sessions" / runner_id
     runner_root.mkdir(parents=True)
     (runner_root / "manifest.json").write_text(
         json.dumps(

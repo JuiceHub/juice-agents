@@ -42,7 +42,10 @@ def test_gateway_cold_agent_query_projects_defaults_without_workspace_writes(
 
 
 def test_gateway_creates_and_resumes_declarative_runner_without_live_root(tmp_path: Path) -> None:
-    runtime = DirectRunnerRuntime(base_dir=tmp_path, agent_mode="agent")
+    runtime = DirectRunnerRuntime(
+        base_dir=tmp_path, agent_mode="agent",
+        ask_handler=lambda request: {"status": "answered", "custom_response": f"created: {request['question']}"},
+    )
 
     status = runtime.start_session()
     runner = runtime._runner
@@ -51,17 +54,24 @@ def test_gateway_creates_and_resumes_declarative_runner_without_live_root(tmp_pa
     assert status.root_agent_name == "root"
     assert runner.config.mode_id == "agent"
     assert runner.state["runner_config"]["mode_id"] == "agent"
+    assert runner.base_dir == tmp_path
+    assert runner.ask_user({"question": "continue?"})["custom_response"] == "created: continue?"
     # Runner creation is a declaration operation.  AgentManager acquires the
     # root only on the first stream request, rather than at gateway startup.
     assert dict(runner.agent_manager.live_agents) == {}
 
-    resumed = DirectRunnerRuntime(base_dir=tmp_path)
+    resumed = DirectRunnerRuntime(
+        base_dir=tmp_path,
+        ask_handler=lambda request: {"status": "answered", "custom_response": f"resumed: {request['question']}"},
+    )
     resumed_status = resumed.resume_session(status.runner_id)
 
     assert resumed_status.runner_id == status.runner_id
     assert resumed_status.root_agent_name == "root"
     assert resumed._runner is not None
     assert resumed._runner.config.mode_id == "agent"
+    assert resumed._runner.base_dir == tmp_path
+    assert resumed._runner.ask_user({"question": "continue?"})["custom_response"] == "resumed: continue?"
 
     runtime.stop_session()
     resumed.stop_session()

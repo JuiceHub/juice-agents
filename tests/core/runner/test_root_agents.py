@@ -5,6 +5,7 @@ ToolManager dispatch and background child execution use their real components.
 """
 
 from __future__ import annotations
+from juice_agents.core.agent.context.serialization import _deserialize_step
 
 import copy
 import json
@@ -107,8 +108,8 @@ def harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Callabl
 def _round(runner: Runner, model: _Model, outputs: list[str]) -> list[Any]:
     model.outputs = outputs
     events = list(runner.stream("exercise agent evolution"))
-    assert next(event for event in events if event["kind"] == "round_end")["output"] == "done"
-    return [event["action_step"] for event in events if event["kind"] == "action_step"]
+    assert next(event for event in events if event["kind"] == "round_end")["data"]["result"]["output"] == "done"
+    return [_deserialize_step(event["data"]["step"]) for event in events if event["kind"] == "step_end"]
 
 
 def _assert_completed_children(runner: Runner, count: int) -> None:

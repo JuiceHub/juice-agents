@@ -3,8 +3,7 @@
 覆盖：
 1) `RpcHandlers.handle_cancel_stream` 把请求转发到 runtime。
 2) `DirectRunnerRuntime.request_cancel_stream` 在没有 runner / 不支持的 runner 时返回 cancelled=False。
-3) `StdioJsonRpcServer._drain_control_commands` 在 streaming 期间能并发分发 cancel_stream，
-   并把非控制命令保留在队列尾部，保持 FIFO。
+3) reader 的取消快速路径保持可用，标准输出协议帧不会交错。
 """
 
 from __future__ import annotations
@@ -62,100 +61,20 @@ class RuntimeRequestCancelStreamTests(unittest.TestCase):
         runtime._runner = object()  # type: ignore[attr-defined]
         self.assertEqual(runtime.request_cancel_stream(), {"cancelled": False})
 
-    def test_cancel_invokes_runner_request_stop_stream(self) -> None:
+    def test_cancel_invokes_manager_owned_round_cancellation(self) -> None:
         runtime = self._make_runtime_without_init()
         runner = MagicMock()
-        runtime._runner = runner  # type: ignore[attr-defined]
-        result = runtime.request_cancel_stream(reason="user_cancelled")
-        runner.request_stop_stream.assert_called_once_with(reason="user_cancelled")
-        self.assertEqual(result, {"cancelled": True})
-        self.assertTrue(runtime._cancel_requested.is_set())  # type: ignore[attr-defined]
-
-
-class DrainControlCommandsTests(unittest.TestCase):
-    def _make_server_with_capture(self) -> tuple[StdioJsonRpcServer, list[dict[str, Any]]]:
-        server = StdioJsonRpcServer()
-        captured: list[dict[str, Any]] = []
-
-        def capture(req: dict[str, Any]) -> None:
-            captured.append(req)
-
-        server._handle_request = capture  # type: ignore[assignment]
-        return server, captured
-
-    def test_drain_dispatches_only_control_commands(self) -> None:
-        server, captured = self._make_server_with_capture()
-        server._command_queue.put({"id": "1", "method": "cancel_stream", "params": {}})
-        server._command_queue.put({"id": "2", "method": "cancel_stream", "params": {}})
-
-        server._drain_control_commands()
-
-        methods = [r["method"] for r in captured]
-        self.assertEqual(methods, ["cancel_stream", "cancel_stream"])
-        self.assertTrue(server._command_queue.empty())
-
-    def test_drain_preserves_non_control_commands_at_queue_head(self) -> None:
-        server, captured = self._make_server_with_capture()
-        server._command_queue.put({"id": "1", "method": "cancel_stream", "params": {}})
-        server._command_queue.put({"id": "2", "method": "describe_session", "params": {}})
-        server._command_queue.put({"id": "3", "method": "cancel_stream", "params": {}})
-        server._command_queue.put({"id": "4", "method": "list_models", "params": {}})
-
-        server._drain_control_commands()
-
-        # 控制命令应被立即派发；非控制命令保持顺序、保留在队列。
-        dispatched_methods = [r["method"] for r in captured]
-        self.assertEqual(dispatched_methods, ["cancel_stream", "cancel_stream"])
-
-        remaining: list[str] = []
-        while not server._command_queue.empty():
-            req = server._command_queue.get_nowait()
-            self.assertIsNotNone(req)
-            assert req is not None
-            remaining.append(req["method"])
-        self.assertEqual(remaining, ["describe_session", "list_models"])
-
-    def test_stream_stop_reason_reads_runner_reason(self) -> None:
-        server = StdioJsonRpcServer()
-        runner = MagicMock()
-        runner.stop_reason = "user_cancelled"
-        runtime = MagicMock()
+        runner.active_round_id = "round-1"
+        runner.cancel_round.return_value = True
         runtime._runner = runner
-        server.handlers._runtime = runtime  # type: ignore[assignment]
+        self.assertEqual(runtime.request_cancel_stream(reason="user_cancelled"), {"cancelled": True})
+        runner.cancel_round.assert_called_once_with("round-1", reason="user_cancelled")
 
-        self.assertEqual(server._stream_stop_reason(), "user_cancelled")
-
-    def test_stream_notification_carries_originating_rpc_request_id(self) -> None:
-        server = StdioJsonRpcServer()
-        event = {"kind": "action_step", "step_num": 1}
-        server.handlers.dispatch = MagicMock(return_value=iter([event]))  # type: ignore[assignment]
-        emitted: list[dict[str, Any]] = []
-        server._write_json = lambda value: emitted.append(value)  # type: ignore[assignment]
-
-        server._handle_request({
-            "jsonrpc": "2.0",
-            "id": 41,
-            "method": "stream_message",
-            "params": {"message": "hello"},
-        })
-
-        self.assertEqual(emitted[0]["method"], "stream_step")
-        self.assertEqual(emitted[0]["params"], {"request_id": 41, "event": event})
-
-    def test_cancelled_queued_request_is_skipped_before_dispatch(self) -> None:
-        server = StdioJsonRpcServer()
-        server.handlers.dispatch = MagicMock(return_value=iter([]))  # type: ignore[assignment]
-        server._write_json = MagicMock()  # type: ignore[assignment]
-        server._record_cancel_target({"request_id": "new"})
-
-        server._handle_request({
-            "jsonrpc": "2.0",
-            "id": "new",
-            "method": "stream_message",
-            "params": {"message": "should not execute"},
-        })
-
-        server.handlers.dispatch.assert_not_called()
+    def test_no_active_round_does_not_report_cancellation(self) -> None:
+        runtime = self._make_runtime_without_init()
+        runtime._runner = MagicMock(active_round_id=None)
+        self.assertEqual(runtime.request_cancel_stream(), {"cancelled": False})
+        runtime._runner.cancel_round.assert_not_called()
 
 
 class ReaderThreadIntegrationTests(unittest.TestCase):

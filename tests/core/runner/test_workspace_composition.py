@@ -3,14 +3,14 @@
 from pathlib import Path
 import json
 import threading
+import time
 
 import pytest
 
-from juice_agents import Juice
+from juice_agents import Runner
 from juice_agents.core.config.runtime_config import read_workspace_config
 from juice_agents.core.registry.agents import registry as registry_module
 from juice_agents.core.registry.agents.types import AgentConfig
-from juice_agents.core.runner import Runner
 from juice_agents.core.runner.errors import RunnerBusyError
 
 
@@ -90,7 +90,11 @@ def test_managed_work_uses_project_tools_rules_and_state(tmp_path, monkeypatch, 
             else:
                 runner.create_team_member("writer", config={"instructions": "Write result.", "tools": ["write"]})
                 task = runner.team_manager.add_task("Write result", eligible_members=["writer"])
-                assert runner.async_task_manager.wait_active_async_tasks(timeout_seconds=5) == []
+                runner.activate()
+                deadline = time.monotonic() + 5
+                while runner.team_manager.has_pending_work() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert not runner.team_manager.has_pending_work()
                 saved = next(item for item in runner.team_manager.list_tasks() if item["task_id"] == task["task_id"])
                 assert saved["status"] == "completed", saved
             assert (workspace / "result.txt").read_text(encoding="utf-8") == f"result-{scope}"
@@ -122,8 +126,7 @@ def test_runtime_override_reconfiguration_preserves_session_and_team_board(tmp_p
         return models.setdefault(name, Model(name))
 
     monkeypatch.setattr(registry_module, "resolve_runtime_model", resolve)
-    client = Juice(workspace=tmp_path)
-    runner = client.runners.create(runner_config="team", permission_mode="accept", runtime_overrides={"runtime": {"model_name": "first"}})
+    runner = Runner.create(base_dir=tmp_path, runner_config="team", permission_mode="accept", runtime_overrides={"runtime": {"model_name": "first"}})
     try:
         assert runner.run("first task") == "first"
         old_context = runner._root().instance.context
@@ -140,6 +143,9 @@ def test_runtime_override_reconfiguration_preserves_session_and_team_board(tmp_p
             with pytest.raises(RunnerBusyError):
                 runner.reconfigure(runtime_overrides={"runtime": {"model_name": "blocked"}})
         finally:
+            # Closing a request subscription does not revoke a durable input.
+            # Wait for its own round before applying a new runtime config.
+            list(stream)
             stream.close()
         assert runner._root().instance is old_root
         runner_id = runner.runner_id
@@ -155,7 +161,7 @@ def test_runtime_override_reconfiguration_preserves_session_and_team_board(tmp_p
         assert not read_workspace_config(tmp_path)
     finally:
         runner.close()
-    resumed = client.runners.resume(runner_id=runner_id, runtime_overrides={"runtime": {"model_name": "third"}})
+    resumed = Runner.resume(base_dir=tmp_path, runner_id=runner_id, runtime_overrides={"runtime": {"model_name": "third"}})
     try:
         assert resumed.run("third task") == "third"
         assert resumed.runner_id == runner_id

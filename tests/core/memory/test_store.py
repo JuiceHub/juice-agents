@@ -114,7 +114,7 @@ class MemoryStoreTests(unittest.TestCase):
     def _write_session(base: Path, runner_id: str, agent_id: str, mtime: float) -> Path:
         """Write only the Manager session path needed by the due-count test."""
 
-        path = base / ".juice" / "runners" / runner_id / "agents" / agent_id / "session.json"
+        path = base / ".juice" / "sessions" / runner_id / "agents" / agent_id / "session.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('{"steps":[]}\n', encoding="utf-8")
         os.utime(path, (mtime, mtime))

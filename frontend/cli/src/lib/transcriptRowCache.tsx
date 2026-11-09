@@ -19,6 +19,7 @@ type MessageBlock = SharedMessageBlock & { timestamp?: number };
 interface CacheEntry {
   rows: RowVM[];
   columns: number;
+  block: MessageBlock;
   blockTimestamp: number;
   lastAccessed: number;
 }
@@ -59,6 +60,7 @@ export class TranscriptRowCache {
     this.cache.set(cacheKey, {
       rows,
       columns,
+      block,
       blockTimestamp: block.timestamp || 0,
       lastAccessed: Date.now(),
     });
@@ -84,6 +86,13 @@ export class TranscriptRowCache {
     block: MessageBlock,
     columns: number
   ): boolean {
+    // Conversation reducers preserve existing message objects, but a new
+    // session reuses positional keys (m0, m1, ...). Object identity prevents
+    // those new messages from displaying rows cached for the old session.
+    if (cached.block !== block) {
+      return false;
+    }
+
     // 终端宽度变化，缓存失效
     if (cached.columns !== columns) {
       return false;

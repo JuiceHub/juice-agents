@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,10 +14,9 @@ from juice_agents.core.agent.builtin.configs import get_general_subagent_config
 from juice_agents.core.agent.tools.builtin.agents.agents_tools import AgentsListTool, AgentViewTool
 from juice_agents.core.agent.tools.builtin.evolution.agent_manage import AgentManageTool
 from juice_agents.core.config.context import ConfigurationContext
-from juice_agents.core.prebuilt import build_prebuilt_agent_declarations, create_prebuilt_runner
 from juice_agents.core.registry import AgentRegistry
 from juice_agents.core.registry.agents import registry as registry_module
-from juice_agents.core.runner import Runner
+from juice_agents import Runner
 
 
 class _SubmitModel:
@@ -36,11 +36,10 @@ def _registry(workspace: Path) -> AgentRegistry:
 
 @pytest.mark.parametrize("mode_id", ["agent", "plan", "group", "team"])
 def test_cold_declarations_and_runner_creation_do_not_save_resources(tmp_path: Path, mode_id: str) -> None:
-    declarations = build_prebuilt_agent_declarations(base_dir=tmp_path, runner_config=mode_id)
-    assert "root" in {config.name for config in declarations}
+    assert "root" in _registry(tmp_path).list_configs()
     assert not (tmp_path / ".juice").exists()
 
-    runner = create_prebuilt_runner(base_dir=tmp_path, runner_config=mode_id)
+    runner = Runner.create(base_dir=tmp_path, runner_config=mode_id)
     try:
         assert runner.agent_registry.get_source("root") == "builtin"
         assert runner.agent_registry.load_config("root").name == "root"
@@ -116,7 +115,7 @@ def test_agent_tools_use_registry_source_and_first_save_materializes_override(tm
 
 def test_saved_root_override_is_used_when_runner_resumes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(registry_module, "resolve_runtime_model", lambda **_kwargs: object())
-    runner = create_prebuilt_runner(base_dir=tmp_path, runner_config="agent")
+    runner = Runner.create(base_dir=tmp_path, runner_config="agent")
     runner_id = runner.runner_id
     override = runner.agent_registry.load_config("root").copy_with(instructions="persisted root override")
     runner.agent_registry.save_config(override)
@@ -133,7 +132,7 @@ def test_saved_root_override_is_used_when_runner_resumes(tmp_path: Path, monkeyp
 
 @pytest.mark.parametrize("member_source", ["shared", "private"])
 def test_failed_first_team_member_creation_restores_builtin_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, member_source: str) -> None:
-    runner = create_prebuilt_runner(base_dir=tmp_path, runner_config="team")
+    runner = Runner.create(base_dir=tmp_path, runner_config="team")
     try:
         def fail_create(*_args, **_kwargs):
             raise ValueError("runtime member failed")
@@ -151,13 +150,16 @@ def test_failed_first_team_member_creation_restores_builtin_manifest(tmp_path: P
 @pytest.mark.parametrize("member_source", ["shared_alias", "private"])
 def test_team_dispatch_resolves_unsaved_shared_and_private_sources(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, member_source: str) -> None:
     monkeypatch.setattr(registry_module, "resolve_runtime_model", lambda **_kwargs: _SubmitModel())
-    runner = create_prebuilt_runner(base_dir=tmp_path, runner_config="team")
+    runner = Runner.create(base_dir=tmp_path, runner_config="team")
     try:
         member_name = "general" if member_source == "private" else "reviewer"
         kwargs = {"config": {"instructions": "private general instructions"}} if member_source == "private" else {"agent_name": "researcher"}
         runner.create_team_member(member_name, **kwargs)
 
-        assert runner._run_team_member(member_name, None) == "done"
+        managed = runner.team_manager.acquire_member(member_name)
+        assert asyncio.run(runner._ainvoke_persistent_round(
+            managed, "Review role", task_images=[], cancel_event=None,
+        )).unwrap() == "done"
         owner = runner.agent_manager.get_by_name(member_name).instance
         declaration = owner._declared_agent_config
         assert declaration.name == ("general" if member_source == "private" else "researcher")
@@ -181,9 +183,9 @@ def test_team_dispatch_resolves_unsaved_shared_and_private_sources(tmp_path: Pat
 @pytest.mark.parametrize("mode_id", ["agent", "plan", "group"])
 def test_builtin_workers_execute_without_saved_declarations(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode_id: str) -> None:
     monkeypatch.setattr(registry_module, "resolve_runtime_model", lambda **_kwargs: _SubmitModel())
-    runner = create_prebuilt_runner(base_dir=tmp_path, runner_config=mode_id)
+    runner = Runner.create(base_dir=tmp_path, runner_config=mode_id)
     try:
-        assert list(runner.stream("initialize root"))[-1]["output"] == "done"
+        assert list(runner.stream("initialize root"))[-1]["data"]["result"]["output"] == "done"
         available = runner.list_available_agents()["agents"]
         worker_name = "general_worker" if mode_id == "group" else available[0]["name"]
         output = {"result": "done"} if mode_id == "group" else "done"

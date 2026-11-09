@@ -14,8 +14,6 @@ from ...runtime.base_tools import LIST_OBSERVATION_CHARS, Tool
 class TeamTool(Tool):
     """Resolve the caller from AgentManager, never from model supplied args."""
 
-    _execution_mode = "serial"
-
     def __init__(self) -> None:
         super().__init__()
         self.owner_agent: Any | None = None
@@ -70,7 +68,6 @@ class TeamTaskCreateTool(TeamTool):
 class TeamTaskListTool(TeamTool):
     name = "team_task_list"
     is_read_only = True
-    _execution_mode = "parallel_safe"
     max_observation_chars = LIST_OBSERVATION_CHARS
     description = "List durable Team tasks, eligibility, claims, dependencies and status."
     inputs: dict[str, dict[str, Any]] = {}
@@ -162,12 +159,12 @@ class TeamUseTool(TeamTool):
 
 class SendMessageTool(TeamTool):
     name = "send_message"
-    description = "Queue a durable private Team message for a member or root."
+    description = "Queue a durable Team message; recipient='*' broadcasts to current active peers, including root."
     inputs = {
-        "recipient": {"type": "string", "description": "Recipient Team member name, or root"},
+        "recipient": {"type": "string", "description": "Team member name, root, or '*' for all active peers except yourself"},
         "text": {"type": "string", "description": "Message content"},
     }
-    outputs = {"message": {"type": "object", "description": "Queued message with ID"}}
+    outputs = {"message": {"type": "object", "description": "Message receipt, or broadcast_id and independent per-recipient receipts"}}
 
     def forward(self, recipient: str, text: str) -> dict[str, Any]:
         _, manager, managed = self._runtime()

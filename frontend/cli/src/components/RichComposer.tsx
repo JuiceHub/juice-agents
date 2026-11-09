@@ -15,6 +15,7 @@ import {
   submitDraft,
   syncEditedDraft,
 } from "../lib/composer.js";
+import { loadSharedHistory, recordSharedHistory } from "../lib/history.js";
 import {
   deleteBackwardAtCursor,
   insertTextAtCursor,
@@ -210,6 +211,11 @@ export function RichComposer({
           return;
         }
 
+        // Refresh only when entering history: new submissions from other
+        // processes become visible without shifting indexes during traversal.
+        const current = controllerRef.current;
+        const history = loadSharedHistory(current.history);
+        controllerRef.current = { ...current, history, historyCursors: history.map((item) => item.length) };
         const next = cycleHistoryUp(controllerRef.current, value, cursor);
         commitController(next);
         onChange(next.value);
@@ -257,6 +263,8 @@ export function RichComposer({
         if (!submitted) {
           return;
         }
+
+        recordSharedHistory(submitted);
 
         const currentController = controllerRef.current;
         const nextHistoryCursors = pushHistoryCursor(

@@ -1,74 +1,55 @@
-"""Serialization helpers that turn core action steps into JSON-RPC payloads."""
+"""One JSON contract shared by stdio and WebSocket public event delivery."""
 
 from __future__ import annotations
 
+from dataclasses import fields, is_dataclass
+from pathlib import Path
 from typing import Any
 
 from juice_agents.core.agent.agent_type import ObservationImage
 from juice_agents.core.agent.context.steps import ActionStep
+from juice_agents.core.agent.context.serialization import _serialize_step
 
 
 def serialize_action_step(step: ActionStep) -> dict[str, Any]:
-    """Convert an ActionStep into plain JSON-serializable values for transport."""
-    return {
-        "step_num": int(step.step_num),
-        "model_output": str(step.model_output or ""),
-        "thought": str(step.thought or ""),
-        "tool_calls": [dict(item) for item in list(step.tool_calls or []) if isinstance(item, dict)],
-        "code_action": str(step.code_action or ""),
-        "reasoning_content": str(step.reasoning_content or ""),
-        "observations": list(step.observations or []),
-        "observation_limits": list(step.observation_limits or []),
-        "request_bytes": int(step.request_bytes or 0),
-        "usage": dict(step.usage) if isinstance(step.usage, dict) else None,
-        "observation_images": [
-            _serialize_observation_image(img)
-            for img in (step.observations_images or [])
-        ],
-        "attachments": [dict(att) for att in (step.attachments or [])],
-        "error": str(step.error) if step.error else None,
-        "round_outcome": step.round_outcome,
-        "output": step.output,
-    }
+    """Reuse the committed SDK projection, including round/step/tool identities."""
+    return _json_value(_serialize_step(step))
 
 
 def serialize_runner_stream_event(event: dict[str, Any]) -> dict[str, Any]:
-    """Convert a RunnerStreamEvent into transport-safe JSON values."""
+    """Serialize only the public envelope and its typed ``kind + data`` payload.
 
-    action_step = event.get("action_step")
-    # TeamManager emits domain data at the event root. Keep the wire format's
-    # existing team_event envelope so stdio and WebSocket clients share one
-    # shape, while accepting older callers that already provide the envelope.
-    team_event = event.get("team_event")
-    if event.get("kind") == "team_update" and team_event is None:
-        team_event = {
-            "team_name": event.get("team_name"),
-            "actor": event.get("agent_name") or "team",
-            "update": event.get("update") or {},
-            "snapshot": event.get("snapshot") or {},
-        }
-    return {
-        "kind": str(event.get("kind") or ""),
-        "permission_mode": str(event.get("permission_mode") or ""),
-        "agent_mode": str(event.get("agent_mode") or event.get("mode_id") or ""),
-        "runner_id": str(event.get("runner_id") or ""),
-        "agent_name": event.get("agent_name"),
-        "agent_id": event.get("agent_id"),
-        "agent_role": event.get("agent_role"),
-        "step_num": event.get("step_num"),
-        "action_step": (
-            serialize_action_step(action_step)
-            if isinstance(action_step, ActionStep)
-            else action_step
-        ),
-        "team_event": team_event,
-        "lifecycle_event": event.get("lifecycle_event"),
-        "round_id": str(event.get("round_id") or ""),
-        "outcome": str(event.get("outcome") or ""),
-        "output": event.get("output"),
-        "reason": str(event.get("reason") or ""),
-        "stop_reason": str(event.get("stop_reason") or ""),
-    }
+    Identity and timestamps originate in the Runner, never in a transport.
+    Recursive conversion preserves committed steps, results and tool call IDs
+    without rebuilding a second event schema or leaking storage details.
+    """
+    common = ("kind", "event_id", "timestamp", "runner_id", "agent_id", "agent_name", "agent_role")
+    payload = {key: _json_value(event.get(key)) for key in common}
+    for key in ("round_id", "step_num"):
+        if event.get(key) is not None:
+            payload[key] = _json_value(event[key])
+    payload["data"] = _json_value(event.get("data") or {})
+    return payload
+
+
+def _json_value(value: Any) -> Any:
+    """Flatten nested SDK values while retaining their public field identities."""
+    if isinstance(value, ActionStep):
+        return serialize_action_step(value)
+    if isinstance(value, ObservationImage):
+        return _serialize_observation_image(value)
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        return _json_value(to_dict())
+    if is_dataclass(value) and not isinstance(value, type):
+        return {field.name: _json_value(getattr(value, field.name)) for field in fields(value)}
+    if isinstance(value, dict):
+        return {str(key): _json_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_json_value(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    return value
 
 
 def _serialize_observation_image(img: ObservationImage) -> dict[str, Any]:

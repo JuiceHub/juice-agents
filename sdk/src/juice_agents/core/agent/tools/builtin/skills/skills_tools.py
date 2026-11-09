@@ -98,7 +98,6 @@ class SkillToolBase(Tool):
 
 
 class SkillsListTool(SkillToolBase):
-    _execution_mode = "parallel_safe"
     max_observation_chars = LIST_OBSERVATION_CHARS
     name = "skills_list"
     is_read_only = True
@@ -122,7 +121,6 @@ class SkillsListTool(SkillToolBase):
 
 
 class SkillViewTool(SkillToolBase):
-    _execution_mode = "parallel_safe"
     max_observation_chars = CONTENT_OBSERVATION_CHARS
     name = "skill_view"
     is_read_only = True

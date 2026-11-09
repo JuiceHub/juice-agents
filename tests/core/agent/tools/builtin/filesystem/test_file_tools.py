@@ -1,7 +1,10 @@
 """Workspace filesystem tool contracts."""
 
 import os
+import subprocess
+import sys
 import tempfile
+import textwrap
 import time
 import unittest
 from pathlib import Path
@@ -21,6 +24,64 @@ class FileToolsTests(unittest.TestCase):
 
     def tearDown(self):
         self.tmp_dir.cleanup()
+
+    def test_default_bundle_binds_to_workspace_at_first_explicit_access(self):
+        """A fresh interpreter exercises imports without a pre-cached bundle."""
+        for name in ("import-workspace", "tool-workspace", "later-workspace"):
+            (self.root_dir / name).mkdir()
+        script = textwrap.dedent("""
+            import os
+            from pathlib import Path
+            import sys
+
+            root = Path(sys.argv[1])
+            os.chdir(root / "import-workspace")
+            import juice_agents
+
+            # Importing the SDK must not fix the default tools to that cwd.
+            workspace = root / "tool-workspace"
+            os.chdir(workspace)
+            from juice_agents.core.agent.tools import FILE_TOOLS
+            from juice_agents.core.agent.tools.builtin.filesystem import files_tools
+
+            expected = {
+                "read": files_tools.ReadTool,
+                "write": files_tools.WriteTool,
+                "edit": files_tools.EditTool,
+                "glob": files_tools.GlobTool,
+                "grep": files_tools.GrepTool,
+            }
+            assert set(FILE_TOOLS) == set(expected)
+            for name, tool_type in expected.items():
+                assert isinstance(FILE_TOOLS[name], tool_type)
+                assert FILE_TOOLS[name].root_dir == workspace
+            FILE_TOOLS["write"].forward(path="bundle.txt", content="chosen workspace")
+            assert (workspace / "bundle.txt").read_text() == "chosen workspace"
+            assert not (root / "import-workspace" / "bundle.txt").exists()
+
+            # Existing callers retain the shared instances after cwd changes.
+            os.chdir(root / "later-workspace")
+            from juice_agents.core.agent.tools import FILE_TOOLS as exported_again
+            assert exported_again is FILE_TOOLS is files_tools.FILE_TOOLS
+            assert FILE_TOOLS["read"].forward(path="bundle.txt")["content"] == "chosen workspace"
+        """)
+        result = subprocess.run(
+            [sys.executable, "-P", "-c", script, str(self.root_dir)],
+            cwd=self.root_dir, capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_explicit_roots_are_validated_during_construction(self):
+        """Lazy bundle exports must preserve direct constructor validation."""
+        non_directory = self.root_dir / "file.txt"
+        non_directory.write_text("not a directory", encoding="utf-8")
+        for tool_type in (ReadTool, WriteTool, EditTool, GlobTool, GrepTool):
+            with self.subTest(tool_type=tool_type.__name__):
+                with self.assertRaisesRegex(ValueError, "root_dir 不存在"):
+                    tool_type(root_dir=self.root_dir / "missing")
+                with self.assertRaisesRegex(ValueError, "root_dir 必须是目录"):
+                    tool_type(root_dir=non_directory)
+                self.assertEqual(tool_type(root_dir=self.root_dir).root_dir, self.root_dir)
 
     def test_write_new_file_and_read_full_content(self):
         result = self.write_tool.forward(path="docs/a.txt", content="hello")

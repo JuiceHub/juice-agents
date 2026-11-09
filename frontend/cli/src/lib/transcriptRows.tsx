@@ -31,7 +31,6 @@ import { getMessageAppearance } from "./messageAppearance.js";
 import {
   formatToolHeader,
   formatToolOutputPreview,
-  pickPrimaryToolParameter,
   MAX_TOOL_PREVIEW_LINES,
 } from "./toolOutputFormatter.js";
 import { splitByDisplayWidth } from "./transcriptLayout.js";
@@ -221,7 +220,8 @@ function displayWidth(value: string): number {
 }
 
 /**
- * 摊平工具块：header 行（▸ Ran tool(arg=val) / ✗ Failed） + ⎿ 折叠输出（前 6 行 + `+K more lines`）。
+ * 摊平同一次工具调用：带参数摘要的生命周期标题、返回结果和独立错误详情。
+ * 每一部分都先按终端显示宽度换行，保证虚拟滚动的一条 RowVM 对应一行。
  */
 function flattenToolBlock(
   block: MessageBlock,
@@ -230,53 +230,77 @@ function flattenToolBlock(
 ): RowVM[] {
   if (!block.toolCall) return [];
   const header = formatToolHeader(block.toolCall);
-  const primary = pickPrimaryToolParameter(block.toolCall);
-  const preview = primary
-    ? formatToolOutputPreview(primary.value, MAX_TOOL_PREVIEW_LINES)
-    : { lines: [], truncatedCount: 0 };
 
   const headerColor = header.failed
     ? TUI_THEME.message.errorAccent
     : TUI_THEME.message.responseAccent;
-  const isRunning = block.toolCall.status === "running";
-  const headerSuffix = isRunning ? " (running)" : "";
   const headerLine = header.inlineParams
-    ? `${header.label} ${header.inlineParams}${headerSuffix}`
-    : `${header.label}${headerSuffix}`;
+    ? `${header.label} ${header.inlineParams}`
+    : header.label;
 
   const rows: RowVM[] = [];
   const mutedColor = TUI_THEME.message.muted;
 
-  // header 行：glyph 上色 + 标题。header 不 wrap（已由 inlineParams 截断）。
-  rows.push({
-    key: `${blockKey}:0`,
-    prefix: `${header.glyph} `,
-    prefixColor: headerColor,
-    text: headerLine,
-    textColor: headerColor,
-    dim: false,
-  });
+  // 字符截断无法保证中文、emoji 或很窄终端不溢出。统一按显示单元拆行；
+  // 当终端过窄时先让出缩进，给双宽字符保留空间，而不是让 Ink 隐式换行。
+  const appendLines = (
+    section: string,
+    text: string,
+    firstPrefix: string,
+    continuationPrefix: string,
+    color: string,
+    dim: boolean,
+    maxLines?: number,
+  ): number => {
+    const fitPrefix = (prefix: string): string =>
+      displayWidth(prefix) <= Math.max(0, width - 2) ? prefix : "";
+    const headPrefix = fitPrefix(firstPrefix);
+    const restPrefix = fitPrefix(continuationPrefix);
+    // 以较宽的前缀预留空间，保证首行和续行都不会触发终端隐式换行。
+    const contentWidth = Math.max(1, width - Math.max(displayWidth(headPrefix), displayWidth(restPrefix)));
+    // Browser results often serialize HTML/text into a single long line with
+    // escaped newlines. Apply the preview budget AFTER terminal-width wrapping
+    // so that one source line cannot expand into hundreds of visible rows.
+    const wrapped = text.replace(/\t/g, "    ").split("\n")
+      .flatMap((line) => splitByDisplayWidth(line || " ", contentWidth));
+    const preview = maxLines === undefined
+      ? { lines: wrapped, truncatedCount: 0 }
+      : formatToolOutputPreview(wrapped.join("\n"), maxLines);
+    let first = true;
+    let sectionRow = 0;
+    for (const chunk of preview.lines) {
+      rows.push({
+        key: `${blockKey}:${section}:${sectionRow++}`,
+        prefix: first ? headPrefix : restPrefix,
+        prefixColor: color,
+        // A terminal with only one available cell cannot contain a CJK glyph.
+        // Use one ellipsis instead of allowing the row to spill into the next.
+        text: displayWidth(chunk) <= contentWidth ? chunk : "…",
+        textColor: color,
+        dim,
+      });
+      first = false;
+    }
+    return preview.truncatedCount;
+  };
 
-  // 折叠输出：⎿ + 前 6 行；首行 ⎿ 前缀，续行 4 空格缩进。
-  preview.lines.forEach((line, idx) => {
-    rows.push({
-      key: `${blockKey}:out:${idx}`,
-      prefix: idx === 0 ? "  ⎿ " : "    ",
-      prefixColor: mutedColor,
-      text: line || " ",
-      textColor: mutedColor,
-      dim: true,
-    });
-  });
-  if (preview.truncatedCount > 0) {
-    rows.push({
-      key: `${blockKey}:more`,
-      prefix: "    ",
-      prefixColor: TUI_THEME.surface.muted,
-      text: `… +${preview.truncatedCount} more lines`,
-      textColor: TUI_THEME.surface.muted,
-      dim: true,
-    });
+  appendLines("header", headerLine, `${header.glyph} `, "  ", headerColor, false);
+  const error = String(block.toolCall.error || "").trim();
+  const observation = String(block.toolCall.observation || "").trim();
+  if (observation) {
+    // Tool-returned errors can have completed status. Display the raw result
+    // without guessing status from its text; explicit failures keep all detail.
+    const fullDetail = header.failed || Boolean(error);
+    const omittedLines = appendLines("result", observation, "  ⎿ ", "    ",
+      fullDetail ? TUI_THEME.message.errorAccent : mutedColor, !fullDetail,
+      fullDetail ? undefined : MAX_TOOL_PREVIEW_LINES);
+    if (omittedLines > 0) {
+      appendLines("result-more", `… +${omittedLines} more lines`, "    ", "    ", mutedColor, true);
+    }
+  }
+  if (error && !observation.includes(error)) {
+    // Error details have their own budget: a long input never hides the failure.
+    appendLines("error", `Error: ${error}`, "  ⎿ ", "    ", TUI_THEME.message.errorAccent, false);
   }
   return rows;
 }

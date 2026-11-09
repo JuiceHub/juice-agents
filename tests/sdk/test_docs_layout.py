@@ -12,7 +12,7 @@ SDK_ROOT = REPO_ROOT / "sdk"
 CORE_SOURCE = REPO_ROOT / "sdk" / "src" / "juice_agents" / "core"
 MODULES = {
     "agent", "cron", "workflow", "group", "managers", "memory",
-    "models", "permissions", "prebuilt", "registry", "runner", "team",
+    "models", "permissions", "registry", "runner", "team",
 }
 MARKDOWN_LINK = re.compile(r"\[[^]]+\]\(([^)]+)\)")
 

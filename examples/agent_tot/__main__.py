@@ -39,12 +39,13 @@ DEFAULT_TASK = (
 class DemonstrationStrategy(TreeOfThoughtsStrategy):
     """Show the real scoring decision before the winner executes its actions."""
 
-    def select(
+    async def aselect(
         self, *, context: list[dict[str, Any]], candidates: list[ActionStep],
         on_model_usage: Callable[..., None] | None = None,
+        model_call: Callable[..., Any] | None = None,
     ) -> tuple[int, list[float | None]]:
-        selected, scores = super().select(
-            context=context, candidates=candidates, on_model_usage=on_model_usage,
+        selected, scores = await super().aselect(
+            context=context, candidates=candidates, on_model_usage=on_model_usage, model_call=model_call,
         )
         print(f"[tot] candidates={len(candidates)} scores={scores} selected={selected + 1}", flush=True)
         for index, candidate in enumerate(candidates):

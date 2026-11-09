@@ -1,10 +1,10 @@
 """
 统一运行时配置中的模型目录加载与模型解析。
 
-该模块服务于 runner / prebuilt / TUI：
+该模块服务于 Runner 与前端适配层：
 - 从合并运行时配置的 `models` 顶层读取逻辑模型目录；
 - 从 `.env` / 环境变量解析密钥；
-- 根据 `backend=openai|doubao|anthropic|composite` 选择具体模型实现。
+- 通过共享 `providers` 解析连接，按 backend 选择模型实现。
 
 性能优化：
 - 模型实例复用：使用 WeakValueDictionary 缓存已创建的模型实例
@@ -21,15 +21,16 @@ from weakref import WeakValueDictionary
 
 from juice_agents.core.models.chat_models import ChatModel
 
+from .provider_catalog import (
+    load_model_catalog,
+    redact_provider_api_base,
+    resolve_catalog_entry,
+    resolve_provider_credentials,
+)
 from .runtime_config import (
     DEFAULT_DOTENV_PATH,
     DEFAULT_RUNTIME_CONFIG_PATH,
     get_evaluator_config,
-    get_runtime_mapping,
-    credential_paths,
-    read_credential_values,
-    resolve_env_value,
-    resolve_runtime_config_path,
 )
 
 logger = logging.getLogger(__name__)
@@ -66,79 +67,11 @@ CLAUDE_DISABLED_ONLY_EFFORTS: tuple[str, ...] = ("disabled",)
 class RuntimeModelConfig:
     model_name: str
     backend: RuntimeBackend
-    api_base: str = ""
+    api_base: str = field(default="", repr=False)
     api_key_env: str = ""
     provider_model_name: str = ""
     api_key: str = field(default="", repr=False)
-
-
-def _load_catalog_payload(
-    runtime_config_path: str | Path | None,
-    *,
-    workspace_dir: str | Path | None = None,
-    runtime_overrides: dict[str, Any] | None = None,
-) -> tuple[Path, dict[str, Any]]:
-    resolved_path = resolve_runtime_config_path(runtime_config_path)
-    if not resolved_path.exists():
-        raise FileNotFoundError(f"模型目录文件不存在: {resolved_path}")
-    return resolved_path, get_runtime_mapping(
-        "models",
-        config_path=resolved_path,
-        workspace_dir=workspace_dir,
-        overrides=runtime_overrides,
-    )
-
-
-def _require_model_entry_fields(model_name: str, raw: dict[str, Any], required: list[str]) -> None:
-    for field in required:
-        if not str(raw.get(field) or "").strip():
-            raise ValueError(f"模型 {model_name} 缺少必填字段: {field}")
-
-
-def _normalize_backend(model_name: str, raw: dict[str, Any]) -> RuntimeBackend:
-    backend = str(raw.get("backend") or "").strip().lower()
-    if backend not in {"openai", "doubao", "anthropic"}:
-        raise ValueError(f"模型 {model_name} 的 backend 不合法: {backend}")
-    return backend  # type: ignore[return-value]
-
-
-def _read_env_value(
-    name: str, *, dotenv_path: str | Path | None, workspace_dir: str | Path | None = None,
-) -> str:
-    """所有模型入口使用统一凭据来源，显式 .env 仍作为项目级来源。"""
-    return resolve_env_value(
-        name, dotenv_values=read_credential_values(workspace_dir=workspace_dir, dotenv_path=dotenv_path),
-    )
-
-
-def _resolve_api_key(
-    *, api_key_env: str, dotenv_path: str | Path | None, workspace_dir: str | Path | None = None,
-) -> str:
-    value = _read_env_value(api_key_env, dotenv_path=dotenv_path, workspace_dir=workspace_dir)
-    if not value:
-        locations = ", ".join(str(path) for path in credential_paths(
-            workspace_dir=workspace_dir, dotenv_path=dotenv_path,
-        ))
-        raise ValueError(f"模型密钥环境变量未配置: {api_key_env}；请设置进程环境变量，或写入 {locations}")
-    return value
-
-
-def _resolve_api_base(
-    *, api_base: str, api_base_env: str, dotenv_path: str | Path | None,
-    workspace_dir: str | Path | None = None,
-) -> str:
-    """
-    解析 API base URL，优先级：api_base_env 指向的变量 > YAML 中的 api_base。
-
-    便于在 .env 中切换官方地址与代理/中转地址，而无需修改模型目录 YAML。
-    """
-    if api_base_env:
-        env_value = _read_env_value(api_base_env, dotenv_path=dotenv_path, workspace_dir=workspace_dir)
-        if env_value:
-            # URLs may embed credentials; only log the source variable name.
-            logger.info("api_base 由环境变量 %s 覆盖", api_base_env)
-            return env_value
-    return api_base
+    provider: str = ""
 
 
 def normalize_runtime_model_effort(model_effort: str | None) -> RuntimeModelEffort:
@@ -256,12 +189,11 @@ def validate_runtime_model_effort(
     runtime_overrides: dict[str, Any] | None = None,
 ) -> RuntimeModelEffort:
     normalized = normalize_runtime_model_effort(model_effort)
-    _, models = _load_catalog_payload(
-        runtime_config_path, workspace_dir=workspace_dir, runtime_overrides=runtime_overrides,
+    payload, _ = load_model_catalog(
+        "models", runtime_config_path=runtime_config_path,
+        workspace_dir=workspace_dir, runtime_overrides=runtime_overrides,
     )
-    raw_model = models.get(str(model_name or "").strip())
-    if not isinstance(raw_model, dict):
-        raise ValueError(f"模型目录中不存在模型: {model_name}")
+    raw_model = resolve_catalog_entry(payload, "models", str(model_name or "").strip())
     supported = resolve_supported_efforts(str(model_name or "").strip(), raw_model)
     if normalized not in supported:
         raise ValueError(
@@ -309,41 +241,21 @@ def load_runtime_model_config(
     if not normalized_model_name:
         raise ValueError("model_name 不能为空")
 
-    _, models = _load_catalog_payload(
-        runtime_config_path, workspace_dir=workspace_dir, runtime_overrides=runtime_overrides,
+    payload, _ = load_model_catalog(
+        "models", runtime_config_path=runtime_config_path,
+        workspace_dir=workspace_dir, runtime_overrides=runtime_overrides,
     )
-    raw_model = models.get(normalized_model_name)
-    if not isinstance(raw_model, dict):
-        raise ValueError(f"模型目录中不存在模型: {normalized_model_name}")
-
-    _require_model_entry_fields(normalized_model_name, raw_model, ["backend"])
-    backend = _normalize_backend(normalized_model_name, raw_model)
-
-    _require_model_entry_fields(
-        normalized_model_name,
-        raw_model,
-        ["api_base", "api_key_env", "provider_model_name"],
+    entry = resolve_catalog_entry(payload, "models", normalized_model_name)
+    api_base, api_key = resolve_provider_credentials(
+        entry, dotenv_path=dotenv_path, workspace_dir=workspace_dir,
     )
-
-    api_key_env = str(raw_model.get("api_key_env") or "").strip()
-    provider_model_name = str(raw_model.get("provider_model_name") or "").strip()
-    # api_base_env 可选：配置后其指向的变量（如 ANTHROPIC_BASE_URL）优先于 YAML 的 api_base
-    api_base = _resolve_api_base(
-        api_base=str(raw_model.get("api_base") or "").strip(),
-        api_base_env=str(raw_model.get("api_base_env") or "").strip(),
-        dotenv_path=dotenv_path,
-        workspace_dir=workspace_dir,
-    )
-    api_key = _resolve_api_key(
-        api_key_env=api_key_env, dotenv_path=dotenv_path, workspace_dir=workspace_dir,
-    )
-
     return RuntimeModelConfig(
         model_name=normalized_model_name,
-        backend=backend,
+        provider=entry["provider"],
+        backend=entry["backend"],
         api_base=api_base,
-        api_key_env=api_key_env,
-        provider_model_name=provider_model_name,
+        api_key_env=entry["api_key_env"],
+        provider_model_name=entry["provider_model_name"],
         api_key=api_key,
     )
 
@@ -354,30 +266,24 @@ def list_runtime_models(
     workspace_dir: str | Path | None = None,
     runtime_overrides: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    _, models = _load_catalog_payload(
-        runtime_config_path, workspace_dir=workspace_dir, runtime_overrides=runtime_overrides,
+    payload, models = load_model_catalog(
+        "models", runtime_config_path=runtime_config_path,
+        workspace_dir=workspace_dir, runtime_overrides=runtime_overrides,
     )
     items: list[dict[str, Any]] = []
-    for model_name in sorted(models.keys()):
-        raw = dict(models.get(model_name) or {})
-        _require_model_entry_fields(model_name, raw, ["backend"])
-        backend = _normalize_backend(model_name, raw)
-        _require_model_entry_fields(
-            model_name,
-            raw,
-            ["api_base", "api_key_env", "provider_model_name"],
-        )
-        item = {
+    for model_name in sorted(models):
+        raw = resolve_catalog_entry(payload, "models", model_name)
+        items.append({
             "model_name": model_name,
-            "backend": backend,
-            "api_base": str(raw.get("api_base") or "").strip(),
-            "api_key_env": str(raw.get("api_key_env") or "").strip(),
-            "provider_model_name": str(raw.get("provider_model_name") or "").strip(),
+            "provider": raw["provider"],
+            "backend": raw["backend"],
+            "api_base": redact_provider_api_base(raw["api_base"]),
+            "api_key_env": raw["api_key_env"],
+            "provider_model_name": raw["provider_model_name"],
             "supported_efforts": resolve_supported_efforts(model_name, raw),
             "thinking_mode": resolve_thinking_mode(raw),
             "supports_budget_tokens": resolve_supports_budget_tokens(raw),
-        }
-        items.append(item)
+        })
     return items
 
 

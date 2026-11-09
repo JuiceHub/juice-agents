@@ -45,7 +45,6 @@ class _BaseMemoryTool(Tool):
 
 
 class MemoryReadTool(_BaseMemoryTool):
-    _execution_mode = "parallel_safe"
     max_observation_chars = CONTENT_OBSERVATION_CHARS
     name = "memory_read"
     description = "Read a workspace memory file under .juice/memory"
@@ -68,7 +67,6 @@ class MemoryReadTool(_BaseMemoryTool):
 
 
 class MemorySearchTool(_BaseMemoryTool):
-    _execution_mode = "parallel_safe"
     max_observation_chars = LIST_OBSERVATION_CHARS
     name = "memory_search"
     description = "Search workspace memory files under .juice/memory"
@@ -83,7 +81,6 @@ class MemorySearchTool(_BaseMemoryTool):
 
 
 class MemoryWriteTool(_BaseMemoryTool):
-    _execution_mode = "serial"
     name = "memory_write"
     description = "Write or update a topic memory file under .juice/memory/topics"
     inputs = {
@@ -114,7 +111,6 @@ class MemoryWriteTool(_BaseMemoryTool):
 
 
 class MemoryForgetTool(_BaseMemoryTool):
-    _execution_mode = "serial"
     name = "memory_forget"
     description = "Remove a topic memory and its MEMORY.md index pointer"
     inputs = {
@@ -132,7 +128,6 @@ class MemoryForgetTool(_BaseMemoryTool):
 
 
 class MemoryStatusTool(_BaseMemoryTool):
-    _execution_mode = "parallel_safe"
     name = "memory_status"
     description = "Return workspace memory status and configuration flags"
     inputs = {}

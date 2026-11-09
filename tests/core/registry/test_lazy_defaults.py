@@ -9,13 +9,12 @@ from typing import Any
 import pytest
 
 from juice_agents.core.config.context import ConfigurationContext
-from juice_agents.core.prebuilt import create_prebuilt_runner
 from juice_agents.core.registry import AgentRegistry, TeamRegistry
 from juice_agents.core.registry.agents import registry as agent_registry_module
 from juice_agents.core.registry.agents.defaults import build_builtin_agent_configs
 from juice_agents.core.registry.agents.store import AgentConfigStore
 from juice_agents.core.registry.teams.store import TeamConfigStore
-from juice_agents.core.runner import Runner
+from juice_agents import Runner
 
 
 class _SubmitModel:
@@ -64,13 +63,13 @@ def test_each_builtin_mode_runs_and_saves_state_without_saving_resources(
     """模型请求走真实 Agent 路径；运行记录可写，默认资源声明仍不落盘。"""
 
     _install_model(monkeypatch)
-    runner = create_prebuilt_runner(runner_config=mode_id, base_dir=tmp_path)
+    runner = Runner.create(runner_config=mode_id, base_dir=tmp_path)
     try:
         assert not (tmp_path / ".juice" / "agents").exists()
         assert not (tmp_path / ".juice" / "teams").exists()
         events = list(runner.stream("Return done."))
         assert events[-1]["kind"] == "round_end"
-        assert events[-1]["output"] == "done"
+        assert events[-1]["data"]["result"]["output"] == "done"
         assert runner.layout.manifest_path.is_file()
         assert runner.agent_manager.get_by_name("root").instance.name == "root"
         assert not (tmp_path / ".juice" / "agents").exists()
@@ -95,18 +94,18 @@ def test_agent_override_survives_reload_and_runner_resume(
     assert fresh.get_source("root") == "local"
     assert fresh.load_config("general").instructions != edited_root.instructions
 
-    runner = create_prebuilt_runner(runner_config="agent", base_dir=tmp_path)
+    runner = Runner.create(runner_config="agent", base_dir=tmp_path)
     runner_id = runner.runner_id
     try:
         assert runner.root_config.instructions == edited_root.instructions
-        assert list(runner.stream("First turn."))[-1]["output"] == "done"
+        assert list(runner.stream("First turn."))[-1]["data"]["result"]["output"] == "done"
     finally:
         runner.close()
 
     resumed = Runner.resume(runner_id=runner_id, base_dir=tmp_path)
     try:
         assert resumed.root_config.instructions == edited_root.instructions
-        assert list(resumed.stream("Second turn."))[-1]["output"] == "done"
+        assert list(resumed.stream("Second turn."))[-1]["data"]["result"]["output"] == "done"
         # 全局资源目录只包含用户显式保存的 root，运行状态位于 runners 下。
         assert sorted(path.name for path in context.agents_dir.iterdir()) == ["root.yaml"]
     finally:

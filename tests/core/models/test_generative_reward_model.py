@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import subprocess
@@ -9,7 +10,7 @@ import sys
 import textwrap
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -18,28 +19,46 @@ from juice_agents.core.config.model_catalog import RuntimeModelConfig
 from juice_agents.core.models.reward_models import BaseRewardModel, GenerativeRewardModel
 
 
+pytestmark = pytest.mark.anyio
+
+
 _BACKEND_SDK = {
-    "openai": ("openai", "OpenAI"),
-    "doubao": ("volcenginesdkarkruntime", "Ark"),
-    "anthropic": ("anthropic", "Anthropic"),
+    "openai": ("openai", "AsyncOpenAI"),
+    "doubao": ("volcenginesdkarkruntime", "AsyncArk"),
+    "anthropic": ("anthropic", "AsyncAnthropic"),
 }
 
 
-def _client(response: str, backend: str = "openai") -> tuple[SimpleNamespace, Mock]:
+class _NativeAsyncClient(SimpleNamespace):
+    """模拟原生 SDK 的身份比较，允许同步适配器登记并回收连接。"""
+
+    __hash__ = object.__hash__
+    __eq__ = object.__eq__
+
+
+def _client(
+    response: str, backend: str = "openai", *, asynchronous: bool = True,
+) -> tuple[SimpleNamespace, Mock]:
     """保留原生 SDK 响应形状，由生产评分器负责提取文本。"""
+    create_type = AsyncMock
     if backend == "anthropic":
         raw_response = SimpleNamespace(content=[
             SimpleNamespace(type="thinking", thinking="ignore this reasoning"),
             SimpleNamespace(type="text", text=response),
         ], usage={"input_tokens": 12, "output_tokens": 4})
-        create = Mock(return_value=raw_response)
-        return SimpleNamespace(messages=SimpleNamespace(create=create)), create
-    raw_response = SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content=response))],
-        usage={"prompt_tokens": 12, "completion_tokens": 4},
-    )
-    create = Mock(return_value=raw_response)
-    return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create))), create
+        create = create_type(return_value=raw_response)
+        client = SimpleNamespace(messages=SimpleNamespace(create=create))
+    else:
+        raw_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=response))],
+            usage={"prompt_tokens": 12, "completion_tokens": 4},
+        )
+        create = create_type(return_value=raw_response)
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    if asynchronous:
+        client = _NativeAsyncClient(**vars(client))
+        client.close = AsyncMock()
+    return client, create
 
 
 def _scorer(response: str, backend: str = "openai") -> tuple[GenerativeRewardModel, Mock]:
@@ -73,13 +92,25 @@ def _runtime_config(backend: str = "openai") -> RuntimeModelConfig:
     )
 
 
-def test_reward_subclass_requires_evaluate_batch_implementation() -> None:
+async def test_reward_subclass_requires_evaluate_batch_implementation() -> None:
     """与聊天模型基类一致：允许构造子类，调用未实现能力时明确报错。"""
     class MissingRewardModel(BaseRewardModel):
         """模拟尚未实现评分逻辑的自定义奖励模型。"""
 
     with pytest.raises(NotImplementedError):
-        MissingRewardModel().evaluate_batch(context=[], actions=[{"content": "candidate"}])
+        (await MissingRewardModel().evaluate_batch(context=[], actions=[{"content": "candidate"}]))
+
+
+async def test_config_reload_keeps_injected_sdk_client_and_model_choice() -> None:
+    """A host reload must not take ownership of caller-supplied connections."""
+
+    scorer, create = _scorer('{"scores": [9]}')
+    original_client = scorer._client
+    (await scorer.reload_config(_configuration()))
+    assert scorer.model_name == "judge"
+    assert scorer._client is original_client
+    assert (await scorer.evaluate_batch(context=[], actions=[{}]))["scores"] == [9.0]
+    create.assert_called_once()
 
 
 @pytest.mark.parametrize("first_module", [
@@ -90,10 +121,11 @@ def test_cold_import_and_scoring(first_module: str) -> None:
     """独立解释器执行两个公开入口，避免已加载模块掩盖循环导入。"""
     script = textwrap.dedent(
         """
+        import asyncio
         import importlib
         import sys
         from types import SimpleNamespace
-        from unittest.mock import Mock
+        from unittest.mock import AsyncMock
 
         importlib.import_module(sys.argv[1])
         from juice_agents.core.models import BaseRewardModel
@@ -101,13 +133,13 @@ def test_cold_import_and_scoring(first_module: str) -> None:
         from juice_agents.core.models.reward_models import GenerativeRewardModel
 
         for scorer_type in (GenerativeRewardModel, PublicGenerativeRewardModel):
-            create = Mock(return_value=SimpleNamespace(choices=[SimpleNamespace(
+            create = AsyncMock(return_value=SimpleNamespace(choices=[SimpleNamespace(
                 message=SimpleNamespace(content='{"scores": [2, 9.5]}'))]))
             client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
             scorer = scorer_type("judge", client=client)
             assert isinstance(scorer, BaseRewardModel)
             create.assert_not_called()
-            assert scorer.evaluate_batch(context=[], actions=[{}, {}])["scores"] == [2.0, 9.5]
+            assert asyncio.run(scorer.evaluate_batch(context=[], actions=[{}, {}]))["scores"] == [2.0, 9.5]
             create.assert_called_once()
         """
     )
@@ -120,27 +152,27 @@ def test_cold_import_and_scoring(first_module: str) -> None:
 
 
 @pytest.mark.parametrize("backend", _BACKEND_SDK)
-def test_direct_sdk_is_lazy_and_reused(monkeypatch: pytest.MonkeyPatch, backend: str) -> None:
+async def test_direct_sdk_is_lazy_and_reused(monkeypatch: pytest.MonkeyPatch, backend: str) -> None:
     """直接参数可独立使用；空批次不创建 SDK，首次创建后复用客户端。"""
-    client, create = _client('{"scores": [6]}', backend)
+    client, create = _client('{"scores": [6]}', backend, asynchronous=True)
     constructor = _install_sdk(monkeypatch, backend, client)
     scorer = GenerativeRewardModel(
         " judge ", backend=backend, api_base="https://direct.test/v1", api_key="direct-key",
     )
     assert scorer.model_name == "judge"
-    assert scorer.evaluate_batch(context=[], actions=[]) == {"scores": [], "usage": None, "usage_calls": []}
+    assert (await scorer.evaluate_batch(context=[], actions=[])) == {"scores": [], "usage": None, "usage_calls": []}
     constructor.assert_not_called()
     create.assert_not_called()
 
     for _ in range(2):
-        assert scorer.evaluate_batch(context=[], actions=[{}])["scores"] == [6.0]
+        assert (await scorer.evaluate_batch(context=[], actions=[{}]))["scores"] == [6.0]
     constructor.assert_called_once_with(api_key="direct-key", base_url="https://direct.test/v1")
     assert create.call_count == 2
     assert create.call_args.kwargs["model"] == "judge"
 
 
 @pytest.mark.parametrize("backend", _BACKEND_SDK)
-def test_injected_client_routes_requests_and_preserves_inputs(
+async def test_injected_client_routes_requests_and_preserves_inputs(
     monkeypatch: pytest.MonkeyPatch, backend: str,
 ) -> None:
     """三个 SDK 使用独立评审提示词；Anthropic 将 system 与用户消息分开。"""
@@ -153,10 +185,10 @@ def test_injected_client_routes_requests_and_preserves_inputs(
         {"role": "assistant", "content": "<actions>actual candidate</actions>"},
     ]
     original = copy.deepcopy((context, actions))
-    assert scorer.evaluate_batch(context=context, actions=[])["scores"] == []
+    assert (await scorer.evaluate_batch(context=context, actions=[]))["scores"] == []
     create.assert_not_called()
 
-    result = scorer.evaluate_batch(context=context, actions=actions)
+    result = (await scorer.evaluate_batch(context=context, actions=actions))
     assert result["scores"] == [2.0, 9.5]
     assert result["usage"]["total_tokens"] == 16
     assert result["usage_calls"] == [{"backend": backend, "model_name": "judge", "usage": result["usage"]}]
@@ -180,24 +212,24 @@ def test_injected_client_routes_requests_and_preserves_inputs(
 
 
 @pytest.mark.parametrize("backend", _BACKEND_SDK)
-def test_from_config_loads_lazily_and_keeps_logical_name(
+async def test_from_config_loads_lazily_and_keeps_logical_name(
     monkeypatch: pytest.MonkeyPatch, backend: str,
 ) -> None:
     """配置只读取连接参数；请求用 provider 名称，不创建聊天模型。"""
     context = _configuration()
     load = Mock(return_value=_runtime_config(backend))
     monkeypatch.setattr(model_catalog, "load_runtime_model_config", load)
-    client, create = _client('{"scores": [4]}', backend)
+    client, create = _client('{"scores": [4]}', backend, asynchronous=True)
     constructor = _install_sdk(monkeypatch, backend, client)
     scorer = GenerativeRewardModel.from_config(" judge ", context)
     assert scorer.model_name == "judge"
-    assert scorer.evaluate_batch(context=[], actions=[])["scores"] == []
+    assert (await scorer.evaluate_batch(context=[], actions=[]))["scores"] == []
     load.assert_not_called()
     constructor.assert_not_called()
     create.assert_not_called()
 
     for _ in range(2):
-        assert scorer.evaluate_batch(context=[], actions=[{}])["scores"] == [4.0]
+        assert (await scorer.evaluate_batch(context=[], actions=[{}]))["scores"] == [4.0]
     load.assert_called_once_with(
         model_name="judge", runtime_config_path=context.project_config_path,
         workspace_dir=context.workspace_dir, dotenv_path=context.dotenv_path,
@@ -212,11 +244,11 @@ def test_from_config_loads_lazily_and_keeps_logical_name(
 
 
 @pytest.mark.parametrize("failure_source", ["configuration", "sdk_constructor"])
-def test_failed_initialization_can_retry_and_cache_success(
+async def test_failed_initialization_can_retry_and_cache_success(
     monkeypatch: pytest.MonkeyPatch, failure_source: str,
 ) -> None:
     """配置加载或 SDK 初始化失败不会留下不可恢复的半初始化状态。"""
-    client, create = _client('{"scores": [7]}')
+    client, create = _client('{"scores": [7]}', asynchronous=True)
     constructor = _install_sdk(monkeypatch, "openai", client)
     if failure_source == "configuration":
         load = Mock(side_effect=[RuntimeError("loading failed"), _runtime_config()])
@@ -227,10 +259,10 @@ def test_failed_initialization_can_retry_and_cache_success(
         scorer = GenerativeRewardModel("judge", api_key="test-key")
 
     with pytest.raises(RuntimeError, match="loading failed"):
-        scorer.evaluate_batch(context=[], actions=[{}])
+        (await scorer.evaluate_batch(context=[], actions=[{}]))
     create.assert_not_called()
     for _ in range(2):
-        assert scorer.evaluate_batch(context=[], actions=[{}])["scores"] == [7.0]
+        assert (await scorer.evaluate_batch(context=[], actions=[{}]))["scores"] == [7.0]
     assert create.call_count == 2
     assert constructor.call_count == (1 if failure_source == "configuration" else 2)
     if failure_source == "configuration":
@@ -238,9 +270,9 @@ def test_failed_initialization_can_retry_and_cache_success(
 
 
 @pytest.mark.parametrize("response", ['```json\n{"scores": [3, 8]}\n```', '{scores: [3, 8,],}'])
-def test_reuses_json_extraction_and_repair(response: str) -> None:
+async def test_reuses_json_extraction_and_repair(response: str) -> None:
     scorer, _create = _scorer(response)
-    assert scorer.evaluate_batch(context=[], actions=[{}, {}])["scores"] == [3.0, 8.0]
+    assert (await scorer.evaluate_batch(context=[], actions=[{}, {}]))["scores"] == [3.0, 8.0]
 
 
 @pytest.mark.parametrize("response, message", [
@@ -251,10 +283,10 @@ def test_reuses_json_extraction_and_repair(response: str) -> None:
     ('{"scores": [1, 2]}', "数量不匹配"), ('{"scores": "1"}', "评分列表"),
     ('{}', "评分列表"), ('[]', "类型不匹配"), ('no structured response', "JSON"),
 ])
-def test_invalid_scores_fail_explicitly_without_format_retry(response: str, message: str) -> None:
+async def test_invalid_scores_fail_explicitly_without_format_retry(response: str, message: str) -> None:
     scorer, create = _scorer(response)
     with pytest.raises(ValueError, match=message) as error:
-        scorer.evaluate_batch(context=[], actions=[{}])
+        (await scorer.evaluate_batch(context=[], actions=[{}]))
     create.assert_called_once()
     assert len(error.value.usage_calls) == 1
     assert error.value.usage_calls[0]["usage"]["total_tokens"] == 16
@@ -269,19 +301,19 @@ def test_invalid_scores_fail_explicitly_without_format_retry(response: str, mess
     ("anthropic", SimpleNamespace(content=[SimpleNamespace(type="text")])),
     ("anthropic", SimpleNamespace(content=[SimpleNamespace(type="text", text=None)])),
 ])
-def test_missing_response_text_fails_explicitly(backend: str, response: object) -> None:
+async def test_missing_response_text_fails_explicitly(backend: str, response: object) -> None:
     scorer, create = _scorer('{"scores": [1]}', backend)
     create.return_value = response
     with pytest.raises(ValueError):
-        scorer.evaluate_batch(context=[], actions=[{}])
+        (await scorer.evaluate_batch(context=[], actions=[{}]))
     create.assert_called_once()
 
 
-def test_provider_failure_propagates_without_application_retry() -> None:
+async def test_provider_failure_propagates_without_application_retry() -> None:
     scorer, create = _scorer('{"scores": [1]}')
     create.side_effect = RuntimeError("provider unavailable")
     with pytest.raises(RuntimeError, match="provider unavailable") as error:
-        scorer.evaluate_batch(context=[], actions=[{}])
+        (await scorer.evaluate_batch(context=[], actions=[{}]))
     create.assert_called_once()
     assert error.value.usage_calls == [{"backend": "openai", "model_name": "judge", "usage": None}]
 
@@ -311,3 +343,45 @@ def test_rejects_invalid_sdk_options(kwargs: dict) -> None:
 def test_requires_backend_appropriate_callable_client(backend: str, client: object) -> None:
     with pytest.raises(TypeError):
         GenerativeRewardModel("judge", backend=backend, client=client)
+
+
+@pytest.mark.parametrize("backend", ["openai", "doubao", "anthropic"])
+async def test_cancellable_scoring_stream_preserves_text_usage_and_closes(backend: str) -> None:
+    import threading
+
+    closed = threading.Event()
+    if backend == "anthropic":
+        chunks = [
+            SimpleNamespace(message=SimpleNamespace(usage={"input_tokens": 12}), delta=None),
+            SimpleNamespace(delta=SimpleNamespace(type="text_delta", text='{"scores": [7]}')),
+            SimpleNamespace(usage={"output_tokens": 4}, delta=None),
+        ]
+    else:
+        chunks = [
+            SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content='{"scores": [7]}'))], usage=None),
+            SimpleNamespace(choices=[], usage={"prompt_tokens": 12, "completion_tokens": 4}),
+        ]
+
+    class Stream:
+        async def __aiter__(self):
+            for chunk in chunks:
+                yield chunk
+
+        async def close(self):
+            closed.set()
+
+    create = AsyncMock(return_value=Stream())
+    client = (
+        SimpleNamespace(messages=SimpleNamespace(create=create))
+        if backend == "anthropic" else
+        SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    )
+    scorer = GenerativeRewardModel("judge", backend=backend, client=client)
+    result = (await scorer.evaluate_batch(context=[], actions=[{}], stream=True))
+    assert result["scores"] == [7.0]
+    assert result["usage"]["input_tokens"] == 12
+    assert result["usage"]["output_tokens"] == 4
+    assert result["usage"]["total_tokens"] == 16
+    assert len(result["usage_calls"]) == 1
+    assert closed.is_set()
+    assert create.call_args.kwargs["stream"] is True

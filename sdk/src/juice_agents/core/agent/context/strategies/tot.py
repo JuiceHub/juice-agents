@@ -7,6 +7,10 @@ import math
 from numbers import Real
 from typing import TYPE_CHECKING, Any, Callable
 
+from ....managers.models import invoke_model_call
+from ....runner.execution.async_bridge import run_async
+from ....runner.execution.async_io import invoke
+from ....runner.execution.cancellation import StreamCancelled
 from ..steps import ActionStep
 
 if TYPE_CHECKING:
@@ -32,9 +36,13 @@ class TreeOfThoughtsStrategy:
     def candidate_count(self) -> int:
         return self.breadth if self.reward_model is not None else 1
 
-    def select(
+    def select(self, **kwargs: Any) -> tuple[int, list[float | None]]:
+        return run_async(self.aselect(**kwargs))
+
+    async def aselect(
         self, *, context: list[dict[str, Any]], candidates: list[ActionStep],
         on_model_usage: Callable[..., None] | None = None,
+        model_call: Callable[..., Any] | None = None,
     ) -> tuple[int, list[float | None]]:
         scores: list[float | None] = [None] * len(candidates)
         valid_indices = [i for i, candidate in enumerate(candidates) if candidate.error is None]
@@ -43,20 +51,26 @@ class TreeOfThoughtsStrategy:
             return 0, scores
 
         try:
-            result = self.reward_model.evaluate_batch(
-                context=context,
-                actions=[
+            call_kwargs = {
+                "context": context,
+                "actions": [
                     {"role": "assistant", "content": candidates[i].model_output}
                     for i in valid_indices
                 ],
-            )
+            }
+            if model_call is not None:
+                result = await invoke(model_call,
+                    self.reward_model, "evaluate_batch", purpose="scoring", kwargs=call_kwargs,
+                )
+            else:
+                result = await invoke_model_call(
+                    self.reward_model, "evaluate_batch", purpose="scoring", kwargs=call_kwargs,
+                    on_model_usage=on_model_usage,
+                )
+        except StreamCancelled:
+            raise
         except Exception as exc:
-            if on_model_usage is not None:
-                on_model_usage(kind="reward", model=self.reward_model, error=exc)
             raise RuntimeError(f"候选评分失败: {exc}") from exc
-        # 先传递请求用量，再校验分数；模型成功响应也可能包含非法评分。
-        if on_model_usage is not None:
-            on_model_usage(kind="reward", model=self.reward_model, response=result)
         evaluated = result.get("scores") if isinstance(result, dict) else None
         if not isinstance(evaluated, list):
             raise ValueError("候选评分结果必须包含 scores 列表")

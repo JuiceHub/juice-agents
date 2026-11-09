@@ -62,6 +62,7 @@ export function presentCommandHelp(commands?: { label: string; description?: str
     { label: "/models" },
     { label: "/model [model_name] [effort]" },
     { label: "/rm [model_name|reset]" },
+    { label: "/image_model [model_name]" },
     { label: "/strategy [breadth=N|reset]" },
     { label: "/config" },
     { label: "/agents [name]" },
@@ -80,7 +81,7 @@ export function presentCommandHelp(commands?: { label: string; description?: str
     { label: "/tasks" },
     { label: "/resume [runner_id]" },
     { label: "/sessions" },
-    { label: "/clear" },
+    { label: "/clear", description: "Start a blank session with current settings; resume the previous one with /resume" },
     { label: "/exit" },
   ];
   const display: MessageDisplay = { type: "list", items };

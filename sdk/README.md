@@ -47,17 +47,27 @@ Credentials:   process environment > workspace/.env > ~/.juice/.env
 
 `ConfigurationContext` is the shared read path for runners, models and tools. Credentials never mutate the process environment; config caches detect file creation, deletion, modification and atomic replacement. Missing credentials are reported when a model or keyed tool is used, so listing configuration remains available. Project config writes preserve only project overrides.
 
-Model entries accept an optional `api_base_env`: the named variable overrides YAML `api_base` using the credential precedence above. Built-in Claude models use `ANTHROPIC_BASE_URL`. See [configuration conventions](src/juice_agents/core/config/README.md).
+SDK imports do not resolve the process cwd. Pass an absolute workspace to
+`ConfigurationContext.from_workspace()` to read its configuration even if the
+process's former cwd was deleted. Implicit workspace paths require a valid cwd.
+
+Model entries reference `providers`, which own backend, endpoint and credential
+source. Chat and GRM select independently from `models`; image generation uses
+`image_models` and `image.model_name`, with `image.enabled: false` by default.
+Providers accept optional `api_base_env`, following the credential precedence
+above. Built-in Claude providers use `ANTHROPIC_BASE_URL`. After editing settings,
+call `runner.reconfigure(reload_config=True)` at idle to retain history and
+exploration choices while refreshing connections. See [configuration conventions](src/juice_agents/core/config/README.md).
 
 ## Quick Start
 
 ### Single Agent
 
 ```python
-from juice_agents import Juice
+from juice_agents import Runner
 
-juice = Juice(workspace=".")
-runner = juice.runners.create(
+runner = Runner.create(
+    base_dir=".",
     runner_config="agent",
     permission_mode="default"
 )
@@ -73,16 +83,73 @@ print(result)
 
 ### Session Resume
 
+Persistent sessions and their task, browser, and image artifacts live in
+`.juice/sessions/<runner_id>/`. `Runner.create()` starts with empty context;
+`Runner.resume()` restores a previous session. Historical `.juice/runners/`
+data is not loaded or migrated.
+
 ```python
 # First session
-runner = juice.runners.create(runner_config="agent")
+runner = Runner.create(base_dir=".", runner_config="agent")
 runner.run("Start analyzing the codebase")
 runner_id = runner.runner_id
+runner.close()
 
 # After restart (even different process)
-runner = juice.runners.resume(runner_id=runner_id)
+runner = Runner.resume(base_dir=".", runner_id=runner_id)
 runner.run("Continue with the implementation")
 ```
+
+### Autonomous execution
+
+```python
+runner = Runner.resume(base_dir=".", runner_id=runner_id)
+unsubscribe = runner.subscribe_events(lambda event: print(event))
+runner.set_ask_handler(ask_handler)  # Bind interactive capabilities first.
+runner.activate()                  # Idempotent; resume queued/active rounds.
+# To stop a round: runner.cancel_round(round_id).
+# To shut down: runner.close(), then unsubscribe() after cleanup finishes.
+```
+
+`run/stream` also activate automatically. User, Team and async completion messages
+share a durable Agent inbox, stable message IDs and serial per-Agent rounds.
+`round_start/round_end` carry independent round IDs; subscriptions also receive
+rounds started after a foreground request ends. Cancellation persists before it
+returns, interrupts synchronous children, and leaves independent async tasks running.
+A functional invocation finishes its work before returning and cannot launch detached work.
+
+
+### Round results and event contract
+
+```python
+from juice_agents import RoundFailedError, RoundCancelledError
+
+result = runner.run_round("Review this change")  # Retains partial failed/cancelled output.
+print(result.status, result.reason, result.output)
+# runner.run(...) returns output on success, otherwise raises with .result.
+```
+
+| Public events | Main data fields |
+| --- | --- |
+| `agent_state` | `status: idle/running/released`, lifecycle and lightweight round summary |
+| `round_start / round_end` | Input message identity / `result: {round_id,status,output,reason,error}` |
+| `step_start / step_end` | Step identity / committed `step` snapshot |
+| `model_start / model_end` | Same `model_call_id`, `purpose: generation/scoring/compression` |
+| `thinking`, `tool_start / tool_end` | Thought content / same framework `call_id` |
+| `workflow_progress / team_update / message_deferred` | Call identity, business progress and reassignment |
+
+Every event carries `event_id`, a seconds-based `timestamp`, Runner/Agent identity and
+applicable `round_id/step_num`. `subscribe_events()` also observes child Agents; the
+main conversation consumes root only. `describe_agent_sessions(agent_id=...)` reads
+history with round, step and tool identities on demand. Closing `stream()` detaches
+its observer. Models expose native async methods and async connection cleanup. The synchronous
+Agent/Runner bridges each complete invocation once; cancellation interrupts
+request setup, stream reads and retry waits; see [model conventions](src/juice_agents/core/models/README.md).
+Explicit cancellation saves intent, stops model/pending tool work and
+waits for started calls to unwind; it never overwrites an already committed result.
+The step budget retains one final submit opportunity; otherwise the result is
+`failed/max_steps_exceeded` with partial output. Current formats are Runner v6,
+Agent v2 and Context v3; old sessions are rejected and their files preserved.
 
 ### Plan Mode
 
@@ -97,8 +164,8 @@ def ask_handler(request):
     selected = [option for option in options if option["value"] == answer]
     return {"status": "answered", "selected": selected, "custom_response": "" if selected else answer}
 
-juice = Juice(workspace=".", ask_handler=ask_handler)
-runner = juice.runners.create(runner_config="plan")
+runner = Runner.create(base_dir=".", runner_config="plan")
+runner.set_ask_handler(ask_handler)
 runner.run("Refactor the authentication module")
 ```
 
@@ -107,7 +174,8 @@ The agent writes `plans/root.md` under the Runner state directory and requests a
 ### Group Coordination
 
 ```python
-runner = juice.runners.create(
+runner = Runner.create(
+    base_dir=".",
     runner_config="group",
     permission_mode="default"
 )
@@ -120,7 +188,8 @@ runner.run("Research competitors and write a market analysis report")
 ### Team Collaboration
 
 ```python
-runner = juice.runners.create(
+runner = Runner.create(
+    base_dir=".",
     runner_config="team",
     permission_mode="default"
 )
@@ -146,11 +215,17 @@ All modes use the same `Runner` execution path and share tool, permission, and p
 
 ## Tools
 
+Tool events use `tool_start` / `tool_end` with the same `call_id`. The end event
+retains the existing execution status, observation and caught exception; result
+text never determines failure. CodeAct saves one public Python wrapper alongside
+its internal audit records so history can reproduce the live tool display.
+See the [Agent event contract](src/juice_agents/core/agent/README.md).
+
 Agents have access to built-in tools, including:
 
 - Filesystem: `read`, `write`, `edit`, `glob`, `grep`
 - Execution: `shell`, `python`
-- Web: `web_search`, `browser_open_url`, `browser_screenshot`
+- Web: `web_search` (Bing by default), `browser_open_url`, `browser_screenshot`
 - Memory: `memory_read`, `memory_write`, `memory_search`, `memory_forget`
 - Collaboration: `agent_tool`, `team_task_create`, `send_message`
 - Workflows and interaction: `workflow_run`, `submit_output`, `ask`
@@ -208,7 +283,8 @@ result = runner.workflow_manager.call("research", {"query": "AI trends 2024"})
 Configure at runner creation:
 
 ```python
-runner = juice.runners.create(
+runner = Runner.create(
+    base_dir=".",
     runner_config="agent",
     permission_mode="accept"
 )
@@ -219,28 +295,27 @@ runner = juice.runners.create(
 Schedule recurring tasks:
 
 ```python
-# UI owns the clock; SDK provides tick primitives
-juice.cron.tick()
+from juice_agents.core.cron import create_cron_task, execute_due_cron_tasks
 
-# Create a job with juice.cron.create(cron="0 9 * * *", prompt="Write a daily report")
-# Jobs are stored in workspace .juice/scheduled_tasks.json
+create_cron_task(".", "0 9 * * *", "Write a daily report")
+# The host owns the clock and calls this when it wants to execute due jobs.
+results = execute_due_cron_tasks(".", runner_config="agent")
 ```
 
 ## API Reference
 
-### Juice Client
-
-```python
-juice = Juice(workspace=".", runtime_config_path=None)
-```
-
-- `workspace`: Working directory for `.juice/` state
-- `runtime_config_path`: Optional path to the runtime configuration file
-
 ### Runner Creation
 
+Use `Runner.create/resume` directly and pass the workspace as `base_dir`.
+`runtime_config_path` selects the base configuration; `runtime_overrides` adds
+launch-only overrides. Bind `runner.set_ask_handler(handler)` after creation or
+resume: UI callbacks are process-local and are never persisted. Always call
+`runner.close()` in `finally` when finished. See
+[Cron](src/juice_agents/core/cron/README.md) for scheduling APIs.
+
 ```python
-runner = juice.runners.create(
+runner = Runner.create(
+    base_dir=".",
     runner_config="agent",  # or "plan", "group", "team", or custom config
     permission_mode="default"
 )
@@ -249,7 +324,7 @@ runner = juice.runners.create(
 ### Runner Resume
 
 ```python
-runner = juice.runners.resume(runner_id="run_abc123")
+runner = Runner.resume(base_dir=".", runner_id="run_abc123")
 ```
 
 ### Execution
@@ -269,6 +344,7 @@ result = runner.run("Task description")
 runner.runner_id  # Unique ID for resume
 runner.config     # Immutable RunnerConfig
 runner.stop()     # Cooperative cancellation
+runner.close()    # Release resources
 ```
 
 ## Package Boundary
@@ -292,11 +368,10 @@ or load read-only sources from `.agents/skills` and configured external director
 ## Architecture
 
 ```text
-Juice Client
-  └─ runners.create(runner_config) → Runner
-       └─ AgentManager, ToolManager, WorkflowRunManager
-          └─ Agents execute via RunnerContext
-             └─ Tools, permissions, audit
+Runner.create(base_dir=..., runner_config=...) / Runner.resume(...)
+  └─ AgentManager, ToolManager, WorkflowRunManager
+     └─ Agents execute via RunnerContext
+        └─ Tools, permissions, audit
 ```
 
 **Key boundaries:**
@@ -344,3 +419,8 @@ SDK development follows core conventions:
 - Tests in `tests/sdk/` and `tests/core/`
 
 See [AGENTS.md](../AGENTS.md) for project guidelines.
+
+Async hosts use `await Runner.acreate/aresume(...)`, `await runner.arun/arun_round(...)`,
+`async for event in runner.astream(...)` and `await runner.aclose()` (or `async with`).
+Sync methods share the same coroutine execution chain. ModelManager owns requests,
+usage and clients; TeamManager owns member dispatch and reconciliation.

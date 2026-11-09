@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable
 
 from juice_agents.core.config.runtime_config import read_workspace_config, update_workspace_config
 from juice_agents.core.config.context import ConfigurationContext
@@ -12,7 +12,6 @@ from juice_agents.core.registry.teams import TeamManifest, TeamRegistry
 from juice_agents.core.runner.types.ask import AskHandler
 
 from .runtime import DirectRunnerRuntime, SessionStatus
-from .serialization import serialize_runner_stream_event
 from .sessions import list_sessions
 
 
@@ -22,9 +21,14 @@ logger = logging.getLogger(__name__)
 class RpcHandlers:
     """Dispatch JSON-RPC method names to runtime operations."""
 
-    def __init__(self, ask_handler: AskHandler | None = None) -> None:
+    def __init__(
+        self,
+        ask_handler: AskHandler | None = None,
+        event_handler: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
         self._runtime: DirectRunnerRuntime | None = None
         self._ask_handler = ask_handler
+        self._event_handler = event_handler
 
     def dispatch(self, method: str, params: dict[str, Any]) -> Any:
         """Route a JSON-RPC method string to its concrete handler."""
@@ -48,6 +52,7 @@ class RpcHandlers:
                 model_effort=payload.get("model_effort"),
                 worktree=payload.get("worktree"),
                 ask_handler=self._ask_handler,
+                event_handler=self._event_handler,
             )
         return self._runtime
 
@@ -59,117 +64,59 @@ class RpcHandlers:
             config_context=ConfigurationContext.from_workspace(params.get("base_dir", "."))
         )
 
-    def handle_start_session(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Create a fresh runtime session for the requested workspace and mode."""
-        base_dir = params.get("base_dir", ".")
-        pending_strategy, pending_reward_model = self._pending_configuration_for_workspace(base_dir)
-        permission_mode = params.get("permission_mode")
-        agent_mode = params.get("agent_mode")
-        agent_type = params.get("agent_type")
-        runtime_config_path = params.get("runtime_config_path")
-        # A pending name belongs to its project catalog. Preserve that source
-        # unless startup explicitly selects a different configuration file.
-        if runtime_config_path is None and pending_reward_model is not None:
-            runtime_config_path = self._runtime.runtime_config_path
-        model_name = params.get("model_name")
-        model_effort = params.get("model_effort")
-        worktree = params.get("worktree")
+    def _replacement_runtime(
+        self, params: dict[str, Any], *, preserve_launch_configuration: bool,
+    ) -> DirectRunnerRuntime:
+        """Validate replacement choices before releasing the current Runner."""
 
-        self._runtime = DirectRunnerRuntime(
-            base_dir=base_dir,
-            permission_mode=permission_mode,
-            agent_mode=agent_mode,
-            agent_type=agent_type,
-            runtime_config_path=runtime_config_path,
-            model_name=model_name,
-            model_effort=model_effort,
-            worktree=None if worktree is None else str(worktree),
+        return DirectRunnerRuntime.for_session_replacement(
+            self._runtime,
+            preserve_launch_configuration=preserve_launch_configuration,
+            base_dir=params.get("base_dir", "."),
+            permission_mode=params.get("permission_mode"),
+            agent_mode=params.get("agent_mode"),
+            agent_type=params.get("agent_type"),
+            runtime_config_path=params.get("runtime_config_path"),
+            model_name=params.get("model_name"),
+            model_effort=params.get("model_effort"),
+            worktree=params.get("worktree"),
             ask_handler=self._ask_handler,
+            event_handler=self._event_handler,
         )
-        if pending_strategy is not None:
-            self._runtime.switch_strategy(pending_strategy)
-        if pending_reward_model is not None:
-            self._runtime.configure_reward_model(pending_reward_model)
-        status = self._runtime.start_session()
-        return _serialize_session_status(status)
+
+    def handle_start_session(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Create an empty session, retaining this workspace's current choices."""
+
+        replacement = self._replacement_runtime(params, preserve_launch_configuration=True)
+        if self._runtime is not None:
+            self._runtime.stop_session(source="runner_switch")
+        self._runtime = replacement
+        return _serialize_session_status(self._runtime.start_session())
 
     def handle_resume_session(self, params: dict[str, Any]) -> dict[str, Any]:
         """Resume an existing runtime session from persisted runner state."""
-        runner_id = params["runner_id"]
-        base_dir = params.get("base_dir", ".")
-        pending_strategy, pending_reward_model = self._pending_configuration_for_workspace(base_dir)
-        runtime_config_path = params.get("runtime_config_path")
-        if runtime_config_path is None and pending_reward_model is not None:
-            runtime_config_path = self._runtime.runtime_config_path
-        model_name = params.get("model_name")
-        model_effort = params.get("model_effort")
 
-        self._runtime = DirectRunnerRuntime(
-            base_dir=base_dir,
-            runtime_config_path=runtime_config_path,
-            model_name=model_name,
-            model_effort=model_effort,
-            ask_handler=self._ask_handler,
-        )
-        if pending_strategy is not None:
-            self._runtime.switch_strategy(pending_strategy)
-        if pending_reward_model is not None:
-            self._runtime.configure_reward_model(pending_reward_model)
-        status = self._runtime.resume_session(runner_id)
-        return _serialize_session_status(status)
+        replacement = self._replacement_runtime(params, preserve_launch_configuration=False)
+        if self._runtime is not None:
+            self._runtime.stop_session(source="runner_switch")
+        self._runtime = replacement
+        return _serialize_session_status(self._runtime.resume_session(params["runner_id"]))
 
-    def _pending_configuration_for_workspace(
-        self, base_dir: str | Path,
-    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-        """Keep `/strategy` and `/rm` choices across runtime replacement.
-
-        This is in-memory configuration for the same workspace only; scorer
-        objects and settings from another workspace are never transferred.
-        """
-
-        if self._runtime is None or self._runtime.base_dir != Path(base_dir).expanduser().resolve():
-            return None, None
-        return (
-            self._runtime.pending_strategy_configuration,
-            self._runtime.pending_reward_model_configuration,
-        )
-
-    def handle_stream_message(self, params: dict[str, Any]) -> Iterator[dict[str, Any]]:
-        """Forward a user message and yield serialized streaming steps."""
+    def handle_activate_session(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Enable scheduling after the client has loaded its initial history."""
         if self._runtime is None:
             raise RuntimeError("No active session")
+        return self._runtime.activate_session(str(params["runner_id"]))
 
-        message = params["message"]
-        agent_mode_override = params.get("agent_mode_override")
-        cancel_check = params.get("_cancel_check")
-        stream_options: dict[str, Any] = {
-            "agent_mode_override": (
-                None if agent_mode_override is None else str(agent_mode_override)
-            ),
-        }
-        if callable(cancel_check):
-            stream_options["cancel_check"] = cancel_check
-        for event in self._runtime.stream_message(message, **stream_options):
-            payload = serialize_runner_stream_event(event)
-            payload["agent_sessions_report"] = self._describe_agent_sessions_for_stream()
-            yield payload
-
-    def _describe_agent_sessions_for_stream(self) -> dict[str, Any] | None:
-        """
-        Best-effort Agent session snapshot for streaming notifications.
-
-        The stdio server handles one long `stream_message` request at a time, so
-        the CLI cannot issue a fresh `describe_agent_sessions` RPC while a run is
-        still streaming. Attaching the current read-only report here keeps Ctrl+T
-        agent selection current without introducing concurrent RPC handling.
-        """
+    def handle_stream_message(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Wait for one real round result; events use the permanent subscription."""
         if self._runtime is None:
-            return None
-        try:
-            return self._runtime.describe_agent_sessions()
-        except Exception as exc:  # pragma: no cover - defensive transport guard
-            logger.warning("Failed to attach agent session report to stream event: %s", exc)
-            return None
+            raise RuntimeError("No active session")
+        return self._runtime.stream_message(
+            params["message"],
+            agent_mode_override=params.get("agent_mode_override"),
+            cancel_check=params.get("_cancel_check"),
+        )
 
     def handle_describe_session(self, params: dict[str, Any]) -> dict[str, Any]:
         """Return the currently active session status snapshot."""
@@ -241,10 +188,9 @@ class RpcHandlers:
 
     def handle_describe_agent_sessions(self, params: dict[str, Any]) -> dict[str, Any]:
         """Return Agent sessions for CLI transcript switching."""
-        del params
         if self._runtime is None:
             raise RuntimeError("No active session")
-        return self._runtime.describe_agent_sessions()
+        return self._runtime.describe_agent_sessions(agent_id=params.get("agent_id"))
 
     def handle_send_agent_message(self, params: dict[str, Any]) -> dict[str, Any]:
         """Queue a user instruction for the selected Agent."""
@@ -361,8 +307,16 @@ class RpcHandlers:
 
     def handle_set_image_config(self, params: dict[str, Any]) -> dict[str, Any]:
         """Update workspace YAML image overrides and reload the active runner."""
-        runtime = self._bootstrap_runtime(params)
-        return runtime.set_image_config(enabled=bool(params.get("enabled")))
+        # Image model_name belongs to the image catalog, never the launch
+        # model. A first /image_model command must leave chat selection alone.
+        runtime = self._bootstrap_runtime({key: value for key, value in params.items() if key != "model_name"})
+        return runtime.set_image_config(enabled=params.get("enabled"), model_name=params.get("model_name"))
+
+    def handle_list_image_models(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Return image candidates and selection without creating a Runner."""
+
+        runtime = self._bootstrap_runtime({key: value for key, value in params.items() if key != "model_name"})
+        return runtime.list_image_models()
 
     def handle_list_skills(self, params: dict[str, Any]) -> dict[str, Any]:
         """Return skills visible to the current root agent capabilities."""
@@ -486,6 +440,7 @@ class RpcHandlers:
                 model_name=params.get("model_name"),
                 model_effort=params.get("model_effort"),
                 ask_handler=self._ask_handler,
+                event_handler=self._event_handler,
             )
         return list(self._runtime.list_models())
 
@@ -530,15 +485,11 @@ class RpcHandlers:
         )
 
     def handle_cancel_stream(self, params: dict[str, Any]) -> dict[str, bool]:
-        """请求中断正在进行的 stream_message; cooperative，下一 step 边界生效。
-
-        允许在 streaming 期间被并发派发：handler 仅设置 runner 上的中断标志，
-        不阻塞、不持久化，不会与正在迭代的生成器竞争 session 状态。
-        """
-        del params
+        """Persist the cancellation intent and signal one concrete active round."""
         if self._runtime is None:
             return {"cancelled": False}
-        return self._runtime.request_cancel_stream()
+        target = {key: str(params[key]) for key in ("runner_id", "round_id") if params.get(key)}
+        return self._runtime.request_cancel_stream(**target)
 
     def handle_list_sessions(self, params: dict[str, Any]) -> list[dict[str, Any]]:
         """List persisted sessions under the requested workspace root."""

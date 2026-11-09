@@ -23,20 +23,6 @@ export interface LifecycleStatusEvent {
   detail?: string;
 }
 
-const NODE_SUMMARIES: Record<string, string> = {
-  preflight: "Preparing research...",
-  write_research_brief: "Writing research brief...",
-  plan_research_topics: "Planning research...",
-  dispatch_research: "Starting researchers...",
-  research_topic: "Researching sources...",
-  compress_and_deduplicate: "Organizing evidence...",
-  verify_and_vote_claims: "Verifying claims...",
-  assess_gaps: "Assessing evidence gaps...",
-  write_final_report: "Writing final report...",
-  verify_citations: "Verifying citations...",
-  persist_artifacts: "Saving research artifacts...",
-};
-
 // 等待时间提示阈值。借鉴 claude-code Spinner 的 30s/1800s 设计，但缩短上限到 5min:
 // 用户在 5 分钟无响应时通常已经在考虑是否要中断，及时给一个 /clear 提示更有用。
 const TIP_AFTER_MS = 30_000; // 30 秒后开始提示中断方式
@@ -48,19 +34,12 @@ export function lifecycleStatusModel(
 ): Pick<CurrentWorkStatusModel, "summary" | "items"> {
   if (!event) return { summary: "", items: [] };
   const node = String(event.node || "");
-  let summary = NODE_SUMMARIES[node] || String(event.detail || "Working...");
   const completed = Number(event.completed);
   const total = Number(event.total);
+  const progress = Number.isFinite(total) && total > 0
+    ? ` (${Number.isFinite(completed) ? Math.max(0, Math.min(completed, total)) : 0}/${total})` : "";
+  const summary = `${event.detail || node.replaceAll("_", " ") || "Working"}${progress}`;
   const items: CurrentWorkStatusItem[] = [];
-  if (node === "research_topic" && Number.isFinite(total) && total > 0) {
-    const boundedCompleted = Number.isFinite(completed)
-      ? Math.max(0, Math.min(completed, total))
-      : 0;
-    summary = `Researching sources (${boundedCompleted}/${total})...`;
-  }
-  if (node && event.detail && !NODE_SUMMARIES[node]) {
-    items.push({ label: "Stage", value: String(event.detail) });
-  }
   return { summary, items };
 }
 

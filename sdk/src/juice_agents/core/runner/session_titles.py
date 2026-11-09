@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
+
+from juice_agents.core.agent.context import deserialize_context_tree, serialize_context_transcript
+
+
+logger = logging.getLogger(__name__)
 
 
 FIRST_USER_REQUEST_PREVIEW_LENGTH = 80
@@ -20,12 +26,15 @@ def normalize_first_user_request_preview(value: Any) -> str:
 
 
 def extract_first_user_request_preview(session_payload: Any) -> str:
-    """从序列化 AgentSession 中提取第一条非空用户 TaskStep。"""
+    """从保存的会话树中读取首条非空请求，与历史显示使用同一选中分支。"""
 
     if not isinstance(session_payload, dict):
         return ""
-    steps = session_payload.get("steps")
-    if not isinstance(steps, list):
+    try:
+        steps = serialize_context_transcript(deserialize_context_tree(session_payload))
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        # 会话列表允许包含损坏或不支持的快照；记录原因并保留 ID 回退标题。
+        logger.warning("无法从会话树提取首条请求预览: %s", exc)
         return ""
     for step in steps:
         if not isinstance(step, dict) or str(step.get("type") or "").strip() != "task":

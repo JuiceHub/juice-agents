@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -9,6 +10,7 @@ from numbers import Real
 from typing import TYPE_CHECKING, Any
 
 from ..utils import normalize_token_usage, parse_model_json
+from .chat_models import _AsyncModelLifecycle
 
 if TYPE_CHECKING:
     # 配置上下文只用于类型注解，避免模型层与模型目录在初始化时循环导入。
@@ -31,16 +33,17 @@ scale from 0 to 10. Return only a JSON object with exactly this structure:
 """
 
 
-class BaseRewardModel:
-    """同步批量评分基类，与聊天模型的 generate 接口独立。
+class BaseRewardModel(_AsyncModelLifecycle):
+    """异步批量评分基类，与聊天模型的 generate 接口独立。
 
     与 BaseChatModel 一样使用普通基类，由子类覆盖具体能力；未实现的方法
     在调用时抛出 NotImplementedError。策略通过此基类调用评分，不关心分数
     由聊天模型、专用奖励模型还是本地规则产生。
     """
 
-    def evaluate_batch(
-        self, *, context: list[dict[str, Any]], actions: list[dict[str, Any]]
+    async def evaluate_batch(
+        self, *, context: list[dict[str, Any]], actions: list[dict[str, Any]],
+        stream: bool = False,
     ) -> dict[str, Any]:
         """返回 scores、usage、usage_calls；scores 与候选等长，高分更优。"""
         raise NotImplementedError
@@ -78,18 +81,13 @@ class GenerativeRewardModel(BaseRewardModel):
         self._api_base = api_base
         self._api_key = api_key
         self._client = client
+        self._owns_client = client is None
         self._provider_model_name = self.model_name
         self._config_context: ConfigurationContext | None = None
 
     @staticmethod
     def _validate_client(client: Any, backend: str) -> None:
-        """只检查原生 SDK 请求入口，不要求 SDK client 继承框架中的类型。"""
-        if backend == "anthropic":
-            endpoint = getattr(client, "messages", None)
-        else:
-            endpoint = getattr(getattr(client, "chat", None), "completions", None)
-        if not callable(getattr(endpoint, "create", None)):
-            raise TypeError(f"client 必须提供 {backend} SDK 的可调用 create 接口")
+        _AsyncModelLifecycle._validate_async_client(client, backend)
 
     @classmethod
     def from_config(
@@ -136,17 +134,17 @@ class GenerativeRewardModel(BaseRewardModel):
             options[credential] = api_key
         # SDK 按需导入，注入已有 client 时无需再次创建连接或读取凭证。
         if backend == "openai":
-            from openai import OpenAI
+            from openai import AsyncOpenAI
 
-            client = OpenAI(**options)
+            client = AsyncOpenAI(**options)
         elif backend == "doubao":
-            from volcenginesdkarkruntime import Ark
+            from volcenginesdkarkruntime import AsyncArk
 
-            client = Ark(**options)
+            client = AsyncArk(**options)
         else:
-            from anthropic import Anthropic
+            from anthropic import AsyncAnthropic
 
-            client = Anthropic(**options)
+            client = AsyncAnthropic(**options)
         self._validate_client(client, backend)
         self._client = client
         self.backend = backend
@@ -154,19 +152,36 @@ class GenerativeRewardModel(BaseRewardModel):
         self._provider_model_name = provider_model_name
         return client
 
-    def _request_scores(self, data: str, usage_calls: list[dict[str, Any]]) -> str:
-        """按 SDK 协议请求，先返回用量明细，再解析文本和分数。"""
+    async def reload_config(self, config_context: ConfigurationContext) -> None:
+        """Forget a catalog-owned SDK connection without changing the choice.
+
+        Configuration reload happens at the host's idle boundary. Only catalog
+        scorers participate; direct connection settings and injected clients
+        remain unchanged. The next scoring batch resolves the latest provider.
+        """
+
+        if self._config_context is None:
+            return
+        self._check_loop()
+        if self._client is not None:
+            await self._client.close()
+        self._config_context = config_context
+        self._client = None
+        logger.info("奖励模型配置已刷新: model=%s", self.model_name)
+
+    async def _request_scores(
+        self, data: str, usage_calls: list[dict[str, Any]], *, stream: bool,
+    ) -> str:
+        """直接等待原生异步 SDK；网络重试始终由 SDK 管理。"""
         client = self._get_client()
-        logger.info(
-            "生成式奖励模型请求: backend=%s model=%s provider_model=%s",
-            self.backend, self.model_name, self._provider_model_name,
-        )
+        logger.info("生成式奖励模型请求: backend=%s model=%s", self.backend, self.model_name)
         if self.backend == "anthropic":
             create = client.messages.create
             payload = {
                 "model": self._provider_model_name, "system": _REWARD_SYSTEM_PROMPT,
                 "messages": [{"role": "user", "content": data}], "max_tokens": self.max_tokens,
             }
+            stream = stream or self.max_tokens > 8192
         else:
             create = client.chat.completions.create
             payload = {
@@ -174,28 +189,25 @@ class GenerativeRewardModel(BaseRewardModel):
                 "messages": [{"role": "system", "content": _REWARD_SYSTEM_PROMPT},
                              {"role": "user", "content": data}],
             }
+        if stream:
+            return await self._request_scores_streaming(create, payload, usage_calls)
         try:
-            response = create(**payload)
+            response = await create(**payload)
         except TypeError:
             raise
-        except Exception:
-            usage_calls.append({"backend": self.backend, "model_name": self.model_name, "usage": None})
+        except (Exception, asyncio.CancelledError):
+            self._append_usage(usage_calls, None)
             raise
-        usage_calls.append({
-            "backend": self.backend, "model_name": self.model_name,
-            "usage": normalize_token_usage(getattr(response, "usage", None)),
-        })
+        self._append_usage(usage_calls, getattr(response, "usage", None))
         if self.backend == "anthropic":
-            # thinking 等非文本块不能混入评分 JSON。
-            text_blocks: list[str] = []
+            parts = []
             for block in getattr(response, "content", None) or []:
-                if getattr(block, "type", None) != "text":
-                    continue
-                text = getattr(block, "text", None)
-                if not isinstance(text, str):
-                    raise ValueError("奖励模型响应必须为非空文本")
-                text_blocks.append(text)
-            content = "".join(text_blocks)
+                if getattr(block, "type", None) == "text":
+                    text = getattr(block, "text", None)
+                    if not isinstance(text, str):
+                        raise ValueError("奖励模型响应必须为非空文本")
+                    parts.append(text)
+            content = "".join(parts)
         else:
             choices = getattr(response, "choices", None)
             if not choices:
@@ -205,22 +217,74 @@ class GenerativeRewardModel(BaseRewardModel):
             raise ValueError("奖励模型响应必须为非空文本")
         return content
 
-    def evaluate_batch(
+    def _append_usage(self, usage_calls: list[dict[str, Any]], usage: Any) -> None:
+        usage_calls.append({"backend": self.backend, "model_name": self.model_name,
+                            "usage": normalize_token_usage(usage)})
+
+    async def _request_scores_streaming(
+        self, create: Any, payload: dict[str, Any], usage_calls: list[dict[str, Any]],
+    ) -> str:
+        """评分与生成采用相同的协程取消语义；finally 完成流关闭后才退出。"""
+        options = {**payload, "stream": True}
+        if self.backend != "anthropic":
+            options["stream_options"] = {"include_usage": True}
+        try:
+            response = await create(**options)
+        except TypeError:
+            raise
+        except (Exception, asyncio.CancelledError):
+            self._append_usage(usage_calls, None)
+            raise
+        text: list[str] = []
+        usage: dict[str, Any] = {}
+
+        def merge_usage(source: Any) -> None:
+            normalized = normalize_token_usage(source)
+            if normalized is not None:
+                usage.update(normalized["provider_usage"])
+
+        try:
+            async for chunk in response:
+                if self.backend == "anthropic":
+                    merge_usage(getattr(getattr(chunk, "message", None), "usage", None))
+                    merge_usage(getattr(chunk, "usage", None))
+                    delta = getattr(chunk, "delta", None)
+                    if getattr(delta, "type", "") == "text_delta":
+                        text.append(str(getattr(delta, "text", "") or ""))
+                else:
+                    merge_usage(getattr(chunk, "usage", None))
+                    choices = getattr(chunk, "choices", None) or []
+                    if choices:
+                        text.append(str(getattr(choices[0].delta, "content", "") or ""))
+        finally:
+            try:
+                await self._close_stream(response)
+            finally:
+                self._append_usage(usage_calls, usage or None)
+        return "".join(text)
+
+    async def evaluate_batch(
         self, *, context: list[dict[str, Any]], actions: list[dict[str, Any]],
+        stream: bool = False,
     ) -> dict[str, Any]:
         """返回分数和本次请求用量；失败异常保留相同的 usage_calls 明细。"""
         usage_calls: list[dict[str, Any]] = []
         try:
-            scores = self._evaluate_scores(context=context, actions=actions, usage_calls=usage_calls)
+            self._check_loop()
+            scores = await self._evaluate_scores(
+                context=context, actions=actions, usage_calls=usage_calls, stream=stream,
+            )
             return {"scores": scores, "usage": usage_calls[-1]["usage"] if usage_calls else None,
                     "usage_calls": usage_calls}
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
             exc.usage_calls = usage_calls
+            logger.info("评分调用结束: model=%s error=%s", self.model_name, type(exc).__name__)
             raise
 
-    def _evaluate_scores(
+    async def _evaluate_scores(
         self, *, context: list[dict[str, Any]], actions: list[dict[str, Any]],
         usage_calls: list[dict[str, Any]],
+        stream: bool = False,
     ) -> list[float]:
         """用一次模型调用按输入顺序评分；坏结果显式失败，禁止静默择首。"""
         if not actions:
@@ -230,7 +294,7 @@ class GenerativeRewardModel(BaseRewardModel):
         data = json.dumps({"context": context, "candidates": actions}, ensure_ascii=False)
         logger.info("生成式奖励模型批量评分: model=%s candidates=%s", self.model_name, len(actions))
         payload = parse_model_json(
-            self._request_scores(data, usage_calls), field_name="奖励模型评分", expected_type=dict
+            await self._request_scores(data, usage_calls, stream=stream), field_name="奖励模型评分", expected_type=dict
         )
         raw_scores = payload.get("scores")
         if not isinstance(raw_scores, list):

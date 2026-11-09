@@ -15,6 +15,7 @@ A lightweight Python agent framework for building ReAct and CodeAct agents with 
 | 🧠 **Per-step Candidate Selection** | Generate multiple outputs, score valid candidates, and execute one |
 | 🌐 **Workflow Orchestration** | Run Python workflows with inner agents and saved artifacts |
 | 🛠️ **Rich Toolset** | Shell, Python, file, web, browser, image, MCP, and custom tools |
+| ⚡ **Concurrent ReAct Actions** | Actions in one step run concurrently by default; dependent work belongs in later steps |
 | 💾 **Persistent State** | Sessions, workflow artifacts, background task records, and team boards survive restarts |
 | 🚀 **Multiple Interfaces** | Python SDK, terminal CLI, and local web workbench |
 
@@ -23,6 +24,72 @@ User request → Runner → Agent / Workflow / Team → Tools
                     │                              │
                     └──── persistence, approval, audit ────┘
 ```
+
+## Durable inbox and autonomous rounds
+
+User input, Team messages/assignments and background task notifications all enter
+`AgentManager.post(agent_id, attachment)`. Each Agent runs rounds serially;
+different Agents run concurrently. A persistent Agent returns to idle when its
+round finishes, and a new message wakes it without an open foreground request.
+
+```text
+post → agents/<agent_id>/inbox.json → session + round checkpoint → producer ack
+                 ↓                         ↓
+          message_received       round_start → steps → round_end
+```
+
+The inbox is a durable pending queue, not conversation history. Entries leave
+only after the receiving session is saved and its producer is acknowledged.
+The backend publishes `message_received` after accepting input, so CLI/Web show
+background completion even while the owner is still computing its reply.
+`round_start.data.input` and saved session attachments restore child tasks and
+messages; snapshots also expose `pending_messages` during a running call.
+Frontends display these backend facts; scheduling, delivery and task
+outcomes remain backend responsibilities.
+
+`run/stream` activate scheduling automatically and wait for their own round.
+For background hosts, bind `subscribe_events` and `set_ask_handler` before calling
+`runner.activate()`. Use `runner.cancel_round(round_id)` for a single round;
+independent background jobs use `async_task_stop`. Release resources with `close()`.
+Runner, Agents, workflows and background jobs execute through native coroutines.
+`ModelManager` owns model calls, request events, usage and connection cleanup;
+`TeamManager` owns member dispatch and reconciliation. Synchronous entry points
+adapt complete operations at the SDK boundary. Cancellation interrupts request setup, stream reads and
+SDK retry waits, and waits for request cleanup before publishing a round result.
+Recovery resumes active round budgets and deduplicates committed messages. One
+running Runner owns a session; tool side effects are not guaranteed exactly once.
+
+Runtime managers live together in [`core/managers/`](sdk/src/juice_agents/core/managers/README.md):
+Agent, Model, Tool, Workflow, AsyncTask and Team. `core/agent/` retains Agent protocols and context.
+
+## Async SDK
+
+```python
+from juice_agents import Runner
+
+async def answer(workspace):
+    async with await Runner.acreate(base_dir=workspace) as runner:
+        return await runner.arun("Explain this project")
+```
+
+## Lifecycle and public events
+
+Agent instances follow `idle → running → idle/released`; independent round results
+are `completed / failed / cancelled`. Manager alone commits terminal results and
+publishes steps/results after successful persistence. `Runner.run()` returns
+successful output or raises `RoundFailedError / RoundCancelledError` with `.result`;
+`run_round()` returns the full `RoundResult`.
+
+Public events use `kind + data` with event, Runner, Agent, round and step identity.
+Gateway forwards each event once through its permanent subscription; CLI/Web share
+a reducer and presenter. Closing an observer detaches it; `cancel_round()` produces
+a real cancellation only after execution unwinds, while `close()` stops the Runner.
+Recovery accepts Runner v6 / Agent v2 / Context v3; old files are retained and rejected.
+
+The CLI keeps message blocks and rendered rows in memory, without a separate
+display journal. Resume rebuilds them from backend session and pending-message
+snapshots. Permanent stdio notifications omit `request_id`; the CLI routes them
+to its always-bound handler even while a foreground request is active.
 
 ## Quick Start
 
@@ -46,6 +113,11 @@ Re-run the installer after moving the checkout or replacing either interpreter.
 Startup checks dependencies; install or repair them explicitly with the commands
 above. It never installs packages or edits lock files during a normal launch.
 
+If the launch directory was deleted, `cd /path/to/existing/project` before retrying
+`juice`. The launcher diagnoses an unavailable cwd before starting interpreters;
+only missing Python modules produce dependency installation advice. Other import
+failures retain their traceback.
+
 Configure shared settings and credentials for online models:
 
 ```bash
@@ -55,27 +127,57 @@ cp .env.example ~/.juice/.env
 # Optional: put shared model/runtime overrides in ~/.juice/config.yaml
 ```
 
-Browser tools require: `python -m playwright install chromium`
+The default `doubao_lite` model uses `doubao-seed-2-1-lite-260915` on
+Volcengine Ark. Select another configured model with `/model` when needed.
+
+The CLI shares Up/Down input history across Runners through
+`~/.juice/cli_history.jsonl`; see the [CLI guide](frontend/cli/README.md#common-operations).
+The CLI updates one tool record from `tool_start` to `tool_end`, matched by
+`call_id`. Parameters show only a short, single-line summary in the title.
+Results and caught exceptions stay inside that record; ordinary
+results preview six terminal rows after wrapping, and explicit failure details remain fully visible.
+Status comes from execution fields, never from result text. Complete results
+remain in session data, and restored history uses the same tool style.
+
+Browser tools use Playwright Chromium by default; install it with
+`python -m playwright install chromium`. The CLI passes its Node.js executable to
+the gateway for the Playwright driver unless `PLAYWRIGHT_NODEJS_PATH` is already
+set. For local Chromium and standalone SDK setup, see the
+[browser setup](sdk/src/juice_agents/core/agent/README.md#browser-setup).
+The built-in `web_search` uses Bing by default. See the
+[Agent documentation](sdk/src/juice_agents/core/agent/README.md#web-search) for engine selection.
 
 ### First Program
 
 ```python
-from juice_agents import Juice
+from juice_agents import Runner
 
-juice = Juice(workspace=".")
-runner = juice.runners.create(runner_config="agent", permission_mode="default")
+runner = Runner.create(base_dir=".", runner_config="agent", permission_mode="default")
 
 # Stream execution events
-for event in runner.stream("Analyze this project's module boundaries"):
-    print(event)
+try:
+    for event in runner.stream("Analyze this project's module boundaries"):
+        print(event)
+    runner_id = runner.runner_id
+finally:
+    runner.close()
 
 # Resume the same session later (even after process restart)
-runner = juice.runners.resume(runner_id=runner.runner_id)
-print(runner.run("Turn the recommendations into an implementation order"))
-print(runner.token_usage())  # generation / reward / total
+runner = Runner.resume(base_dir=".", runner_id=runner_id)
+try:
+    print(runner.run("Turn the recommendations into an implementation order"))
+    print(runner.token_usage())  # generation / reward / total
+finally:
+    runner.close()
 ```
 
-Agents forward model usage to `AgentManager`, which persists and totals calls in
+`Runner.create/resume` are the public session entry points. Pass the workspace as
+`base_dir`, bind UI callbacks with `runner.set_ask_handler(handler)` after either
+entry point, and release resources with `close()`. Scheduled prompts use
+[`core.cron`](sdk/src/juice_agents/core/cron/README.md), with read-only CLI idle
+polling until a task is due.
+
+Agents forward model usage to `ModelManager`, which persists and totals calls in
 `agents/model_usage.jsonl`; Runner delegates to it. Totals include rejected
 candidates and survive resume. Known counts and `missing_usage_requests` remain
 separate; no token or cost estimates are made. See [Runner](sdk/src/juice_agents/core/runner/README.md#token-usage).
@@ -91,6 +193,8 @@ separate; no token or cost estimates are made. See [Runner](sdk/src/juice_agents
 
 Mode switches preserve the current ReAct/CodeAct protocol unless a new
 `agent_type` is supplied.
+ReAct repairs repeated closing `</actions>` tags at the end of a model response;
+other trailing content remains invalid.
 
 ### CLI and Web
 
@@ -114,11 +218,61 @@ SDK defaults are bundled in `juice_agents/core/config/defaults.yaml`; keep
 changes in user/project overrides. The SDK ships no demonstration Skills;
 provide them through `.juice/skills`, `.agents/skills`, or configured external directories.
 
+Connections are shared through `providers`; chat and GRM select independently
+from `models`, while image generation uses `image_models`:
+
+```text
+providers → models       → /model (chat), /rm (GRM)
+          → image_models → /image_model (images)
+```
+
+```yaml
+providers:
+  ark:
+    backend: doubao
+    api_base: https://ark.cn-beijing.volces.com/api/v3
+    api_key_env: DOUBAO_API_KEY
+models:
+  doubao_lite:
+    provider: ark
+    provider_model_name: doubao-seed-2-1-lite-260915
+image_models:
+  seedream_4:
+    provider: ark
+    provider_model_name: doubao-seedream-4-0-250828
+image:
+  enabled: false
+  model_name: seedream_4
+```
+
+`/image_model` opens the image picker; `/image_model seedream_4` selects directly.
+Enable generation separately in `/config`; Plan mode always excludes it. Ark
+supports generation and editing with independent image deployments. Move old
+inline connection fields into `providers` and reference them with `provider`;
+legacy entries report migration guidance and are never rewritten automatically.
+See [configuration](sdk/src/juice_agents/core/config/README.md) for layering and
+credential precedence, and [Runner](sdk/src/juice_agents/core/runner/README.md)
+for explicit configuration reloads that preserve conversation and GRM state.
+
+OpenAI/Ark image requests preserve HTTP(S) links and encode local images as
+MIME-correct base64 data URLs at send time. Session state keeps local paths;
+see [image input](sdk/src/juice_agents/core/models/README.md#image-input).
+
 `--workspace` wins over `JUICE_WORKSPACE_DIR` and the startup directory; it must
 exist. Root, child, Team and Workflow Agents use that workspace for tools,
 Skills and `.juice` session state. Global config is managed as files; `/config`
 and `/model` save only explicit project overrides. Missing credentials are
 reported when a provider is needed; help and configuration remain available.
+
+Sessions and their artifacts live in `.juice/sessions/<runner_id>/`.
+In CLI and Web, `/clear` creates a blank session with the current model, effort,
+execution mode, Agent type, permissions, strategy and reward model. During a
+running round it waits in FIFO order; later messages follow it into the new
+session. The transcript clears only after creation succeeds. CLI `/resume` lists
+saved sessions with their first request. `/resume <runner_id>` restores the whole
+Runner: main and child Agent histories, task records, and session state together.
+The old `.juice/runners/` layout is neither
+discovered nor migrated.
 
 At each rule directory a nonempty `AGENTS.override.md` replaces `AGENTS.md`.
 Non-Git workspaces read only their own project rules. Rules carry source/scope,
@@ -157,14 +311,12 @@ Context → generate breadth candidates → validate → score → execute one �
 ```
 
 ```python
-from openai import OpenAI
-
 from juice_agents.core.agent.context.strategies import TreeOfThoughtsStrategy
 from juice_agents.core.models.reward_models import GenerativeRewardModel
 
-# Native SDK client; OpenAI reads OPENAI_API_KEY from the environment.
-scorer = GenerativeRewardModel(model_name="your-model", client=OpenAI())
-# evaluate_batch(...) returns {"scores": [...], "usage": ..., "usage_calls": [...]}.
+# The scorer owns its async SDK client; credentials come from OPENAI_API_KEY.
+scorer = GenerativeRewardModel(model_name="your-model")
+# await scorer.evaluate_batch(...) returns {"scores": [...], "usage": ..., "usage_calls": [...]}.
 # scores has one finite number per valid candidate; higher wins, ties pick first.
 agent.set_exploration_strategy(TreeOfThoughtsStrategy(breadth=3, reward_model=scorer))
 ```
@@ -172,8 +324,10 @@ agent.set_exploration_strategy(TreeOfThoughtsStrategy(breadth=3, reward_model=sc
 The [model layer](sdk/src/juice_agents/core/models/README.md) provides one concrete
 chat class, `ChatModel`, with `backend="openai"`, `"doubao"`, or `"anthropic"`.
 It keeps `generate()` separate from reward scoring and includes complete examples.
-Chat calls retry transient failures and empty responses; invalid requests,
-credentials, and unclassified errors fail immediately. Anthropic requests with
+Models expose native `async generate()` and `async evaluate_batch()` methods; use
+`async with` / `aclose()` for owned connections. Agent/Runner retains its synchronous
+entry points alongside `arun/astream/aclose`; the execution chain awaits models directly. SDKs handle network retries;
+the chat layer retries only empty responses. Anthropic requests with
 large output budgets use streaming even without a cancellation token.
 `GenerativeRewardModel` (GRM) calls the provider SDK to generate JSON scores and parses
 them into numbers without configuration files. To use a configured logical model

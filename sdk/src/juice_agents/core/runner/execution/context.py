@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import aclosing
 import threading
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterator
 
 from ..types.ask import AskRequest, AskResponse
 from .cancellation import raise_if_cancelled
@@ -22,6 +23,7 @@ class RunnerContext:
     agent_id: str
     agent_role: str
     agent: Any
+    cancellation: threading.Event | None = None
 
     @property
     def runner_id(self) -> str:
@@ -53,6 +55,25 @@ class RunnerContext:
             order=order,
             context=context,
         )
+
+    def execute_tools_streaming(self, actions: Any, *, context: Any) -> Iterator[Any]:
+        """Expose batch events without moving execution ownership to an Agent."""
+
+        return self.runner.tool_manager.execute_streaming_for_agent(
+            agent_id=self.agent_id,
+            actions=actions,
+            context=context,
+        )
+
+    async def aexecute_tools_streaming(self, actions: Any, *, context: Any):
+        async with aclosing(self.runner.tool_manager.aexecute_streaming_for_agent(
+            agent_id=self.agent_id, actions=actions, context=context,
+        )) as events:
+            async for event in events:
+                yield event
+
+    async def arun_code(self, execute: Any, code: str) -> Any:
+        return await self.runner.tool_manager.arun_code_for_agent(self.agent_id, execute, code)
 
     def list_available_agents(self) -> dict[str, Any]:
         """Read the current dispatch projection without acquiring an Agent.
@@ -167,7 +188,13 @@ class RunnerContext:
     def ask_user(self, request: AskRequest) -> AskResponse:
         """把工具层用户提问交给 Runner 当前绑定的交互 provider。"""
 
-        return self.runner.ask_user(request)
+        # Cancellation must wake only this execution's pending interaction;
+        # independent background work may be asking the user at the same time.
+        managed = self.runner.agent_manager.get(self.agent_id)
+        return self.runner.ask_user({**request, "runner_id": self.runner.runner_id,
+            "agent_id": self.agent_id, "round_id": managed.round_checkpoint.get("round_id"),
+            "cancellation_round_id": managed.metadata.get("cancellation_round_id")
+                or managed.round_checkpoint.get("round_id")})
 
     def get_plan_file_path(self) -> str:
         """Return the one Runner-owned formal plan path."""
@@ -200,7 +227,7 @@ class RunnerContext:
     def cancel_event(self) -> threading.Event:
         """Return the current stream cancellation token."""
 
-        return self.runner.cancel_event
+        return self.cancellation if self.cancellation is not None else self.runner.cancel_event
 
     def check_cancelled(self) -> None:
         """Raise when the current stream has been interrupted by the user."""

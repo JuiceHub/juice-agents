@@ -24,6 +24,7 @@ from pathlib import Path, PurePosixPath
 import logging
 import os
 import re
+import threading
 import time
 from typing import Any, Dict
 
@@ -67,27 +68,39 @@ class _FileRuntimeState:
     max_entries: int = field(default=_LRU_MAX_ENTRIES)
     max_size_bytes: int = field(default=_LRU_MAX_SIZE_BYTES)
     current_size_bytes: int = field(default=0, init=False)
+    # 不同路径的工具 worker 共享 LRU，检查、移动、淘汰与字节计数必须原子更新。
+    # 只保护缓存元数据；路径资源锁继续负责单个文件，文件 I/O 不持有此锁。
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False, compare=False)
 
     def add_snapshot(self, path: str, snapshot: _ReadSnapshot) -> None:
-        if path in self.snapshots:
-            old = self.snapshots.pop(path)
-            self.current_size_bytes -= old.size_bytes
-        self.snapshots[path] = snapshot
-        self.current_size_bytes += snapshot.size_bytes
-        while (
-            len(self.snapshots) > self.max_entries
-            or self.current_size_bytes > self.max_size_bytes
-        ):
-            if not self.snapshots:
-                break
-            _, evicted = self.snapshots.popitem(last=False)
-            self.current_size_bytes -= evicted.size_bytes
+        with self._lock:
+            if path in self.snapshots:
+                old = self.snapshots.pop(path)
+                self.current_size_bytes -= old.size_bytes
+            self.snapshots[path] = snapshot
+            self.current_size_bytes += snapshot.size_bytes
+            while (
+                len(self.snapshots) > self.max_entries
+                or self.current_size_bytes > self.max_size_bytes
+            ):
+                if not self.snapshots:
+                    break
+                _, evicted = self.snapshots.popitem(last=False)
+                self.current_size_bytes -= evicted.size_bytes
 
     def get_snapshot(self, path: str) -> _ReadSnapshot | None:
-        if path not in self.snapshots:
-            return None
-        self.snapshots.move_to_end(path)
-        return self.snapshots[path]
+        with self._lock:
+            if path not in self.snapshots:
+                return None
+            self.snapshots.move_to_end(path)
+            return self.snapshots[path]
+
+    def reset(self) -> None:
+        """原子清空快照与计数，避免与其他路径的读取/淘汰交错。"""
+
+        with self._lock:
+            self.snapshots.clear()
+            self.current_size_bytes = 0
 
 
 class _BaseFileTool(Tool):
@@ -96,11 +109,9 @@ class _BaseFileTool(Tool):
     """
 
     max_observation_chars = CONTENT_OBSERVATION_CHARS
-    # File reads/searches are safe to batch; mutating subclasses override this
-    # to SERIAL below. The path is converted to a resource key so two calls on
-    # the same file cannot overlap even when both are otherwise safe.
-    _execution_mode = "parallel_safe"
+    # 同一步内文件调用默认并发；资源键仍保证同一个文件的访问互斥。
     _STATE_BY_KEY: dict[tuple[str, str], _FileRuntimeState] = {}
+    _STATE_BY_KEY_LOCK = threading.Lock()
 
     def __init__(self, root_dir: str | Path | None = None) -> None:
         super().__init__()
@@ -117,20 +128,17 @@ class _BaseFileTool(Tool):
 
     def execution_policy(self, args: dict[str, Any], context: Any) -> Any:
         del context
-        from ...runtime.executor import ToolExecutionMode, ToolExecutionPolicy
+        from ...runtime.executor import ToolExecutionPolicy
 
         raw_path = args.get("path") or args.get("file_path") or ""
         try:
             key = f"file:{self._resolve_path(str(raw_path)).resolve()}" if raw_path else ""
         except Exception:
             key = f"file:{raw_path}" if raw_path else ""
-        mode = ToolExecutionMode(str(self._execution_mode))
-        return ToolExecutionPolicy(mode=mode, resource_keys=(key,) if key else ())
+        return ToolExecutionPolicy(resource_keys=(key,) if key else ())
 
     def reset_runtime_state(self) -> None:
-        state = self._get_runtime_state()
-        state.snapshots.clear()
-        state.current_size_bytes = 0
+        self._get_runtime_state().reset()
 
     def _runtime_key(self) -> tuple[str, str]:
         """
@@ -146,11 +154,13 @@ class _BaseFileTool(Tool):
 
     def _get_runtime_state(self) -> _FileRuntimeState:
         key = self._runtime_key()
-        state = self._STATE_BY_KEY.get(key)
-        if state is None:
-            state = _FileRuntimeState()
-            self._STATE_BY_KEY[key] = state
-        return state
+        # 首次读取可能来自多个不同文件，确保只创建并发布一个共享缓存实例。
+        with self._STATE_BY_KEY_LOCK:
+            state = self._STATE_BY_KEY.get(key)
+            if state is None:
+                state = _FileRuntimeState()
+                self._STATE_BY_KEY[key] = state
+            return state
 
     def _resolve_path(self, path: str) -> Path:
         if not isinstance(path, str) or not path.strip():
@@ -388,7 +398,6 @@ class ReadTool(_BaseFileTool):
 
 
 class WriteTool(_BaseFileTool):
-    _execution_mode = "serial"
     name = "write"
     description = "整文件写入文本内容；覆盖已有文件前必须先完整读取"
     inputs = {
@@ -445,7 +454,6 @@ class WriteTool(_BaseFileTool):
 
 
 class EditTool(_BaseFileTool):
-    _execution_mode = "serial"
     name = "edit"
     description = "按结构化 edits 顺序修改文本文件，支持 replace 与锚点前后插入"
     inputs = {
@@ -776,13 +784,31 @@ class GrepTool(_BaseFileTool):
         }
 
 
-FILE_TOOLS = {
-    "read": ReadTool(),
-    "write": WriteTool(),
-    "edit": EditTool(),
-    "glob": GlobTool(),
-    "grep": GrepTool(),
-}
+_FILE_TOOLS_LOCK = threading.Lock()
+
+
+def __getattr__(name: str) -> dict[str, Tool]:
+    """Build the shared default bundle only when a caller explicitly requests it.
+
+    Importing tool classes must not inspect cwd or choose a filesystem sandbox.
+    The compatibility bundle binds to cwd at its first access and keeps the same
+    instances thereafter; workspace registries construct their own tools with
+    explicit roots. The lock preserves that identity for concurrent callers.
+    """
+    if name != "FILE_TOOLS":
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    with _FILE_TOOLS_LOCK:
+        bundle = globals().get(name)
+        if bundle is None:
+            bundle = {
+                "read": ReadTool(),
+                "write": WriteTool(),
+                "edit": EditTool(),
+                "glob": GlobTool(),
+                "grep": GrepTool(),
+            }
+            globals()[name] = bundle
+        return bundle
 
 
 __all__ = [

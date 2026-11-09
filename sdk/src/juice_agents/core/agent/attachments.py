@@ -20,9 +20,11 @@ from typing import Any, Literal, TypedDict
 
 RuntimeEventType = Literal["async_task_notification"]
 RuntimeAttachmentType = Literal[
+    "user_message",
     "async_task_notification",
     "agent_user_message",
     "inbox_message",
+    "task_assignment",
     "plan_mode",
     "plan_mode_exit",
     "goal_state",
@@ -54,6 +56,7 @@ class RuntimeEvent(TypedDict, total=False):
 class RuntimeAttachment(TypedDict, total=False):
     """最终注入到模型上下文的附件块。"""
 
+    message_id: str
     attachment_type: RuntimeAttachmentType
     created_at: float
     payload: dict[str, Any]
@@ -65,7 +68,9 @@ _ATTACHMENT_PRIORITY = {
     "explicit_capability": -1,
     "async_task_notification": 0,
     "agent_user_message": 1,
+    "user_message": 1,
     "inbox_message": 2,
+    "task_assignment": 2,
     "plan_mode": 2,
     "plan_mode_exit": 2,
     "goal_state": 3,
@@ -104,6 +109,7 @@ def build_async_task_notification_attachment(event: RuntimeEvent) -> RuntimeAtta
     if async_task_id:
         payload["async_task_id"] = async_task_id
     return {
+        "message_id": str(event.get("event_id") or ""),
         "attachment_type": _notification_attachment_type(event),
         "created_at": float(event.get("created_at") or 0.0),
         "payload": payload,
@@ -115,6 +121,7 @@ def build_inbox_message_attachment(message: dict[str, Any]) -> RuntimeAttachment
 
     payload = dict(message or {})
     return {
+        "message_id": str(payload.get("message_id") or ""),
         "attachment_type": "inbox_message",
         "created_at": _parse_timestamp(payload.get("timestamp")),
         "payload": payload,
@@ -199,6 +206,7 @@ def serialize_runtime_attachments_text(attachments: list[RuntimeAttachment] | No
     normalized = merge_runtime_attachments(
         runtime_events=[
             {
+                "event_id": str(attachment.get("message_id") or ""),
                 "event_type": str(attachment.get("attachment_type") or ""),
                 "created_at": attachment.get("created_at"),
                 "payload": attachment.get("payload") or {},
@@ -216,6 +224,7 @@ def serialize_runtime_attachments_text(attachments: list[RuntimeAttachment] | No
     )
     normalized.extend(
         {
+            "message_id": str(attachment.get("message_id") or ""),
             "attachment_type": str(attachment.get("attachment_type") or ""),
             "created_at": float(attachment.get("created_at") or 0.0),
             "payload": dict(attachment.get("payload") or {}),
@@ -224,6 +233,8 @@ def serialize_runtime_attachments_text(attachments: list[RuntimeAttachment] | No
         if isinstance(attachment, dict)
         and str(attachment.get("attachment_type") or "") in {
             "agent_user_message",
+            "user_message",
+            "task_assignment",
             "plan_mode",
             "plan_mode_exit",
             "goal_state",
@@ -246,6 +257,8 @@ def serialize_runtime_attachments_text(attachments: list[RuntimeAttachment] | No
         attachment_type = str(attachment.get("attachment_type") or "").strip()
         payload = dict(attachment.get("payload") or {})
         attrs: list[str] = []
+        if attachment.get("message_id") and not payload.get("message_id"):
+            attrs.append(f'message_id="{escape(str(attachment["message_id"]), quote=True)}"')
         preferred_text_key = None
         if attachment_type == "async_task_notification":
             for key in ("async_task_id", "status", "output_dir"):
@@ -266,7 +279,7 @@ def serialize_runtime_attachments_text(attachments: list[RuntimeAttachment] | No
                 if value in (None, ""):
                     continue
                 attrs.append(f'{attr_name}="{escape(str(value), quote=True)}"')
-        elif attachment_type == "agent_user_message":
+        elif attachment_type in {"agent_user_message", "user_message"}:
             preferred_text_key = "text"
             for payload_key, attr_name in (
                 ("from", "from"),
@@ -277,6 +290,11 @@ def serialize_runtime_attachments_text(attachments: list[RuntimeAttachment] | No
                 if value in (None, ""):
                     continue
                 attrs.append(f'{attr_name}="{escape(str(value), quote=True)}"')
+        elif attachment_type == "task_assignment":
+            preferred_text_key = "text"
+            for key in ("task_id", "team_run_id", "generation"):
+                if payload.get(key) not in (None, ""):
+                    attrs.append(f'{key}="{escape(str(payload[key]), quote=True)}"')
         elif attachment_type == "plan_mode":
             preferred_text_key = "message"
             for payload_key, attr_name in (

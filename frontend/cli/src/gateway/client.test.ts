@@ -81,7 +81,7 @@ test("streamMessage uses the same RPC id for the request and its handlers", asyn
   (client as any).handleResponse(JSON.stringify({
     jsonrpc: "2.0",
     method: "stream_step",
-    params: { request_id: 1, event: { kind: "action_step" } },
+    params: { request_id: 1, event: { kind: "step_end" } },
   }));
   (client as any).handleResponse(JSON.stringify({
     jsonrpc: "2.0",
@@ -106,12 +106,12 @@ test("stream_step falls back to ambient handler only for empty request id", asyn
     JSON.stringify({
       jsonrpc: "2.0",
       method: "stream_step",
-      params: { request_id: null, event: { kind: "action_step", step: { step_num: 1 } } },
+      params: { request_id: null, event: { kind: "step_end", step: { step_num: 1 } } },
     }),
   );
 
   assert.equal(received.length, 1, "ambient handler 应接收到自动续跑推送的 stream_step");
-  assert.equal(received[0].kind, "action_step");
+  assert.equal(received[0].kind, "step_end");
 });
 
 test("stream_step routes only to the matching request and drops unknown ids", async () => {
@@ -129,13 +129,13 @@ test("stream_step routes only to the matching request and drops unknown ids", as
     JSON.stringify({
       jsonrpc: "2.0",
       method: "stream_step",
-      params: { request_id: 2, event: { kind: "action_step" } },
+      params: { request_id: 2, event: { kind: "step_end" } },
     }),
   );
   (client as any).handleResponse(JSON.stringify({
     jsonrpc: "2.0",
     method: "stream_step",
-    params: { request_id: 999, event: { kind: "action_step" } },
+    params: { request_id: 999, event: { kind: "step_end" } },
   }));
 
   assert.equal(first.length, 0);

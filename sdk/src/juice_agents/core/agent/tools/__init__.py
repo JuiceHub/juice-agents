@@ -46,7 +46,7 @@ from .builtin.evolution.skill_manage import SkillManageTool
 from .builtin.evolution.tool_manage import ToolManageTool
 from .builtin.tasks.async_tasks_tools import AsyncTaskStopTool
 from .builtin.workflows.workflows_tools import WorkflowListTool, WorkflowRunTool, WorkflowViewTool
-from .builtin.filesystem.files_tools import EditTool, FILE_TOOLS, GlobTool, GrepTool, ReadTool, WriteTool
+from .builtin.filesystem.files_tools import EditTool, GlobTool, GrepTool, ReadTool, WriteTool
 
 DEFAULT_TOOLS = {
     "shell": ShellTool(),
@@ -62,14 +62,17 @@ SKILL_TOOLS = [SkillsListTool, SkillViewTool, SkillManageTool]
 PLUGIN_TOOLS = [PluginsListTool, PluginViewTool]
 WORKFLOW_TOOLS = [WorkflowListTool, WorkflowViewTool, WorkflowManageTool, WorkflowRunTool]
 
-_LAZY_EXPORTS = {"AgentTool"}
+_LAZY_EXPORTS = {
+    "AgentTool": ".builtin.agents.subagents_tools",
+    "FILE_TOOLS": ".builtin.filesystem.files_tools",
+}
 
 
 def __getattr__(name: str):
-    """Defer subagent orchestration import until a caller actually needs it."""
+    """Defer orchestration imports and workspace-bound bundles until requested."""
 
     if name in _LAZY_EXPORTS:
-        value = getattr(import_module(".builtin.agents.subagents_tools", __package__), name)
+        value = getattr(import_module(_LAZY_EXPORTS[name], __package__), name)
         globals()[name] = value
         return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -6,6 +6,22 @@
 
 **包名：** `juice-agents` | **导入：** `juice_agents` | **Python：** 3.11+
 
+## 自主运行与恢复
+
+```python
+runner = Runner.resume(base_dir=".", runner_id=runner_id)
+unsubscribe = runner.subscribe_events(lambda event: print(event))
+runner.set_ask_handler(ask_handler)  # 先绑定交互能力。
+runner.activate()                  # 幂等；恢复待投递消息与 active round。
+# 停止一轮：runner.cancel_round(round_id)。
+# 关闭宿主：runner.close() 等待收尾，再 unsubscribe()。
+```
+
+`run/stream` 也会自动激活。用户、Team 与异步完成消息共享持久 inbox 和稳定 ID，
+每个 Agent 串行执行 round。订阅通过独立 `round_start/round_end` 接收后续自主执行。
+取消意图持久化后才返回，并中断同步子调用；独立异步任务继续运行。
+functional 调用必须在返回前完成调用内工作，禁止启动脱离调用的后台任务。
+
 ## 核心功能
 
 | 功能 | 说明 |
@@ -47,17 +63,30 @@ mkdir -p ~/.juice
 
 Runner、模型和工具统一通过 `ConfigurationContext` 读取配置。凭据不写入进程环境；缓存识别文件新增、修改、删除和原子替换。仅在实际使用模型或需密钥的工具时检查凭据，因此仍可查看配置与帮助。项目配置写入仅保留项目覆盖。
 
-模型条目可选 `api_base_env`：其指向的变量按上述凭据优先级覆盖 YAML 中的 `api_base`。内置 Claude 模型使用 `ANTHROPIC_BASE_URL`。参见[配置开发约定](src/juice_agents/core/config/README.zh-CN.md)。
+SDK 导入不解析进程工作目录。即使原 cwd 已删除，仍可向
+`ConfigurationContext.from_workspace()` 传入绝对工作区路径读取配置；
+使用隐式工作区路径时需要有效 cwd。
+
+模型条目引用 `providers`，后者统一维护 backend、地址与凭据来源。
+聊天和 GRM 各自从同一份 `models` 选择；生图通过 `image_models` 和
+`image.model_name` 选择，`image.enabled` 默认关闭。Provider 可选 `api_base_env`，
+按上述凭据优先级覆盖 YAML 地址；内置 Claude Provider 使用 `ANTHROPIC_BASE_URL`。
+修改设置后在空闲时调用 `runner.reconfigure(reload_config=True)`，保留历史和探索
+选择并刷新连接。参见[配置开发约定](src/juice_agents/core/config/README.zh-CN.md)。
 
 ## 快速开始
+
+会话及任务、浏览器和图片产物保存在 `.juice/sessions/<runner_id>/`。
+`Runner.create()` 使用空上下文，`Runner.resume()` 恢复指定旧会话；
+历史 `.juice/runners/` 数据不读取、不迁移。
 
 ### 单智能体
 
 ```python
-from juice_agents import Juice
+from juice_agents import Runner
 
-juice = Juice(workspace=".")
-runner = juice.runners.create(
+runner = Runner.create(
+    base_dir=".",
     runner_config="agent",
     permission_mode="default"
 )
@@ -75,12 +104,13 @@ print(result)
 
 ```python
 # 第一次会话
-runner = juice.runners.create(runner_config="agent")
+runner = Runner.create(base_dir=".", runner_config="agent")
 runner.run("开始分析代码库")
 runner_id = runner.runner_id
+runner.close()
 
 # 重启后（甚至不同进程）
-runner = juice.runners.resume(runner_id=runner_id)
+runner = Runner.resume(base_dir=".", runner_id=runner_id)
 runner.run("继续实现")
 ```
 
@@ -97,8 +127,8 @@ def ask_handler(request):
     selected = [option for option in options if option["value"] == answer]
     return {"status": "answered", "selected": selected, "custom_response": "" if selected else answer}
 
-juice = Juice(workspace=".", ask_handler=ask_handler)
-runner = juice.runners.create(runner_config="plan")
+runner = Runner.create(base_dir=".", runner_config="plan")
+runner.set_ask_handler(ask_handler)
 runner.run("重构身份验证模块")
 ```
 
@@ -107,7 +137,8 @@ runner.run("重构身份验证模块")
 ### 组协调
 
 ```python
-runner = juice.runners.create(
+runner = Runner.create(
+    base_dir=".",
     runner_config="group",
     permission_mode="default"
 )
@@ -120,7 +151,8 @@ runner.run("研究竞争对手并撰写市场分析报告")
 ### 团队协作
 
 ```python
-runner = juice.runners.create(
+runner = Runner.create(
+    base_dir=".",
     runner_config="team",
     permission_mode="default"
 )
@@ -145,6 +177,11 @@ runner.run("添加任务：设计模式、实现爬虫、测试")
 所有模式使用相同的 `Runner` 执行路径并共享工具、权限和持久化基础设施。
 
 ## 工具
+
+工具事件使用 `tool_start` / `tool_end`，通过相同 `call_id` 关联。结束事件保留
+已有执行状态、返回结果及捕获的异常，不根据文本判断失败。CodeAct 同时保存公开
+Python wrapper 与内部审计记录，供历史还原实时工具展示。
+详见 [Agent 事件约定](src/juice_agents/core/agent/README.zh-CN.md)。
 
 智能体可使用多种内置工具，例如：
 
@@ -208,7 +245,8 @@ result = runner.workflow_manager.call("research", {"query": "AI trends 2024"})
 在 runner 创建时配置：
 
 ```python
-runner = juice.runners.create(
+runner = Runner.create(
+    base_dir=".",
     runner_config="agent",
     permission_mode="accept"
 )
@@ -219,28 +257,26 @@ runner = juice.runners.create(
 调度周期任务：
 
 ```python
-# UI 拥有时钟；SDK 提供 tick 原语
-juice.cron.tick()
+from juice_agents.core.cron import create_cron_task, execute_due_cron_tasks
 
-# 用 juice.cron.create(cron="0 9 * * *", prompt="生成日报") 创建作业
-# 作业保存在工作区 .juice/scheduled_tasks.json
+create_cron_task(".", "0 9 * * *", "生成日报")
+# 宿主进程管理时钟，需要执行到期任务时调用。
+results = execute_due_cron_tasks(".", runner_config="agent")
 ```
 
 ## API 参考
 
-### Juice 客户端
-
-```python
-juice = Juice(workspace=".", runtime_config_path=None)
-```
-
-- `workspace`：`.juice/` 状态的工作目录
-- `runtime_config_path`：可选的运行时配置文件路径
-
 ### Runner 创建
 
+直接调用 `Runner.create/resume`，用 `base_dir` 指定工作目录。
+`runtime_config_path` 选择基础配置，`runtime_overrides` 添加本次启动覆盖。
+创建或恢复后通过 `runner.set_ask_handler(handler)` 绑定交互回调；回调仅存在于当前进程，
+不参与持久化。使用结束后在 `finally` 中调用 `runner.close()`。
+定时任务 API 见 [Cron](src/juice_agents/core/cron/README.zh-CN.md)。
+
 ```python
-runner = juice.runners.create(
+runner = Runner.create(
+    base_dir=".",
     runner_config="agent",  # 或 "plan", "group", "team", 或自定义配置
     permission_mode="default"
 )
@@ -249,7 +285,7 @@ runner = juice.runners.create(
 ### Runner 恢复
 
 ```python
-runner = juice.runners.resume(runner_id="run_abc123")
+runner = Runner.resume(base_dir=".", runner_id="run_abc123")
 ```
 
 ### 执行
@@ -269,6 +305,7 @@ result = runner.run("任务描述")
 runner.runner_id  # 用于恢复的唯一 ID
 runner.config     # 不可变 RunnerConfig
 runner.stop()     # 协作取消
+runner.close()    # 释放资源
 ```
 
 ## 包边界
@@ -292,11 +329,10 @@ SDK 不附带演示 Skill。可写技能放在 `.juice/skills`，只读来源通
 ## 架构
 
 ```text
-Juice 客户端
-  └─ runners.create(runner_config) → Runner
-       └─ AgentManager, ToolManager, WorkflowRunManager
-          └─ 智能体通过 RunnerContext 执行
-             └─ 工具、权限、审计
+Runner.create(base_dir=..., runner_config=...) / Runner.resume(...)
+  └─ AgentManager, ToolManager, WorkflowRunManager
+     └─ 智能体通过 RunnerContext 执行
+        └─ 工具、权限、审计
 ```
 
 **关键边界：**
@@ -344,3 +380,37 @@ SDK 开发遵循核心约定：
 - 测试在 `tests/sdk/` 和 `tests/core/`
 
 项目指南见 [AGENTS.md](../AGENTS.md)。
+
+
+### 回合结果与事件契约
+
+```python
+from juice_agents import RoundFailedError, RoundCancelledError
+
+result = runner.run_round("检查变更")  # RoundResult，保留失败/取消的部分输出
+print(result.status, result.reason, result.output)
+# runner.run(...) 成功返回 output，否则抛出上述异常，异常的 .result 是同一结果契约。
+```
+
+| 公开事件 | data 中的主要字段 |
+| --- | --- |
+| `agent_state` | `status: idle/running/released`、生命周期和轻量回合摘要 |
+| `round_start / round_end` | 输入消息身份 / `result: {round_id,status,output,reason,error}` |
+| `step_start / step_end` | 步骤身份 / 已保存的 `step` 快照 |
+| `model_start / model_end` | 相同 `model_call_id`，`purpose: generation/scoring/compression` |
+| `thinking`、`tool_start / tool_end` | 思考内容 / 相同框架 `call_id` |
+| `workflow_progress / team_update / message_deferred` | 调用 ID、业务进度及消息重新分配 |
+
+所有事件包含 `event_id`、秒级 `timestamp`、Runner/Agent 身份及适用的 `round_id/step_num`。
+`subscribe_events()` 可观察子 Agent；主对话仅消费 root。`describe_agent_sessions(agent_id=...)`
+按需读取带回合、步骤和工具身份的历史。模型提供原生异步接口与 `aclose()`；同步 Agent/Runner 仅桥接一次完整调用，
+取消覆盖请求建立、流读取和重试等待，见[模型约定](src/juice_agents/core/models/README.zh-CN.md)。
+关闭 `stream()` 只退订，显式取消先保存意图、
+停止模型/未开始工具，并等待已开始的调用收尾；取消不覆盖已保存的终态。
+步数预算之后保留一次提交机会；仍未提交返回 `failed/max_steps_exceeded` 和部分输出。
+Runner v6、Agent v2、Context v3 是当前格式；不迁移旧会话且不改写旧文件。
+
+异步宿主使用 `await Runner.acreate/aresume(...)`、`await runner.arun/arun_round(...)`、
+`async for event in runner.astream(...)` 及 `await runner.aclose()`（或 `async with`）。
+同步入口共用同一协程执行链。ModelManager 负责请求、用量和连接，TeamManager
+负责成员调度及结果对账。

@@ -20,7 +20,7 @@ from juice_agents.core.agent.context import (
     serialize_context_tree,
 )
 from juice_agents.core.agent.context.compression import CompactCompressStrategy, RemainCompressStrategy
-from juice_agents.core.agent.manager import AgentManager
+from juice_agents.core.managers.agents import AgentManager
 
 
 class _CandidateAgent:
@@ -101,7 +101,7 @@ def test_manager_checkpoints_candidates_before_execution_and_updates_selected_in
     assert agent.executions == 1
 
     # A second request extends the selected leaf, including after persistence.
-    assert manager.run(managed, "second") == "answer:2"
+    assert manager.run(managed, "second").unwrap() == "answer:2"
     assert checkpoints == [3, 6]
     restored = deserialize_context_tree(manager.load_snapshot(managed.agent_id)["session"])
     assert [step.task for step in restored.steps if isinstance(step, TaskStep)] == ["first", "second"]

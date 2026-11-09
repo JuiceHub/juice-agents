@@ -39,10 +39,10 @@ def config_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path,
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv(_API_KEY_ENV, raising=False)
     base = _write_yaml(tmp_path / "base.yaml", {
-        "models": {"judge": {
-            "backend": "openai", "api_base": "https://base.test/v1",
-            "api_key_env": _API_KEY_ENV, "provider_model_name": "base-model",
+        "providers": {"test": {
+            "backend": "openai", "api_base": "https://base.test/v1", "api_key_env": _API_KEY_ENV,
         }},
+        "models": {"judge": {"provider": "test", "provider_model_name": "base-model"}},
         "tools": {"tavily": {"api_key_env": _API_KEY_ENV, "timeout": 12}},
         "runner": {"model": "judge", "language": "en", "max_steps": 10},
     })

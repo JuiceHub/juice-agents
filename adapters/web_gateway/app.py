@@ -27,7 +27,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 
-from adapters.stdio_gateway.runtime import DirectRunnerRuntime
+from adapters.stdio_gateway.runtime import DirectRunnerRuntime, ask_execution_cancelled
 from adapters.stdio_gateway.serialization import serialize_runner_stream_event
 from adapters.stdio_gateway.sessions import list_sessions
 from juice_agents.core.config.runtime_config import read_workspace_config, update_workspace_config
@@ -469,14 +469,12 @@ class WebSocketRuntimeConnection:
         self.outgoing: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
         self.loop: asyncio.AbstractEventLoop | None = None
         self.pending_asks: dict[str, Future[dict[str, Any]]] = {}
-        self.pending_ask_stream_ids: dict[str, str] = {}
+        self.pending_ask_round_ids: dict[str, set[str]] = {}
+        self._cancelled_round_ids: set[str] = set()
         self.pending_asks_lock = threading.Lock()
         self._cancelled_stream_request_ids: set[str] = set()
-        self._active_stream_request_id = ""
+        self._stream_request_ids: set[str] = set()
         self.stream_tasks: set[asyncio.Task[None]] = set()
-        # Transport-level serialization avoids interleaving two websocket streams.
-        # The SDK Runner also rejects concurrent requests as a final safety boundary.
-        self._stream_mutex = asyncio.Lock()
 
     async def run(self) -> None:
         await self.websocket.accept()
@@ -512,6 +510,8 @@ class WebSocketRuntimeConnection:
             await self._answer_ask(command_id, payload)
             return
         if command_type == "stream_message":
+            with self.pending_asks_lock:
+                self._stream_request_ids.add(command_id)
             task = asyncio.create_task(self._stream_message(command_id, payload))
             self.stream_tasks.add(task)
             task.add_done_callback(self.stream_tasks.discard)
@@ -527,15 +527,22 @@ class WebSocketRuntimeConnection:
             await self._send_error(command_id, str(exc))
 
     async def _cancel_stream(self, command_id: str, payload: dict[str, Any]) -> None:
-        """Set the cooperative token, wake Ask, and acknowledge without a task barrier."""
+        """Wake approvals only after the Runner accepts the cancellation intent."""
         try:
-            target = str(payload.get("request_id") or "").strip()
-            is_active = self._cancel_stream_request(target)
-            if is_active or not target:
-                result = await asyncio.to_thread(self._handle_sync_command, "cancel_stream", payload)
-            else:
-                result = {"cancelled": True}
-            logger.info("web stream cancellation requested: command_id=%s", command_id)
+            if payload.get("request_id") and not payload.get("round_id"):
+                target = str(payload["request_id"])
+                with self.pending_asks_lock:
+                    accepted = target in self._stream_request_ids
+                    if accepted:
+                        self._cancelled_stream_request_ids.add(target)
+                await self._send_result(command_id, {"cancelled": accepted})
+                return
+            result = await asyncio.to_thread(self._handle_sync_command, "cancel_stream", payload)
+            if result.get("cancelled"):
+                runner = getattr(self.runtime, "_runner", None)
+                round_id = str(payload.get("round_id") or getattr(runner, "active_round_id", "") or "")
+                if round_id:
+                    self._cancel_pending_asks("cancelled by user", status="cancelled", round_id=round_id)
             await self._send_result(command_id, result)
         except Exception as exc:
             logger.exception("web gateway command failed: cancel_stream")
@@ -543,16 +550,25 @@ class WebSocketRuntimeConnection:
 
     def _handle_sync_command(self, command_type: str, payload: dict[str, Any]) -> Any:
         if command_type == "start_session":
+            replacement = self._new_runtime(payload, preserve_launch_configuration=True)
+            self._cancel_pending_asks("runner replaced", status="cancelled")
             if self.runtime is not None:
                 self.runtime.stop_session(source="runner_switch")
-            self.runtime = self._new_runtime(payload)
+            self.runtime = replacement
             return _serialize_session_status(self.runtime.start_session())
         if command_type == "resume_session":
+            replacement = self._new_runtime(payload)
+            self._cancel_pending_asks("runner replaced", status="cancelled")
             if self.runtime is not None:
                 self.runtime.stop_session(source="runner_switch")
-            self.runtime = self._new_runtime(payload)
+            self.runtime = replacement
             return _serialize_session_status(self.runtime.resume_session(str(payload["runner_id"])))
+        if command_type == "activate_session":
+            if self.runtime is None:
+                raise RuntimeError("No active session")
+            return self.runtime.activate_session(str(payload["runner_id"]))
         if command_type == "stop_session":
+            self._cancel_pending_asks("runner stopped", status="cancelled")
             if self.runtime is None:
                 return {"stopped": False}
             return self.runtime.stop_session()
@@ -561,7 +577,7 @@ class WebSocketRuntimeConnection:
             # 不持久化为 paused、不停止 async tasks，便于继续后续对话。
             if self.runtime is None:
                 return {"cancelled": False}
-            return self.runtime.request_cancel_stream()
+            return self.runtime.request_cancel_stream(**{key: str(payload[key]) for key in ("runner_id", "round_id") if payload.get(key)})
         if command_type == "archive_runner":
             return _archive_web_runner(payload.get("base_dir") or ".", str(payload.get("runner_id") or ""))
         if command_type == "restore_runner":
@@ -580,7 +596,13 @@ class WebSocketRuntimeConnection:
             registry = _team_registry_for(payload.get("base_dir") or ".")
             return _serialize_team_manifest(registry, registry.get_manifest(team_name))
 
-        runtime = self._ensure_runtime(payload)
+        # Image model selection is a separate catalog; it must not become the
+        # chat model if this is the first command in a cold Web connection.
+        runtime_payload = (
+            {key: value for key, value in payload.items() if key != "model_name"}
+            if command_type in {"list_image_models", "set_image_config"} else payload
+        )
+        runtime = self._ensure_runtime(runtime_payload)
         if command_type == "switch_permission_mode":
             return _serialize_session_status(
                 runtime.switch_permission_mode(
@@ -605,6 +627,8 @@ class WebSocketRuntimeConnection:
             )
         if command_type == "list_models":
             return runtime.list_models()
+        if command_type == "list_image_models":
+            return runtime.list_image_models()
         if command_type == "list_sessions":
             base_dir = payload.get("base_dir") or runtime.base_dir
             return [_serialize_session(summary) for summary in _list_web_sessions(base_dir)]
@@ -656,7 +680,7 @@ class WebSocketRuntimeConnection:
                 disabled=[str(item) for item in disabled],
             )
         if command_type == "set_image_config":
-            return runtime.set_image_config(enabled=bool(payload.get("enabled")))
+            return runtime.set_image_config(enabled=payload.get("enabled"), model_name=payload.get("model_name"))
         if command_type == "memory_status":
             return runtime.memory_status()
         if command_type == "memory_search":
@@ -695,7 +719,7 @@ class WebSocketRuntimeConnection:
         if command_type == "cron_status":
             return runtime.cron_status()
         if command_type == "describe_agent_sessions":
-            return runtime.describe_agent_sessions()
+            return runtime.describe_agent_sessions(agent_id=payload.get("agent_id"))
         if command_type == "send_agent_message":
             return runtime.send_agent_message(
                 agent_name=str(payload.get("agent_name") or ""),
@@ -709,70 +733,42 @@ class WebSocketRuntimeConnection:
         raise ValueError(f"unknown websocket command: {command_type}")
 
     async def _stream_message(self, command_id: str, payload: dict[str, Any]) -> None:
+        """Wait independently for the request's committed result."""
         try:
-            # Websocket commands are serialized before entering the SDK Runner.
-            async with self._stream_mutex:
-                with self.pending_asks_lock:
-                    if command_id in self._cancelled_stream_request_ids:
-                        self._cancelled_stream_request_ids.discard(command_id)
-                        skipped = True
-                    else:
-                        self._active_stream_request_id = command_id
-                        skipped = False
-                if skipped:
-                    logger.info("skip cancelled queued web stream: request_id=%s", command_id)
-                else:
-                    try:
-                        await asyncio.to_thread(self._run_stream_worker, command_id, payload)
-                    finally:
-                        with self.pending_asks_lock:
-                            if self._active_stream_request_id == command_id:
-                                self._active_stream_request_id = ""
-                            self._cancelled_stream_request_ids.discard(command_id)
-            result = (
-                {"done": True, "stopped": True, "stop_reason": "user_cancelled"}
-                if skipped
-                else self._current_stream_result()
-            )
+            result = await self._run_stream_request(command_id, payload)
             await self._send_result(command_id, result)
         except Exception as exc:
             logger.exception("web gateway stream failed")
             await self._send_error(command_id, str(exc))
+        finally:
+            with self.pending_asks_lock:
+                self._cancelled_stream_request_ids.discard(command_id)
+                self._stream_request_ids.discard(command_id)
 
-    def _current_stream_result(self) -> dict[str, Any]:
-        runner = getattr(self.runtime, "_runner", None) if self.runtime is not None else None
-        stopped = False
-        stop_reason = ""
-        if runner is not None:
-            getter = getattr(runner, "last_stream_was_cancelled", None)
-            if callable(getter):
-                try:
-                    stopped = bool(getter())
-                except Exception:
-                    stopped = False
-            stop_reason = str(getattr(runner, "stop_reason", None) or "")
-        return {"done": True, "stopped": stopped, "stop_reason": stop_reason}
-
-    def _run_stream_worker(self, command_id: str, payload: dict[str, Any]) -> None:
-        runtime = self._ensure_runtime(payload)
-        message = str(payload.get("message") or "")
+    async def _run_stream_request(self, command_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        runtime = await asyncio.to_thread(self._ensure_runtime, payload)
         agent_mode_override = payload.get("agent_mode_override")
-        for event in runtime.stream_message(
-            message,
+        return await runtime.astream_message(
+            str(payload.get("message") or ""),
             agent_mode_override=(
                 None if agent_mode_override is None else str(agent_mode_override)
             ),
             cancel_check=lambda: self._stream_request_is_cancelled(command_id),
-        ):
-            serialized = serialize_runner_stream_event(event)
-            try:
-                serialized["agent_sessions_report"] = runtime.describe_agent_sessions()
-            except Exception:
-                serialized["agent_sessions_report"] = None
-            self._put_threadsafe({"id": command_id, "type": "stream_step", "payload": serialized})
+        )
 
-    def _new_runtime(self, payload: dict[str, Any]) -> DirectRunnerRuntime:
-        return DirectRunnerRuntime(
+    def _publish_runner_event(self, event: dict[str, Any]) -> None:
+        """Autonomous rounds share the foreground wire schema and event IDs."""
+        if event.get("kind") == "round_end":
+            with self.pending_asks_lock:
+                self._cancelled_round_ids.discard(str(event.get("round_id") or ""))
+        self._put_threadsafe({"type": "stream_step", "payload": serialize_runner_stream_event(event)})
+
+    def _new_runtime(
+        self, payload: dict[str, Any], *, preserve_launch_configuration: bool = False,
+    ) -> DirectRunnerRuntime:
+        return DirectRunnerRuntime.for_session_replacement(
+            self.runtime,
+            preserve_launch_configuration=preserve_launch_configuration,
             base_dir=payload.get("base_dir", "."),
             permission_mode=payload.get("permission_mode"),
             agent_mode=payload.get("agent_mode"),
@@ -781,6 +777,7 @@ class WebSocketRuntimeConnection:
             model_name=payload.get("model_name"),
             model_effort=payload.get("model_effort"),
             ask_handler=self._handle_ask_request,
+            event_handler=self._publish_runner_event,
         )
 
     def _ensure_runtime(self, payload: dict[str, Any]) -> DirectRunnerRuntime:
@@ -791,83 +788,63 @@ class WebSocketRuntimeConnection:
     def _handle_ask_request(self, request: AskRequest) -> dict[str, Any]:
         request_id = str(request.get("request_id") or "").strip()
         future: Future[dict[str, Any]] = Future()
+        round_ids = {
+            str(request.get(key) or "") for key in ("round_id", "cancellation_round_id")
+            if request.get(key)
+        }
         with self.pending_asks_lock:
-            # Ask 不一定在 stream worker 本身执行：权限审批或嵌套工具可能在
-            # agent 的工具线程池中调用 ask handler。threading.local 无法跨线程
-            # 传播 request ID；Web stream 已由 _stream_mutex 串行化，因此锁内的
-            # active request 才是 Ask 归属的唯一可靠真相源。
-            stream_request_id = self._active_stream_request_id
-            if stream_request_id and stream_request_id in self._cancelled_stream_request_ids:
-                return dict(
-                    normalize_ask_response(
-                        {
-                            "status": "cancelled",
-                            "request_id": request_id,
-                            "error": "cancelled by user",
-                        },
-                        request=request,
-                    )
-                )
+            if round_ids & self._cancelled_round_ids:
+                return dict(normalize_ask_response({"status": "cancelled", "error": "cancelled by user"}, request=request))
             self.pending_asks[request_id] = future
-            self.pending_ask_stream_ids[request_id] = stream_request_id
-        logger.info(
-            "registered web Ask: ask_request_id=%s stream_request_id=%s",
-            request_id,
-            stream_request_id or "<ambient>",
-        )
-        self._put_threadsafe({"id": stream_request_id, "type": "ask_request", "payload": dict(request)})
+            self.pending_ask_round_ids[request_id] = round_ids
+        logger.info("registered web Ask: request_id=%s round_ids=%s", request_id, sorted(round_ids))
+        self._put_threadsafe({"type": "ask_request", "payload": dict(request)})
         try:
-            return dict(normalize_ask_response(future.result(), request=request))
+            while True:
+                try:
+                    return dict(normalize_ask_response(future.result(timeout=0.1), request=request))
+                except TimeoutError:
+                    runner = getattr(self.runtime, "_runner", None)
+                    if ask_execution_cancelled(runner, request):
+                        return dict(normalize_ask_response({"status": "cancelled", "error": "cancelled by user"}, request=request))
         finally:
             with self.pending_asks_lock:
                 self.pending_asks.pop(request_id, None)
-                self.pending_ask_stream_ids.pop(request_id, None)
+                self.pending_ask_round_ids.pop(request_id, None)
 
     async def _answer_ask(self, command_id: str, payload: dict[str, Any]) -> None:
         request_id = str(payload.get("request_id") or "").strip()
         with self.pending_asks_lock:
-            future = self.pending_asks.get(request_id)
+            # Claim the pending request before releasing the lock. An answer
+            # racing cancellation must not complete the same Future twice.
+            future = self.pending_asks.pop(request_id, None)
+            self.pending_ask_round_ids.pop(request_id, None)
+            if future is not None:
+                future.set_result(dict(payload.get("response") or {}))
         if future is None:
             await self._send_error(command_id, f"unknown ask request: {request_id}")
             return
-        future.set_result(dict(payload.get("response") or {}))
         await self._send_result(command_id, {"accepted": True})
 
-    def _cancel_pending_asks(self, reason: str, *, status: str = "error") -> None:
+    def _cancel_pending_asks(
+        self, reason: str, *, status: str = "error", round_id: str | None = None,
+    ) -> None:
+        """Cancel approvals for one foreground tree, or all on Runner shutdown."""
         with self.pending_asks_lock:
-            futures = list(self.pending_asks.values())
-            self.pending_asks.clear()
-            self.pending_ask_stream_ids.clear()
+            if round_id is not None:
+                self._cancelled_round_ids.add(round_id)
+            selected = [
+                request_id for request_id in self.pending_asks
+                if round_id is None or round_id in self.pending_ask_round_ids.get(request_id, set())
+            ]
+            futures = [self.pending_asks.pop(request_id) for request_id in selected]
+            for request_id in selected:
+                self.pending_ask_round_ids.pop(request_id, None)
         for future in futures:
             if not future.done():
                 future.set_result({"status": status, "error": reason})
         if futures:
-            logger.info("woke %d pending web Ask request(s): status=%s", len(futures), status)
-
-    def _cancel_stream_request(self, request_id: str) -> bool:
-        """Atomically mark a stream cancelled and wake only its registered Ask."""
-        target = str(request_id or "").strip()
-        futures: list[Future[dict[str, Any]]] = []
-        with self.pending_asks_lock:
-            if target:
-                self._cancelled_stream_request_ids.add(target)
-                for ask_id, stream_id in list(self.pending_ask_stream_ids.items()):
-                    if stream_id == target:
-                        future = self.pending_asks.pop(ask_id, None)
-                        self.pending_ask_stream_ids.pop(ask_id, None)
-                        if future is not None:
-                            futures.append(future)
-            else:
-                futures = list(self.pending_asks.values())
-                self.pending_asks.clear()
-                self.pending_ask_stream_ids.clear()
-            is_active = bool(target and target == self._active_stream_request_id)
-        for future in futures:
-            if not future.done():
-                future.set_result({"status": "cancelled", "error": "cancelled by user"})
-        if futures:
-            logger.info("woke %d pending web Ask request(s): status=cancelled", len(futures))
-        return is_active
+            logger.info("woke %d pending web Ask request(s): status=%s round_id=%s", len(futures), status, round_id)
 
     def _stream_request_is_cancelled(self, request_id: str) -> bool:
         with self.pending_asks_lock:
@@ -1030,7 +1007,7 @@ def _restore_web_runner(base_dir: str | Path, runner_id: str) -> dict[str, Any]:
 
 def _web_archive_marker(root: Path, runner_id: str) -> Path:
     safe_runner_id = _safe_runner_id(runner_id)
-    runner_dir = root / ".juice" / "runners" / safe_runner_id
+    runner_dir = root / ".juice" / "sessions" / safe_runner_id
     if not runner_dir.exists() or not runner_dir.is_dir() or not (runner_dir / "manifest.json").exists():
         raise FileNotFoundError(f"runner not found: {safe_runner_id}")
     return runner_dir / WEB_ARCHIVE_MARKER
@@ -1094,7 +1071,7 @@ def _build_file_tree(root: Path, current: Path, *, max_depth: int, budget: list[
 
 
 def _latest_browser_image(root: Path, *, runner_id: str = "") -> Path | None:
-    juice = root / ".juice" / "runners"
+    juice = root / ".juice" / "sessions"
     if not juice.exists():
         return None
     candidates: list[Path] = []
@@ -1167,7 +1144,7 @@ def _browser_live_session(root: Path, runner_id: str = "", *, headless: bool = T
     keys = _browser_session_keys(root, runner_id)
     if runner_id and keys and keys[0].startswith(f"{runner_id}:"):
         key = keys[0]
-        state_root = root / ".juice" / "runners" / runner_id
+        state_root = root / ".juice" / "sessions" / runner_id
         return key, get_browser_session(
             key,
             headless=headless,

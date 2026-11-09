@@ -287,7 +287,6 @@ class AgentConfigToolBase(Tool):
 
 class AgentsListTool(AgentConfigToolBase):
     _browse_team_shared_candidates = True
-    _execution_mode = "parallel_safe"
     max_observation_chars = LIST_OBSERVATION_CHARS
     name = "agents_list"
     is_read_only = True
@@ -310,7 +309,6 @@ class AgentsListTool(AgentConfigToolBase):
 
 class AgentViewTool(AgentConfigToolBase):
     _browse_team_shared_candidates = True
-    _execution_mode = "parallel_safe"
     max_observation_chars = CONTENT_OBSERVATION_CHARS
     name = "agent_view"
     is_read_only = True

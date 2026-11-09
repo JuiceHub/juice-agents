@@ -17,8 +17,12 @@ class GreedyStrategy:
     def select(
         self, *, context: list[dict[str, Any]], candidates: list[ActionStep],
         on_model_usage: Callable[..., None] | None = None,
+        model_call: Callable[..., Any] | None = None,
     ) -> tuple[int, list[float | None]]:
         return 0, [None] * len(candidates)
+
+    async def aselect(self, **kwargs: Any) -> tuple[int, list[float | None]]:
+        return self.select(**kwargs)
 
 
 __all__ = ["GreedyStrategy"]

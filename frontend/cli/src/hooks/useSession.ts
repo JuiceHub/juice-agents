@@ -65,8 +65,12 @@ export function useSession(client: GatewayClient) {
   const refreshStatus = useCallback(async () => {
     try {
       const result = await client.describeSession();
-      setStatus(result);
-      return result;
+      // The gateway also returns launch previews with an empty runner_id.
+      // Keep those out of active session state; started=false with a real ID
+      // is an existing session that has not run its first round yet.
+      const activeStatus = result.runner_id ? result : null;
+      setStatus(activeStatus);
+      return activeStatus;
     } catch {
       // Session may not be started yet
     }

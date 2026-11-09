@@ -1,17 +1,17 @@
 """Durable background-task manager with generic agent ownership semantics.
 
 The low-level task machinery already has careful subprocess, notification and
-thread-pool handling.  This facade makes that machinery a manager-owned
-runtime service: callers bind a scope and an event sink, then use ``agent_*``
-methods rather than embedding team/group-specific lifecycle logic in Runner.
+coroutine lifecycle handling.  This facade makes that machinery a manager-owned
+runtime service: callers bind a scope and a durable notification sink. Agent
+lifecycle and round scheduling belong exclusively to AgentManager.
 """
 
 from __future__ import annotations
 
 import copy
+import asyncio
 import logging
 from pathlib import Path
-import subprocess
 from typing import Any, Callable, Protocol
 
 from juice_agents.core.runner.async_tasks.lifecycle import close_async_task
@@ -19,6 +19,8 @@ from juice_agents.core.runner.async_tasks.kinds import to_public_kind
 from juice_agents.core.runner.async_tasks.registry import _AsyncTaskRuntime
 from juice_agents.core.runner.async_tasks.store import read_async_task_output
 from juice_agents.core.runner.workspace import RuntimeWorkspace
+
+from juice_agents.core.runner.execution.async_io import blocking
 
 logger = logging.getLogger(__name__)
 
@@ -37,16 +39,6 @@ class _DiscardTaskEvents:
         del owner_agent_id, event
 
 
-_ROLE_TO_INTERNAL_KIND = {
-    "root": "agent_owner",
-    "member": "agent_owner",
-    "functional": "agent_owner",
-    "persistent": "teammate",
-    "manager": "group_manager",
-    "worker": "group_worker",
-}
-
-
 class AsyncTaskManager(_AsyncTaskRuntime):
     """Own a scope's task state, workers, processes, cancellation and recovery.
 
@@ -57,9 +49,8 @@ class AsyncTaskManager(_AsyncTaskRuntime):
     package.
 
     A private implementation supplies low-level process bookkeeping, but this
-    manager instance owns the state and exposes only agent-named operations.
-    Team/group collaboration therefore uses the same manager surface as every
-    other RunnerConfig.
+    manager instance owns task state only. Agent identities are immutable owner
+    references on tasks, never a second live-Agent or round registry.
     """
 
     def __init__(
@@ -73,7 +64,6 @@ class AsyncTaskManager(_AsyncTaskRuntime):
         runtime_workspace: RuntimeWorkspace | None = None,
         default_base_dir: str | Path | None = None,
         max_workers: int = 8,
-        state_callback: Callable[[list[dict[str, Any]], dict[str, dict[str, Any]]], None] | None = None,
     ) -> None:
         self._released_manager = False
         self._state_dir = None if state_dir is None else Path(state_dir).expanduser().resolve()
@@ -82,7 +72,6 @@ class AsyncTaskManager(_AsyncTaskRuntime):
             runtime_workspace=runtime_workspace,
             default_base_dir=default_base_dir,
             max_workers=max_workers,
-            public_sync=state_callback,
             outputs_dir=None if self._state_dir is None else self._state_dir / "tasks",
         )
         if self._state_dir is not None:
@@ -122,72 +111,6 @@ class AsyncTaskManager(_AsyncTaskRuntime):
         logger.info("async task manager bound: scope_id=%s scope_kind=%s", scope_id, scope_kind)
         return dict(snapshot)
 
-    def register_agent(
-        self,
-        *,
-        agent_name: str,
-        agent_id: str,
-        role: str = "member",
-        metadata: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Register a manager-owned agent runtime, not a static declaration."""
-
-        self._ensure_open()
-        normalized_role = str(role or "member").strip().lower() or "member"
-        internal_kind = _ROLE_TO_INTERNAL_KIND.get(normalized_role, "agent_owner")
-        state = super().register_agent(
-            agent_name=str(agent_name or "").strip(),
-            agent_id=str(agent_id or "").strip(),
-            agent_kind=internal_kind,  # runtime validates only the value shape
-            metadata={"role": normalized_role, **dict(metadata or {})},
-        )
-        return self._agent_state(state)
-
-    def get_agent(self, agent_name: str) -> dict[str, Any] | None:
-        state = super().get_agent(agent_name)
-        return None if state is None else self._agent_state(state)
-
-    def list_agents(self) -> list[dict[str, Any]]:
-        with self._lock:
-            states = [copy.deepcopy(value) for value in self._agents.values() if isinstance(value, dict)]
-        return [self._agent_state(state) for state in states]
-
-    def ensure_persistent_agent(
-        self,
-        agent_name: str,
-        *,
-        description: str,
-        metadata: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Create/reuse the single durable worker record for a member agent."""
-
-        self._ensure_open()
-        task = super().ensure_teammate_async_task(
-            agent_name,
-            description=description,
-            metadata=dict(metadata or {}),
-        )
-        return self._task_state(task)
-
-    def launch_persistent_agent_loop(
-        self,
-        agent_name: str,
-        *,
-        runner: Callable[[str, str, Path], Any],
-    ) -> str:
-        self._ensure_open()
-        return super().launch_teammate_loop(agent_name, runner=runner)
-
-    def acquire_agent_run(self, agent_name: str, *, run_id: str) -> bool:
-        self._ensure_open()
-        return super().acquire_agent_run(agent_name, run_id=run_id)
-
-    def finish_agent_run(self, agent_name: str, *, run_id: str, idle: bool = True) -> bool:
-        return super().finish_agent_run(agent_name, run_id=run_id, idle=idle)
-
-    def request_agent_shutdown(self, agent_name: str) -> bool:
-        return super().request_agent_shutdown(agent_name)
-
     def launch(
         self,
         *,
@@ -199,7 +122,7 @@ class AsyncTaskManager(_AsyncTaskRuntime):
         summary_builder: Callable[[Any], str],
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Launch a generic background task in the manager's worker pool."""
+        """Launch a generic background task under the manager's concurrency limit."""
 
         self._ensure_open()
         return super().launch_async_task(
@@ -234,36 +157,9 @@ class AsyncTaskManager(_AsyncTaskRuntime):
             raise ValueError("后台 shell command 不能为空")
         working_dir = Path(cwd).expanduser().resolve()
 
-        def run_shell(_task: dict[str, Any], _output_dir: Path) -> dict[str, Any]:
-            completed = subprocess.run(
-                normalized_command,
-                shell=True,
-                cwd=working_dir,
-                text=True,
-                capture_output=True,
-                timeout=timeout_seconds,
-                check=False,
-            )
-            # Retain stderr and the return code rather than silently losing a
-            # failed command's useful diagnostics.  The task substrate owns
-            # output persistence and notification delivery for this payload.
-            return {
-                "stdout": completed.stdout,
-                "stderr": completed.stderr,
-                "returncode": completed.returncode,
-            }
-
-        return self.launch(
-            task_type="local_bash",
-            owner_agent_id=owner_agent_id,
-            owner_agent_name=owner_agent_name,
-            description=normalized_command,
-            runner=run_shell,
-            summary_builder=lambda result: (
-                "background shell completed"
-                if int(result.get("returncode", 1)) == 0
-                else f"background shell exited with {result.get('returncode')}"
-            ),
+        return super().launch_local_bash_async_task(
+            owner_agent_id=owner_agent_id, owner_agent_name=owner_agent_name,
+            command=normalized_command, cwd=str(working_dir), timeout_seconds=timeout_seconds,
             metadata=dict(metadata or {}),
         )
 
@@ -295,17 +191,18 @@ class AsyncTaskManager(_AsyncTaskRuntime):
             raise ValueError(f"async_task_id 不存在: {async_task_id}")
         return read_async_task_output(str(task.get("output_dir") or ""))
 
-    def cancel(self, async_task_id: str, *, reason: str = "agent_requested") -> dict[str, Any] | None:
+    def cancel(self, async_task_id: str, *, reason: str = "agent_requested",
+               wait_timeout_seconds: float = 1.0) -> dict[str, Any] | None:
         """Persist a task's terminal cancellation before returning control."""
 
         self._ensure_open()
-        stopped = super().stop_async_task(async_task_id, reason=reason)
+        stopped = super().stop_async_task(async_task_id, reason=reason, wait_timeout_seconds=wait_timeout_seconds)
         logger.info("async task cancellation requested: async_task_id=%s", async_task_id)
         return None if stopped is None else self.get_task(async_task_id)
 
-    def stop(self, *, reason: str = "manager_released") -> list[dict[str, Any]]:
+    def stop(self, *, reason: str = "manager_released", wait_timeout_seconds: float = 1.0) -> list[dict[str, Any]]:
         self._ensure_open()
-        super().stop_active_async_tasks(reason=reason)
+        super().stop_active_async_tasks(reason=reason, wait_timeout_seconds=wait_timeout_seconds)
         return self.list_tasks()
 
     def recover(self, *, reason: str = "stale_on_recovery") -> list[dict[str, Any]]:
@@ -320,54 +217,93 @@ class AsyncTaskManager(_AsyncTaskRuntime):
         self._ensure_open()
         closed: list[dict[str, Any]] = []
         with self._lock:
-            for task in self._async_tasks.values():
+            for task in list(self._async_tasks.values()):
                 if str(task.get("status") or "") not in {"pending", "running"}:
                     continue
                 close_async_task(task, status="killed", reason=reason)
-                self._store_async_task_locked(task)
+                self._prepare_notification_locked(
+                    task, status="killed",
+                    summary=f"后台任务已因恢复停止：{task.get('description') or task.get('async_task_id')}",
+                    extra_payload={"closed_reason": reason},
+                )
                 closed.append(copy.deepcopy(task))
             if closed:
                 self._persist_locked()
-        for task in closed:
-            self._emit_notification(
-                task,
-                status="killed",
-                summary=f"后台任务已因恢复停止：{task.get('description') or task.get('async_task_id')}",
-                extra_payload={"closed_reason": reason},
-            )
         replayed = self.requeue_pending_notifications()
         logger.info("async task manager recovered: closed=%d replayed=%d", len(closed), replayed)
         return [self._task_state(task) for task in closed]
 
-    def release(self, *, wait: bool = True, timeout_seconds: float = 5.0) -> bool:
+    def release(self, *, wait: bool = True, timeout_seconds: float | None = 5.0) -> bool:
         """Stop active work, flush state and release manager-owned workers."""
 
-        if self._released_manager:
-            return True
-        self.stop(reason="manager_released")
-        self._released_manager = True
+        if not self._released_manager:
+            self.stop(reason="manager_released")
+            self._released_manager = True
         drained = super().shutdown(wait=wait, timeout_seconds=timeout_seconds)
         logger.info("async task manager released: drained=%s", drained)
         return drained
 
     close = release
 
+    async def alaunch(self, **kwargs: Any) -> dict[str, Any]:
+        return await blocking(self.launch, **kwargs)
+
+    async def alaunch_shell(self, **kwargs: Any) -> dict[str, Any]:
+        return await blocking(self.launch_shell, **kwargs)
+
+    async def acancel(self, async_task_id: str, **kwargs: Any) -> dict[str, Any] | None:
+        await blocking(self.cancel, async_task_id, wait_timeout_seconds=0, **kwargs)
+        future = self._futures.get(async_task_id)
+        if future is not None:
+            await self._await_workers([future], None)
+        return self.get_task(async_task_id)
+
+    async def await_active(self, **kwargs: Any) -> list[dict[str, Any]]:
+        owner = kwargs.pop("owner_agent_id", None)
+        timeout = kwargs.pop("timeout_seconds", 30.0)
+        if kwargs:
+            raise TypeError(f"未知等待参数: {', '.join(kwargs)}")
+        with self._lock:
+            pending = [future for task_id, future in self._futures.items()
+                       if not future.done() and (owner is None or
+                           self._async_tasks[task_id].get("owner_agent_id") == owner)]
+        await self._await_workers(pending, timeout)
+        return self.public_active_async_tasks(owner_agent_id=owner)
+
+    async def aclose(self, *, wait: bool = True, timeout_seconds: float | None = 5.0) -> bool:
+        if not self._released_manager:
+            await blocking(self.stop, reason="manager_released", wait_timeout_seconds=0)
+            self._released_manager = True
+        with self._lock:
+            pending = [future for future in self._futures.values() if not future.done()]
+        drained = await self._await_workers(pending, timeout_seconds) if wait else not pending
+        self._shutdown_complete = drained
+        logger.info("async task manager released: drained=%s", drained)
+        return drained
+
+    @staticmethod
+    async def _await_workers(futures, timeout: float | None) -> bool:
+        """等待完成通知不占线程；重复取消也不会绕过已经开始的收尾。"""
+        if not futures:
+            return True
+        wrapped = [asyncio.wrap_future(future) for future in futures]
+        for future in wrapped:
+            future.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        waiter = asyncio.create_task(asyncio.wait(wrapped, timeout=timeout))
+        cancelled = False
+        while True:
+            try:
+                _, pending = await asyncio.shield(waiter)
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
+        return not pending
+
     def _ensure_open(self) -> None:
         if self._released_manager:
             raise RuntimeError("AsyncTaskManager 已释放")
-
-    @staticmethod
-    def _agent_state(raw: dict[str, Any]) -> dict[str, Any]:
-        metadata = dict(raw.get("metadata") or {})
-        return {
-            "agent_id": str(raw.get("agent_id") or ""),
-            "agent_name": str(raw.get("agent_name") or ""),
-            "role": str(metadata.get("role") or raw.get("agent_kind") or "member"),
-            "status": str(raw.get("status") or ""),
-            "current_async_task_id": str(raw.get("current_async_task_id") or ""),
-            "last_error": str(raw.get("last_error") or ""),
-            "metadata": metadata,
-        }
 
     @staticmethod
     def _task_state(raw: dict[str, Any]) -> dict[str, Any]:
@@ -387,6 +323,7 @@ class AsyncTaskManager(_AsyncTaskRuntime):
             "closed_reason": str(raw.get("closed_reason") or ""),
             "error": str(raw.get("error") or ""),
             "metadata": dict(raw.get("metadata") or {}),
+            "notification": copy.deepcopy(raw.get("notification")),
         }
 
 

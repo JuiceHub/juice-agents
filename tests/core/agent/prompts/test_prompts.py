@@ -131,6 +131,49 @@ class PromptTests(unittest.TestCase):
         self.assertIn('[{"name": "submit_output", "args": {"output": "..."}}]', DEFAULT_REACT_SYSTEM_PROMPT)
         self.assertNotIn('<name="submit_output"', DEFAULT_REACT_SYSTEM_PROMPT)
 
+    def test_rendered_react_prompt_defines_concurrent_step_contract(self):
+        """运行时渲染仍携带调度约定，且规则不依赖动态任务指令或工具名。"""
+
+        contracts = {
+            "en": (
+                "## Action Scheduling",
+                "Actions in the same step execute concurrently by default",
+                "list order does not express a dependency",
+                "Put dependent actions or conflicting operations in different steps",
+                "waits for all foreground actions to finish",
+                "Observations follow the original action order",
+            ),
+            "zh": (
+                "## Action 调度",
+                "同一 step 的 actions 默认并发执行",
+                "数组顺序不表示先后依赖",
+                "有依赖或操作冲突的动作必须拆到不同 step",
+                "等待本步全部前台 action 完成",
+                "observations 仍按原 action 顺序返回",
+            ),
+        }
+        for language, expected in contracts.items():
+            with self.subTest(language=language):
+                prompt = render_prompt_preview(
+                    agent_type="react",
+                    language=language,
+                    mode="rendered",
+                    with_tools=["shell"],
+                    instructions="Review two independent files, then edit their shared summary.",
+                )
+                for text in expected:
+                    self.assertIn(text, prompt)
+                self.assertNotIn("{{", prompt)
+                self.assertNotIn("parallel_safe", prompt)
+
+                # 调度属于 ReAct 的 action 数组协议，不能让共享段落暗示
+                # CodeAct 中普通 Python 函数调用也会被自动并发化。
+                codeact_prompt = render_prompt_preview(
+                    agent_type="codeact", language=language, mode="rendered"
+                )
+                self.assertNotIn(expected[0], codeact_prompt)
+                self.assertNotIn(expected[1], codeact_prompt)
+
     def test_codeact_prompt_contains_code_guidance(self):
         self.assertIn("<thought>", DEFAULT_CODEACT_SYSTEM_PROMPT)
         self.assertIn("<code>", DEFAULT_CODEACT_SYSTEM_PROMPT)

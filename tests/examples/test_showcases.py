@@ -1,7 +1,7 @@
 """Public-SDK contracts for the self-contained business Showcase packages.
 
 The user-facing packages never include an offline path.  These tests put
-fakes at the public Juice/Runner boundary instead, so no provider credential
+fakes at the public Runner boundary instead, so no provider credential
 or model response is needed to test command parsing and Runner lifecycle.
 """
 
@@ -35,6 +35,10 @@ class _FakeRunner:
         self.error = error
         self.tasks: list[str] = []
         self.stop_calls = 0
+        self.ask_handler = None
+
+    def set_ask_handler(self, handler) -> None:
+        self.ask_handler = handler
 
     def _root(self):
         """Expose the actual scoped-capability installer surface without models."""
@@ -46,19 +50,19 @@ class _FakeRunner:
         if self.error is not None:
             raise self.error
         yield {
-            "kind": "action_step",
+            "kind": "step_end",
             "agent_name": "manager",
             "step_num": 1,
-            "action_step": type("Step", (), {"model_output": "classified feedback"})(),
+            "data": {"step": {"model_output": "classified feedback"}},
         }
-        yield {"kind": "round_end", "outcome": "submitted", "output": "business result"}
+        yield {"kind": "round_end", "data": {"result": {"round_id": "r1", "status": "completed", "output": "business result"}}}
 
     def stop(self) -> None:
         self.stop_calls += 1
 
 
-class _FakeRunners:
-    """Public ``Juice.runners`` double preserving create/resume options."""
+class _RunnerFactory:
+    """Public ``Runner.create/resume`` double preserving workspace and options."""
 
     def __init__(self, runner: _FakeRunner) -> None:
         self.runner = runner
@@ -72,23 +76,6 @@ class _FakeRunners:
     def resume(self, **kwargs: Any) -> _FakeRunner:
         self.resume_calls.append(dict(kwargs))
         return self.runner
-
-
-class _FakeJuice:
-    """Workspace-bound SDK fake used at the public dependency boundary."""
-
-    def __init__(self, runner: _FakeRunner) -> None:
-        self.runners = _FakeRunners(runner)
-
-
-class _CapturingJuice:
-    """SDK constructor fake used to validate workspace and model forwarding."""
-
-    received_kwargs: dict[str, Any] | None = None
-
-    def __init__(self, **kwargs: Any) -> None:
-        type(self).received_kwargs = dict(kwargs)
-        self.runners = _FakeRunners(_FakeRunner())
 
 
 @dataclass(frozen=True)
@@ -131,22 +118,39 @@ SHOWCASES = (
 class ShowcaseRuntimeTests(unittest.TestCase):
     """Verify workspace binding and safe cleanup in the shared public runtime."""
 
-    def test_runtime_forwards_dedicated_workspace_and_model_selection(self):
+    def test_runtime_binds_workspace_and_interaction_after_create_and_resume(self):
+        """Runtime callbacks are rebound without replacing persisted permissions."""
+
         with tempfile.TemporaryDirectory() as tmp_dir:
             workspace = Path(tmp_dir)
-            args = argparse.Namespace(model="verified-model", model_effort="high")
-            _CapturingJuice.received_kwargs = None
+            runner = _FakeRunner()
+            factory = _RunnerFactory(runner)
+            args = argparse.Namespace(permission_mode="accept", agent_type="react", resume=None)
+            created = _runtime.create_or_resume_runner(
+                args, agent_mode="group", workspace=workspace, runner_cls=factory,
+            )
+            self.assertIs(created, runner)
+            self.assertIs(runner.ask_handler, _runtime.console_ask)
+            self.assertEqual(factory.create_calls, [{
+                "base_dir": workspace, "permission_mode": "accept", "runner_config": "group",
+            }])
 
-            _runtime._juice_from_args(args, workspace=workspace, juice_cls=_CapturingJuice)
-
-        self.assertEqual(
-            _CapturingJuice.received_kwargs,
-            {"workspace": workspace, "ask_handler": _runtime.console_ask},
-        )
+            # A recovered Runner has no durable UI callback. The shared runtime
+            # must install the current process's handler on this path as well.
+            runner.ask_handler = None
+            args.resume = "existing-runner"
+            restored = _runtime.create_or_resume_runner(
+                args, agent_mode="group", workspace=workspace, runner_cls=factory,
+            )
+            self.assertIs(restored, runner)
+            self.assertIs(runner.ask_handler, _runtime.console_ask)
+            self.assertEqual(factory.resume_calls, [{
+                "base_dir": workspace, "runner_id": "existing-runner",
+            }])
 
     def test_stream_error_still_stops_runner(self):
         runner = _FakeRunner(error=RuntimeError("model stream failed"))
-        juice = _FakeJuice(runner)
+        factory = _RunnerFactory(runner)
         args = argparse.Namespace(
             model=None,
             model_effort=None,
@@ -155,15 +159,15 @@ class ShowcaseRuntimeTests(unittest.TestCase):
             resume=None,
         )
 
-        with patch.object(_runtime, "_juice_from_args", return_value=juice):
-            with self.assertRaisesRegex(RuntimeError, "model stream failed"):
-                _runtime.run_showcase(
-                    args,
-                    agent_mode="group",
-                    workspace=Path.cwd(),
-                    task="process feedback",
-                    writer=lambda _line: None,
-                )
+        with self.assertRaisesRegex(RuntimeError, "model stream failed"):
+            _runtime.run_showcase(
+                args,
+                agent_mode="group",
+                workspace=Path.cwd(),
+                task="process feedback",
+                writer=lambda _line: None,
+                runner_cls=factory,
+            )
 
         self.assertEqual(runner.stop_calls, 1)
 
@@ -176,14 +180,8 @@ class ShowcaseEntryPointTests(unittest.TestCase):
             with self.subTest(module=showcase.module_name):
                 module = importlib.import_module(showcase.module_name)
                 runner = _FakeRunner()
-                juice = _FakeJuice(runner)
-                captured_workspaces: list[Path] = []
+                factory = _RunnerFactory(runner)
                 stdout = io.StringIO()
-
-                def _juice_from_args(_args, *, workspace, juice_cls=_runtime.Juice):
-                    del juice_cls
-                    captured_workspaces.append(workspace)
-                    return juice
 
                 argv = [
                     showcase.business_input,
@@ -196,21 +194,25 @@ class ShowcaseEntryPointTests(unittest.TestCase):
                     "--permission-mode",
                     "accept",
                 ]
-                with patch.object(_runtime, "_juice_from_args", side_effect=_juice_from_args), redirect_stdout(stdout):
+                with ExitStack() as patches:
+                    patches.enter_context(patch.object(_runtime.Runner, "create", side_effect=factory.create))
+                    patches.enter_context(patch.object(_runtime.Runner, "resume", side_effect=factory.resume))
+                    patches.enter_context(redirect_stdout(stdout))
                     result = module.main(argv)
 
                 expected_workspace = Path(module.__file__).resolve().parent
                 self.assertEqual(result, "business result")
-                self.assertEqual(captured_workspaces, [expected_workspace])
                 self.assertEqual(runner.tasks, [showcase.stream_task or showcase.business_input])
                 self.assertEqual(runner.stop_calls, 1)
                 self.assertIn("Runner ID: showcase-runner", stdout.getvalue())
-                self.assertIn("[action_step] manager", stdout.getvalue())
+                self.assertIn("[step_end] manager", stdout.getvalue())
                 self.assertIn("[round_end]", stdout.getvalue())
-                self.assertEqual(len(juice.runners.create_calls), 1)
-                self.assertEqual(juice.runners.resume_calls, [])
+                self.assertEqual(len(factory.create_calls), 1)
+                self.assertEqual(factory.resume_calls, [])
+                self.assertIs(runner.ask_handler, _runtime.console_ask)
 
-                create_call = juice.runners.create_calls[0]
+                create_call = factory.create_calls[0]
+                self.assertEqual(create_call["base_dir"], expected_workspace)
                 self.assertEqual(create_call["runner_config"], showcase.agent_mode)
                 self.assertEqual(create_call["permission_mode"], "accept")
                 self.assertNotIn("agent_type", create_call)
@@ -230,20 +232,24 @@ class ShowcaseEntryPointTests(unittest.TestCase):
             with self.subTest(module=showcase.module_name):
                 module = importlib.import_module(showcase.module_name)
                 runner = _FakeRunner(runner_id=f"{showcase.agent_mode}-resume")
-                juice = _FakeJuice(runner)
+                factory = _RunnerFactory(runner)
 
                 with ExitStack() as patches:
-                    patches.enter_context(patch.object(_runtime, "_juice_from_args", return_value=juice))
+                    patches.enter_context(patch.object(_runtime.Runner, "create", side_effect=factory.create))
+                    patches.enter_context(patch.object(_runtime.Runner, "resume", side_effect=factory.resume))
                     # Stream rendering is asserted in the create path above;
                     # capture it here so a normal test run stays concise.
                     with redirect_stdout(io.StringIO()):
                         module.main([showcase.business_input, "--resume", "existing-runner-001"])
 
-                self.assertEqual(juice.runners.create_calls, [])
-                self.assertEqual(len(juice.runners.resume_calls), 1)
-                resume_call = juice.runners.resume_calls[0]
+                self.assertEqual(factory.create_calls, [])
+                self.assertEqual(len(factory.resume_calls), 1)
+                resume_call = factory.resume_calls[0]
                 self.assertEqual(resume_call["runner_id"], "existing-runner-001")
-                self.assertEqual(resume_call, {"runner_id": "existing-runner-001"})
+                self.assertEqual(resume_call, {
+                    "runner_id": "existing-runner-001", "base_dir": Path(module.__file__).resolve().parent,
+                })
+                self.assertIs(runner.ask_handler, _runtime.console_ask)
                 if showcase.has_evolution_policy:
                     self.assertIn("Controlled ticket capability evolution", runner.root_config.instructions)
                 if showcase.module_name == "examples.agent_research.__main__":

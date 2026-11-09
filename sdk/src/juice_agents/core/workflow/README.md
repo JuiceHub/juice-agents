@@ -85,10 +85,9 @@ Architecture informed by [Open Deep Research](https://github.com/langchain-ai/op
 After saving the `counter` example above to `.juice/workflows/counter.py`, call it through the Runner’s `WorkflowRunManager`:
 
 ```python
-from juice_agents import Juice
+from juice_agents import Runner
 
-juice = Juice(workspace=".")
-runner = juice.runners.create(runner_config="agent")
+runner = Runner.create(base_dir=".", runner_config="agent")
 
 result = runner.workflow_manager.call("counter", {"value": 1})
 print(result["result"])  # {"result": 2}
@@ -118,7 +117,7 @@ def run(ctx: WorkflowContext, args: dict[str, Any]) -> dict[str, Any]:
 Artifacts land in `<runner_root>/workflows/<name>-<call_id>/`:
 
 ```text
-.juice/runners/<runner_id>/workflows/deep_research-a1b2c3/
+.juice/sessions/<runner_id>/workflows/deep_research-a1b2c3/
 ├── report.md
 ├── sources.json
 ├── claims.json
@@ -148,7 +147,9 @@ Inner agents:
 - Do not persist beyond the workflow call
 - Cannot spawn their own child agents
 - Inherit the workflow's cancellation signal
-- Are logged in the workflow's lifecycle events
+- Use the same Manager-owned execution lifecycle as root and child Agents
+- Publish no internal Agent/model/tool events and retain no session body
+- Return output only after a successful `RoundResult`; failure/cancellation raises its typed error
 
 ## Configuration
 
@@ -165,6 +166,15 @@ When `workflows.enabled=false`, agents cannot call workflows automatically, but 
 - Workflow files belong in workspace `.juice/workflows/*.py` or built-in `workflow/builtins/`. Local scripts cannot access shells, files, or networks directly; external actions go through `ctx.agent()`.
 - `WorkflowRunManager` owns execution and artifacts. Workflows call Runner-managed Agents through `ctx.agent()` and never create child Runners.
 - Root can manage workflows; ordinary child Agents cannot create or modify workflow scripts when `self_evolution.enabled=false`.
-- Workflows are synchronous function calls. For long-running workflows, use `AsyncTaskManager` to wrap the call (the `local_workflow` task type).
-- Cancellation propagates via `ctx.cancel_event`. Check periodically for cooperative shutdown.
+- Scripts may define `async def run(ctx, args)` with `await ctx.aagent/aparallel/apipeline/aartifact`. `WorkflowRunManager.acall()` awaits it directly; synchronous `run` and context APIs execute through a controlled blocking boundary. Long-running independent calls use AsyncTaskManager (`local_workflow`).
+- Cancellation propagates through a private token linked to the caller. `ctx.check_control()` checks cancellation and timeout. Parallel failure revokes queued work, stops sibling Agents, and waits for foreground cleanup before returning.
+- Progress includes `workflow_call_id`, caller Agent/round/step identity and a per-node `agent_call_id`. Aggregate by IDs, since names and phase labels may repeat across concurrent calls.
 - Deep Research accepts `source_mode` only. Snippets are not evidence; only `verified_claims` enter report prose. Tests belong in `tests/core/workflow/`.
+
+The built-in Deep Research script uses native async calls. The manager monitors
+caller cancellation and total timeout while the script waits, cancels the script
+and awaits inner-agent cleanup before reporting failure. Pure dedupe, voting and
+citation checks stay synchronous.
+
+Caller-token cancellation and total timeout surface as `WorkflowCancelledError`
+and `WorkflowTimeoutError`, independent of which inner task observes control first.

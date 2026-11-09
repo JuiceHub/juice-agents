@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import openai
@@ -20,6 +20,17 @@ from juice_agents.core.agent.context.steps import ActionStep
 from juice_agents.core.config import model_catalog
 from juice_agents.core.config.runtime_config import DEFAULT_RUNTIME_CONFIG_PATH
 from juice_agents.core.registry.agents import registry as registry_module
+
+
+class _ReviewStream:
+    def __init__(self, content: str) -> None:
+        self.content = content
+
+    async def __aiter__(self):
+        yield SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=self.content))], usage=None)
+
+    async def close(self) -> None:
+        pass
 
 
 @pytest.mark.parametrize("resume", [False, True])
@@ -42,16 +53,18 @@ def test_showcase_applies_strategy_before_stream(monkeypatch, capsys, resume: bo
         else:
             assert strategy.reward_model.model_name == "doubao_lite"
         assert task == "choose a design"
-        yield {"kind": "round_end", "outcome": "submitted", "output": "done"}
+        yield {"kind": "round_end", "data": {"result": {"round_id": "example", "status": "completed", "output": "done", "reason": "submitted", "error": None}}}
 
     runner = SimpleNamespace(
         runner_id="example-root", stream=stream, stop=Mock(),
         root_config=SimpleNamespace(model_config_name="doubao_lite"),
         runtime_config_path=DEFAULT_RUNTIME_CONFIG_PATH,
         _root=lambda: SimpleNamespace(instance=SimpleNamespace(set_exploration_strategy=set_strategy)),
+        set_ask_handler=Mock(),
     )
     runners = SimpleNamespace(create=Mock(return_value=runner), resume=Mock(return_value=runner))
-    monkeypatch.setattr(_runtime, "_juice_from_args", lambda *_args, **_kwargs: SimpleNamespace(runners=runners))
+    monkeypatch.setattr(_runtime.Runner, "create", runners.create)
+    monkeypatch.setattr(_runtime.Runner, "resume", runners.resume)
     argv = ["choose a design", "--strategy", "tot", "--breadth", "3"]
     if resume:
         argv.extend(["--resume", "old-runner"])
@@ -60,6 +73,7 @@ def test_showcase_applies_strategy_before_stream(monkeypatch, capsys, resume: bo
     runner.stop.assert_called_once()
     assert runners.resume.call_count == int(resume)
     assert runners.create.call_count == int(not resume)
+    runner.set_ask_handler.assert_called_once_with(_runtime.console_ask)
     output = capsys.readouterr().out
     assert "每步候选选择" in output
 
@@ -120,10 +134,12 @@ def test_default_demo_scores_real_runner_candidates_before_execution(monkeypatch
             return {"content": f"<thought>done</thought><actions>{json.dumps(actions)}</actions>"}
 
     class Judge:
-        def create(self, *, messages, **kwargs):
+        async def create(self, *, messages, **kwargs):
             # All three generations finish before the batched review request.
             assert len(generation_calls) == 3
             scoring_calls.append(json.loads(messages[1]["content"]))
+            if kwargs.get("stream"):
+                return _ReviewStream('{"scores": [1, 9, 2]}')
             return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{"scores": [1, 9, 2]}'))])
 
     generator, judge = Generator(), Judge()
@@ -136,7 +152,9 @@ def test_default_demo_scores_real_runner_candidates_before_execution(monkeypatch
     monkeypatch.setattr(model_catalog, "load_runtime_model_config", lambda **kwargs: model_catalog.RuntimeModelConfig(
         model_name=kwargs["model_name"], backend="openai", provider_model_name="provider-judge", api_key="test-key",
     ))
-    monkeypatch.setattr(openai, "OpenAI", lambda **kwargs: SimpleNamespace(chat=SimpleNamespace(completions=judge)))
+    monkeypatch.setattr(openai, "AsyncOpenAI", lambda **kwargs: SimpleNamespace(
+        chat=SimpleNamespace(completions=judge), close=AsyncMock(),
+    ))
     monkeypatch.setattr(example, "list_runtime_models", lambda **kwargs: [{"model_name": model_name}])
     assert example.main([]) == "answer-2"
     assert resolved_models == [model_name]
@@ -219,18 +237,23 @@ def test_tot_generation_and_reward_use_repository_credentials(monkeypatch, tmp_p
             actions = [{"name": "submit_output", "args": {"output": f"demo-{len(generation_calls)}"}}]
             return {"content": f"<thought>done</thought><actions>{json.dumps(actions)}</actions>"}
 
-    def create_review(*, messages, **kwargs):
+    async def create_review(*, messages, **kwargs):
         assert len(generation_calls) == 3
         review_calls.append(json.loads(messages[1]["content"]))
+        if kwargs.get("stream"):
+            return _ReviewStream('{"scores": [1, 8, 2]}')
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{"scores": [1, 8, 2]}'))])
 
-    def create_ark(**kwargs):
+    def create_async_ark(**kwargs):
         # 保留真实目录/.env解析，只替换最终SDK边界，避免评分请求访问网络。
         resolved_keys.append(kwargs["api_key"])
-        return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create_review)))
+        return SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create_review)),
+            close=AsyncMock(),
+        )
 
     monkeypatch.setattr(model_catalog, "ChatModel", Provider)
-    monkeypatch.setitem(sys.modules, "volcenginesdkarkruntime", SimpleNamespace(Ark=create_ark))
+    monkeypatch.setitem(sys.modules, "volcenginesdkarkruntime", SimpleNamespace(AsyncArk=create_async_ark))
     assert example.main([]) == "demo-2"
     assert resolved_keys == [credential, credential]
     assert len(generation_calls) == 3 and len(review_calls) == 1

@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from juice_agents.core.agent.manager import (
+from juice_agents.core.managers.agents import (
     AgentExecutionInterrupted,
     AgentLifecycle,
     AgentManager,
@@ -85,15 +85,15 @@ def test_root_is_lazily_acquired_fresh_and_restores_session(tmp_path: Path) -> N
     root = manager.acquire_root({"name": "root"})
     assert registry.instantiate_calls == [({"name": "root"}, {})]
     assert root.agent_id == "root"
-    assert root.status is AgentStatus.READY
-    assert manager.run(root, "first request") == "output:root"
+    assert root.status is AgentStatus.IDLE
+    assert manager.run(root, "first request").unwrap() == "output:root"
     manager.release(root)
 
     resumed = _manager(tmp_path, registry).acquire_root({"name": "root"})
     assert len(registry.instances) == 2  # resume never revives the released object
     assert resumed.instance is not registry.instances[0]
     assert [step.task for step in resumed.context.steps if isinstance(step, TaskStep)] == ["first request"]
-    assert resumed.status is AgentStatus.READY
+    assert resumed.status is AgentStatus.IDLE
 
 
 @pytest.mark.parametrize("entry", ["tree", "mapping", "snapshot"])
@@ -126,7 +126,7 @@ def test_restored_sessions_own_nested_outputs_and_metadata(tmp_path: Path, entry
         # Public inspection tooling accepts an existing snapshot without
         # constructing an Agent; it needs the same ownership guarantee.
         restored = manager.deserialize_snapshot({
-            "schema_version": 1, "agent_id": "root", "agent_name": "root",
+            "schema_version": 2, "agent_id": "root", "agent_name": "root",
             "lifecycle": "persistent", "status": "idle", "session": payload,
         })
     else:
@@ -162,7 +162,7 @@ def test_functional_agent_is_released_but_transcript_remains_inspectable(tmp_pat
         lifecycle=AgentLifecycle.FUNCTIONAL,
         role="worker",
     )
-    assert manager.run(worker, "do work", reset_session=True) == "output:worker"
+    assert manager.run(worker, "do work", reset_session=True).unwrap() == "output:worker"
 
     assert worker.instance is None
     assert worker.status is AgentStatus.RELEASED
@@ -187,7 +187,7 @@ def test_functional_root_still_uses_the_manager_lifecycle(tmp_path: Path) -> Non
     root = manager.acquire_root({"name": "root", "lifecycle": "functional"})
 
     assert root.lifecycle is AgentLifecycle.FUNCTIONAL
-    assert manager.run(root, "one request") == "output:root"
+    assert manager.run(root, "one request").unwrap() == "output:root"
     assert root.status is AgentStatus.RELEASED
     assert manager.load_snapshot("root")["lifecycle"] == "functional"  # type: ignore[index]
 
@@ -206,8 +206,8 @@ def test_persistent_agent_reuses_live_instance_and_checkpoints_each_step(tmp_pat
     first = manager.acquire({"name": "planner"}, lifecycle="persistent", role="member")
     second = manager.acquire({"name": "planner"}, lifecycle="persistent", role="member")
     assert first is second
-    assert manager.run(first, "one") == "output:planner"
-    assert manager.run(second, "two") == "output:planner"
+    assert manager.run(first, "one").unwrap() == "output:planner"
+    assert manager.run(second, "two").unwrap() == "output:planner"
 
     tasks = [step.task for step in first.context.steps if isinstance(step, TaskStep)]
     assert tasks == ["one", "two"]
@@ -228,13 +228,10 @@ def test_runtime_binder_attachment_callback_and_interrupt_share_manager_token(tm
     managed = manager.acquire({"name": "slow"}, lifecycle="persistent", role="teammate")
     assert bound == [("slow", managed.agent_id, "teammate")]
 
-    outcome: list[BaseException] = []
+    outcome = []
 
     def run() -> None:
-        try:
-            manager.run(managed, "wait")
-        except BaseException as exc:  # capture the worker's expected interruption
-            outcome.append(exc)
+        outcome.append(manager.run(managed, "wait"))
 
     thread = threading.Thread(target=run)
     thread.start()
@@ -244,11 +241,19 @@ def test_runtime_binder_attachment_callback_and_interrupt_share_manager_token(tm
 
     assert not thread.is_alive()
     assert len(outcome) == 1
-    assert isinstance(outcome[0], AgentExecutionInterrupted)
-    assert manager.load_snapshot(managed.agent_id)["status"] == "interrupted"  # type: ignore[index]
+    assert outcome[0].status == "cancelled"
+    assert outcome[0].reason == "user_cancelled"
+    snapshot = manager.load_snapshot(managed.agent_id)
+    assert snapshot["status"] == "idle"
+    assert snapshot["session"]["round_checkpoint"]["status"] == "cancelled"
 
 
 def test_manager_has_no_runner_or_static_config_dependency() -> None:
+    from juice_agents.core import managers
+
+    assert managers.AgentManager is AgentManager
+    assert managers.AgentManagerCallbacks is AgentManagerCallbacks
+    assert AgentManager.__module__ == "juice_agents.core.managers.agents.manager"
     source = Path(AgentManager.__module__.replace(".", "/") + ".py")
     # Inspect the installed source through the class file instead of assuming
     # pytest's cwd; this protects the architecture boundary in CI as well.

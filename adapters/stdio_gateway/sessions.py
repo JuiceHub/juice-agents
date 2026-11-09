@@ -62,7 +62,7 @@ def list_sessions(base_dir: str | Path) -> list[SessionSummary]:
         return []
 
     discovered: list[tuple[float, SessionSummary]] = []
-    for manifest_path in juice_dir.glob("runners/*/manifest.json"):
+    for manifest_path in juice_dir.glob("sessions/*/manifest.json"):
         try:
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:

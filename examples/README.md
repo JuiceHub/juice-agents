@@ -106,13 +106,13 @@ GRM again when resuming, and callers must reinject custom scorers.
 ## Development conventions
 
 ```text
-Default/explicit task → scenario system instruction → Juice(workspace=example) → Runner stream
+Default/explicit task → scenario system instruction → Runner.create/resume(base_dir=example) → stream
                                                                                └── workspace state and artifacts
 ```
 
 - Keep dynamic task data in the user prompt; workflow, boundaries, and acceptance criteria belong in the scenario system instruction.
 - Give each `__main__.py` a useful default task and retain both direct-file and module execution. Keep tasks bounded and independent of external input files unless supplied explicitly.
-- Use the public `Juice(...).runners.create/resume` API and the example's own directory as the workspace; do not add `--workspace`. Reuse shared arguments, event rendering, and Runner cleanup from `examples/_runtime.py`.
+- Use the public `Runner.create/resume(base_dir=...)` API and the example's own directory as the workspace; do not add `--workspace`. Bind `console_ask` with `runner.set_ask_handler(...)` on creation and recovery. Reuse shared arguments, event rendering, and Runner cleanup from `examples/_runtime.py`.
 - SDK `Runner.stream` does not parse gateway `$workflow` syntax. The research entry uses the existing `ManualCapability.install` to authorize `deep_research` explicitly without enabling automatic workflows.
 - Use real configured models; do not add mocks, fake artifacts, or silent fallbacks. Always release the Runner with `runner.stop()` on success and errors.
 - Add functional tests under `tests/examples/`, leave no generated test files behind, and update this README and the [project README](../README.md).

@@ -20,7 +20,7 @@ class GitignoreRulesTests(unittest.TestCase):
         for relative_path in (
             ".env",
             "config.ini",
-            ".juice/runners/example/manifest.json",
+            ".juice/sessions/example/manifest.json",
         ):
             with self.subTest(path=relative_path):
                 # --no-index 让断言不依赖文件是否存在或曾经被 Git 跟踪。

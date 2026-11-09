@@ -85,10 +85,9 @@ flowchart TD
 将上面的 `counter` 示例保存到 `.juice/workflows/counter.py` 后，可以通过 Runner 的 `WorkflowRunManager` 调用：
 
 ```python
-from juice_agents import Juice
+from juice_agents import Runner
 
-juice = Juice(workspace=".")
-runner = juice.runners.create(runner_config="agent")
+runner = Runner.create(base_dir=".", runner_config="agent")
 
 result = runner.workflow_manager.call("counter", {"value": 1})
 print(result["result"])  # {"result": 2}
@@ -118,7 +117,7 @@ def run(ctx: WorkflowContext, args: dict[str, Any]) -> dict[str, Any]:
 产物落在 `<runner_root>/workflows/<name>-<call_id>/`：
 
 ```text
-.juice/runners/<runner_id>/workflows/deep_research-a1b2c3/
+.juice/sessions/<runner_id>/workflows/deep_research-a1b2c3/
 ├── report.md
 ├── sources.json
 ├── claims.json
@@ -148,7 +147,9 @@ result = ctx.agent(
 - 不在 workflow 调用之外持久化
 - 不能生成自己的子 agent
 - 继承 workflow 的取消信号
-- 记录在 workflow 的生命周期事件中
+- 与 root/child 使用相同的 Manager 执行生命周期
+- 不公开内部 Agent/模型/工具事件，不保存会话正文
+- 仅成功的 `RoundResult` 返回输出；失败或取消抛出携带结果的类型异常
 
 ## 配置
 
@@ -165,6 +166,14 @@ workflows:
 - Workflow 文件只放在 workspace `.juice/workflows/*.py` 或内置 `workflow/builtins/`；本地脚本不直接访问 shell、文件和网络，外部动作交给 `ctx.agent()`。
 - `WorkflowRunManager` 是执行与产物的唯一所有者。Workflow 通过 `ctx.agent()` 调 Runner 管理的 Agent，不创建子 Runner。
 - root 可管理 workflow；`self_evolution.enabled=false` 时普通子 Agent 无法创建或修改 workflow 脚本。
-- Workflow 是同步函数调用。长时间运行的 workflow 使用 `AsyncTaskManager` 包装调用（`local_workflow` 任务类型）。
-- 取消通过 `ctx.cancel_event` 传播。定期检查以协作关闭。
+- 脚本支持 `async def run(ctx, args)`，使用 `await ctx.aagent/aparallel/apipeline/aartifact`。`WorkflowRunManager.acall()` 直接 await 脚本；同步 `run` 和上下文 API 通过受控阻塞边界执行。独立后台调用使用 AsyncTaskManager（`local_workflow`）。
+- 私有停止令牌关联调用方取消信号；`ctx.check_control()` 检查取消和超时。并行任务失败时撤销排队任务、停止其他内部 Agent，等待前台收尾后返回。
+- 进度携带 `workflow_call_id`、调用方 Agent/回合/步骤身份及节点 `agent_call_id`。并行调用按 ID 归并，名称和阶段标签允许重复。
 - Deep Research 只接受 `source_mode`；snippet 不能直接作为证据，仅 `verified_claims` 进入报告正文。测试放 `tests/core/workflow/`。
+
+内置 Deep Research 已使用原生异步调用。Manager 在脚本等待时持续监视调用方取消
+与总超时，取消脚本并等待内部 Agent 收尾后才报告失败。去重、投票、引用校验等
+纯计算继续保持同步。
+
+调用方令牌取消与总超时分别报告 `WorkflowCancelledError` 和 `WorkflowTimeoutError`，
+不受内部任务观察到控制信号的先后顺序影响。

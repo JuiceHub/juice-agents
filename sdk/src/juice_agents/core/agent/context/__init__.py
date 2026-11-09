@@ -45,6 +45,7 @@ from .serialization import (
     deserialize_context_tree,
     deserialize_exploration_path,
     serialize_context_node,
+    serialize_context_transcript,
     serialize_context_tree,
     serialize_exploration_path,
 )
@@ -64,6 +65,7 @@ __all__ = [
     "SummaryStep",
     "ActionEvent",
     # 序列化
+    "serialize_context_transcript",
     "serialize_context_tree",
     "deserialize_context_tree",
     "serialize_context_node",

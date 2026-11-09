@@ -33,17 +33,34 @@ class RuntimeModelCatalogTests(unittest.TestCase):
     def _write_env(self, body: str) -> None:
         self.env_path.write_text(textwrap.dedent(body).strip() + "\n", encoding="utf-8")
 
+    def test_default_doubao_lite_resolves_to_requested_provider_model(self):
+        from juice_agents.core.config.model_catalog import list_runtime_models, resolve_runtime_model
+
+        # 隔离用户和项目配置，验证内置目录实际传给模型客户端的名称。
+        with patch.dict(os.environ, {"HOME": str(self.base), "DOUBAO_API_KEY": "test-key"}), \
+             patch("juice_agents.core.config.model_catalog.ChatModel", _FakeChatModel):
+            models = list_runtime_models(workspace_dir=self.base)
+            model = resolve_runtime_model(model_name="doubao_lite", workspace_dir=self.base, _enable_cache=False)
+
+        lite = next(entry for entry in models if entry["model_name"] == "doubao_lite")
+        self.assertEqual(lite["provider_model_name"], "doubao-seed-2-1-lite-260915")
+        self.assertEqual(model.kwargs["backend"], "doubao")
+        self.assertEqual(model.kwargs["model_name"], "doubao-seed-2-1-lite-260915")
+
     def test_load_runtime_model_config_reads_yaml_and_env(self):
         from juice_agents.core.config.model_catalog import load_runtime_model_config
 
         self._write_catalog(
             """
-            models:
-              gpt4o_mini:
+            providers:
+              openai:
                 backend: openai
                 api_base: https://api.openai.com/v1
                 api_key_env: OPENAI_API_KEY
+            models:
+              gpt4o_mini:
                 provider_model_name: gpt-4o-mini
+                provider: openai
             """
         )
         self._write_env("OPENAI_API_KEY=test-openai-key")
@@ -67,13 +84,16 @@ class RuntimeModelCatalogTests(unittest.TestCase):
 
         self._write_catalog(
             """
-            models:
-              claude:
+            providers:
+              anthropic:
                 backend: anthropic
                 api_base: https://api.anthropic.com
                 api_base_env: TEST_ANTHROPIC_BASE_URL
                 api_key_env: TEST_ANTHROPIC_AUTH_TOKEN
+            models:
+              claude:
                 provider_model_name: claude-sonnet-4-6
+                provider: anthropic
             """
         )
         kwargs = dict(model_name="claude", runtime_config_path=self.catalog_path, dotenv_path=self.env_path)
@@ -102,22 +122,29 @@ class RuntimeModelCatalogTests(unittest.TestCase):
 
         self._write_catalog(
             """
-            models:
-              claude-opus-4-7:
+            providers:
+              anthropic:
                 backend: anthropic
                 api_base: https://api.anthropic.com
                 api_key_env: ANTHROPIC_AUTH_TOKEN
-                provider_model_name: claude-opus-4-7
-              doubao_seed:
+              doubao:
                 backend: doubao
                 api_base: https://ark.example.com/api/v3
                 api_key_env: DOUBAO_API_KEY
-                provider_model_name: doubao-seed-1-6
-              gpt4o_mini:
+              openai:
                 backend: openai
                 api_base: https://api.openai.com/v1
                 api_key_env: OPENAI_API_KEY
+            models:
+              claude-opus-4-7:
+                provider_model_name: claude-opus-4-7
+                provider: anthropic
+              doubao_seed:
+                provider_model_name: doubao-seed-1-6
+                provider: doubao
+              gpt4o_mini:
                 provider_model_name: gpt-4o-mini
+                provider: openai
             """
         )
 
@@ -128,6 +155,7 @@ class RuntimeModelCatalogTests(unittest.TestCase):
             [
                 {
                     "model_name": "claude-opus-4-7",
+                    "provider": "anthropic",
                     "backend": "anthropic",
                     "api_base": "https://api.anthropic.com",
                     "api_key_env": "ANTHROPIC_AUTH_TOKEN",
@@ -138,6 +166,7 @@ class RuntimeModelCatalogTests(unittest.TestCase):
                 },
                 {
                     "model_name": "doubao_seed",
+                    "provider": "doubao",
                     "backend": "doubao",
                     "api_base": "https://ark.example.com/api/v3",
                     "api_key_env": "DOUBAO_API_KEY",
@@ -148,6 +177,7 @@ class RuntimeModelCatalogTests(unittest.TestCase):
                 },
                 {
                     "model_name": "gpt4o_mini",
+                    "provider": "openai",
                     "backend": "openai",
                     "api_base": "https://api.openai.com/v1",
                     "api_key_env": "OPENAI_API_KEY",
@@ -164,37 +194,30 @@ class RuntimeModelCatalogTests(unittest.TestCase):
 
         self._write_catalog(
             """
+            providers:
+              anthropic:
+                backend: anthropic
+                api_base: https://api.anthropic.com
+                api_key_env: ANTHROPIC_AUTH_TOKEN
             models:
               claude-opus-5-5:
-                backend: anthropic
-                api_base: https://api.anthropic.com
-                api_key_env: ANTHROPIC_AUTH_TOKEN
                 provider_model_name: claude-opus-5-5
+                provider: anthropic
               claude-sonnet-5-5:
-                backend: anthropic
-                api_base: https://api.anthropic.com
-                api_key_env: ANTHROPIC_AUTH_TOKEN
                 provider_model_name: claude-sonnet-5-5
+                provider: anthropic
               claude-opus-4-8:
-                backend: anthropic
-                api_base: https://api.anthropic.com
-                api_key_env: ANTHROPIC_AUTH_TOKEN
                 provider_model_name: claude-opus-4-8
+                provider: anthropic
               claude-opus-4-7:
-                backend: anthropic
-                api_base: https://api.anthropic.com
-                api_key_env: ANTHROPIC_AUTH_TOKEN
                 provider_model_name: claude-opus-4-7
+                provider: anthropic
               claude-sonnet-4-6:
-                backend: anthropic
-                api_base: https://api.anthropic.com
-                api_key_env: ANTHROPIC_AUTH_TOKEN
                 provider_model_name: claude-sonnet-4-6
+                provider: anthropic
               claude-haiku-4-5-20251001:
-                backend: anthropic
-                api_base: https://api.anthropic.com
-                api_key_env: ANTHROPIC_AUTH_TOKEN
                 provider_model_name: claude-haiku-4-5-20251001
+                provider: anthropic
             """
         )
 
@@ -246,15 +269,20 @@ class RuntimeModelCatalogTests(unittest.TestCase):
 
         self._write_catalog(
             """
-            models:
-              custom_claude:
+            providers:
+              anthropic:
                 backend: anthropic
                 api_base: https://api.anthropic.com
                 api_key_env: ANTHROPIC_AUTH_TOKEN
+            models:
+              custom_claude:
                 provider_model_name: claude-custom
-                supported_efforts: [low, high]
+                supported_efforts:
+                - low
+                - high
                 thinking_mode: manual
                 supports_budget_tokens: true
+                provider: anthropic
             """
         )
 
@@ -269,12 +297,15 @@ class RuntimeModelCatalogTests(unittest.TestCase):
 
         self._write_catalog(
             """
-            models:
-              claude-sonnet-4-6:
+            providers:
+              anthropic:
                 backend: anthropic
                 api_base: https://api.anthropic.com
                 api_key_env: ANTHROPIC_AUTH_TOKEN
+            models:
+              claude-sonnet-4-6:
                 provider_model_name: claude-sonnet-4-6
+                provider: anthropic
             """
         )
 
@@ -290,17 +321,22 @@ class RuntimeModelCatalogTests(unittest.TestCase):
 
         self._write_catalog(
             """
-            models:
-              doubao_seed:
+            providers:
+              doubao:
                 backend: doubao
                 api_base: https://ark.example.com/api/v3
                 api_key_env: DOUBAO_API_KEY
-                provider_model_name: doubao-seed-1-6
-              gpt4o_mini:
+              openai:
                 backend: openai
                 api_base: https://api.openai.com/v1
                 api_key_env: OPENAI_API_KEY
+            models:
+              doubao_seed:
+                provider_model_name: doubao-seed-1-6
+                provider: doubao
+              gpt4o_mini:
                 provider_model_name: gpt-4o-mini
+                provider: openai
             """
         )
         self._write_env(
@@ -336,12 +372,15 @@ class RuntimeModelCatalogTests(unittest.TestCase):
 
         self._write_catalog(
             """
-            models:
-              claude-opus-4-7:
+            providers:
+              anthropic:
                 backend: anthropic
                 api_base: https://api.anthropic.com
                 api_key_env: ANTHROPIC_AUTH_TOKEN
+            models:
+              claude-opus-4-7:
                 provider_model_name: claude-opus-4-7
+                provider: anthropic
             """
         )
         self._write_env("ANTHROPIC_AUTH_TOKEN=test-anthropic-token")
@@ -366,22 +405,21 @@ class RuntimeModelCatalogTests(unittest.TestCase):
 
         self._write_catalog(
             """
+            providers:
+              anthropic:
+                backend: anthropic
+                api_base: https://api.anthropic.com
+                api_key_env: ANTHROPIC_AUTH_TOKEN
             models:
               claude-opus-4-7:
-                backend: anthropic
-                api_base: https://api.anthropic.com
-                api_key_env: ANTHROPIC_AUTH_TOKEN
                 provider_model_name: claude-opus-4-7
+                provider: anthropic
               claude-sonnet-4-6:
-                backend: anthropic
-                api_base: https://api.anthropic.com
-                api_key_env: ANTHROPIC_AUTH_TOKEN
                 provider_model_name: claude-sonnet-4-6
+                provider: anthropic
               claude-haiku-4-5-20251001:
-                backend: anthropic
-                api_base: https://api.anthropic.com
-                api_key_env: ANTHROPIC_AUTH_TOKEN
                 provider_model_name: claude-haiku-4-5-20251001
+                provider: anthropic
             """
         )
 
@@ -398,12 +436,15 @@ class RuntimeModelCatalogTests(unittest.TestCase):
 
         self._write_catalog(
             """
-            models:
-              doubao_seed:
+            providers:
+              doubao:
                 backend: doubao
                 api_base: https://ark.example.com/api/v3
                 api_key_env: DOUBAO_API_KEY
+            models:
+              doubao_seed:
                 provider_model_name: doubao-seed-1-6
+                provider: doubao
             """
         )
         self._write_env("DOUBAO_API_KEY=test-doubao-key")
@@ -424,12 +465,15 @@ class RuntimeModelCatalogTests(unittest.TestCase):
 
         self._write_catalog(
             """
-            models:
-              doubao_seed:
+            providers:
+              doubao:
                 backend: doubao
                 api_base: https://ark.example.com/api/v3
                 api_key_env: DOUBAO_API_KEY
+            models:
+              doubao_seed:
                 provider_model_name: doubao-seed-1-6
+                provider: doubao
             """
         )
         self._write_env("DOUBAO_API_KEY=test-doubao-key")
@@ -461,11 +505,14 @@ class RuntimeModelCatalogTests(unittest.TestCase):
 
         self._write_catalog(
             """
-            models:
-              gpt4o_mini:
+            providers:
+              openai:
                 backend: openai
                 api_base: https://api.openai.com/v1
                 api_key_env: OPENAI_API_KEY
+            models:
+              gpt4o_mini:
+                provider: openai
             """
         )
 
@@ -481,12 +528,15 @@ class RuntimeModelCatalogTests(unittest.TestCase):
 
         self._write_catalog(
             """
-            models:
-              gpt4o_mini:
+            providers:
+              openai:
                 backend: openai
                 api_base: https://api.openai.com/v1
                 api_key_env: OPENAI_API_KEY
+            models:
+              gpt4o_mini:
                 provider_model_name: gpt-4o-mini
+                provider: openai
             """
         )
         os.environ.pop("OPENAI_API_KEY", None)
@@ -535,12 +585,15 @@ class RuntimeModelCatalogTests(unittest.TestCase):
 
         self._write_catalog(
             """
-            models:
-              claude_opus:
+            providers:
+              anthropic:
                 backend: anthropic
                 api_base: https://api.anthropic.com
                 api_key_env: ANTHROPIC_API_KEY
+            models:
+              claude_opus:
                 provider_model_name: claude-opus-4-7
+                provider: anthropic
             """
         )
         self._write_env("ANTHROPIC_API_KEY=test-key")
@@ -564,12 +617,15 @@ class RuntimeModelCatalogTests(unittest.TestCase):
 
         self._write_catalog(
             """
-            models:
-              judge:
+            providers:
+              openai:
                 backend: openai
                 api_base: https://example.test/v1
                 api_key_env: TEST_CATALOG_CACHE_API_KEY
+            models:
+              judge:
                 provider_model_name: provider-judge
+                provider: openai
             """
         )
         self._write_env("TEST_CATALOG_CACHE_API_KEY=test-key")

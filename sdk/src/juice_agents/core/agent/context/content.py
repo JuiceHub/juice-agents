@@ -83,7 +83,7 @@ def truncate_text(text: str, max_length: int | None) -> str:
 
 
 def encode_image(image: ImageType) -> str:
-    """将图片对象转为可传入 image_url 的字符串（网络 URL 或本地路径）。"""
+    """将图片对象转为上下文中的网络 URL 或本地路径，API 编码由模型层负责。"""
     if image is None:
         return ""
     if isinstance(image, ObservationImage):
@@ -135,16 +135,19 @@ def image_block(image: ImageType) -> dict[str, Any]:
     if not image_url:
         logger.warning("图片内容为空，image_url 为空，消息可能被拒绝")
 
-    # 火山方舟/Ark 多模态消息协议：不应在 image block 上额外携带自定义字段
+    # 上下文保留轻量的图片引用，模型层在请求出站时将本地路径转成 data URL。
+    # 火山方舟/Ark 多模态消息协议不应额外携带自定义字段。
     return {"type": "image_url", "image_url": {"url": image_url}}
 
 
 def attachments_content_blocks(attachments: list[RuntimeAttachment] | None) -> list[dict[str, Any]]:
     """将 runtime attachments 序列化为可拼接到同一条 user content 的文本块。"""
     serialized = serialize_runtime_attachments_text(attachments)
-    if not serialized:
-        return []
-    return [text_block(serialized)]
+    blocks = [text_block(serialized)] if serialized else []
+    for attachment in attachments or []:
+        for image in dict(attachment.get("payload") or {}).get("task_images") or []:
+            blocks.append(image_block(image))
+    return blocks
 
 
 def message_content_to_transcript_parts(content: Any) -> list[str]:

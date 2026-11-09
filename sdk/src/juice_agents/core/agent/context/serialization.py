@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-import re
 from typing import Any
 
 from ..agent_type import ObservationImage
@@ -11,17 +9,6 @@ from .errors import AgentError
 from .nodes import ContextNode, ExplorationPath, NodeStatus
 from .steps import ActionStep, SummaryStep, TaskStep
 from .tree import ContextTree
-
-try:  # json_repair is optional, but useful for old non-strict action payloads.
-    from json_repair import repair_json
-except Exception:  # pragma: no cover - optional dependency guard
-    repair_json = None
-
-_MODEL_OUTPUT_BLOCK_RE = re.compile(
-    r"<(?P<tag>[A-Za-z_][\w:-]*)>\s*(?P<body>.*?)\s*</(?P=tag)>",
-    re.DOTALL,
-)
-
 
 def _serialize_image(value: Any) -> dict[str, Any]:
     if isinstance(value, ObservationImage):
@@ -46,66 +33,13 @@ def _deserialize_image(payload: dict[str, Any]) -> Any:
         return image_url
 
 
-def _extract_model_output_block(model_output: Any, tag: str) -> str:
-    text = "" if model_output is None else str(model_output)
-    if not text.strip():
-        return ""
-    matches = [
-        str(match.group("body") or "").strip()
-        for match in _MODEL_OUTPUT_BLOCK_RE.finditer(text)
-        if str(match.group("tag") or "").strip() == tag
-    ]
-    return matches[-1] if matches else ""
-
-
-def _load_legacy_actions(model_output: Any) -> list[dict[str, Any]]:
-    raw_actions = _extract_model_output_block(model_output, "actions")
-    if not raw_actions:
-        return []
-    candidates = [raw_actions]
-    if repair_json is not None:
-        try:
-            repaired = repair_json(raw_actions)
-            candidates.append(repaired)
-        except Exception:
-            pass
-    parsed: Any = None
-    for candidate in candidates:
-        try:
-            parsed = json.loads(candidate)
-            break
-        except Exception:
-            continue
-    if not isinstance(parsed, list):
-        return []
-    tool_calls: list[dict[str, Any]] = []
-    for item in parsed:
-        if not isinstance(item, dict):
-            continue
-        name = str(item.get("name") or "").strip()
-        args = item.get("args")
-        if not name or name == "submit_output" or not isinstance(args, dict):
-            continue
-        tool_calls.append(
-            {
-                "name": name,
-                "args": dict(args),
-                "mode": "serial",
-                "execution_mode": "serial",
-                "status": "unknown",
-                "observation_index": None,
-                "is_terminal": False,
-            }
-        )
-    return tool_calls
-
-
 def _serialize_step(step: Any) -> dict[str, Any]:
     """序列化单个 step"""
     if isinstance(step, TaskStep):
         return {
             "type": "task",
             "task": step.task,
+            "round_id": step.round_id,
             "task_images": [_serialize_image(item) for item in list(step.task_images or [])],
             "attachments": [dict(item) for item in list(step.attachments or [])],
         }
@@ -113,6 +47,8 @@ def _serialize_step(step: Any) -> dict[str, Any]:
         return {
             "type": "action",
             "step_num": int(step.step_num),
+            "round_id": step.round_id,
+            "step_id": step.step_id,
             "model_output": step.model_output,
             "thought": step.thought,
             "tool_calls": [dict(item) for item in list(step.tool_calls or []) if isinstance(item, dict)],
@@ -141,6 +77,7 @@ def _deserialize_step(raw: dict[str, Any]) -> Any:
     if step_type == "task":
         return TaskStep(
             task=str(raw.get("task") or ""),
+            round_id=str(raw.get("round_id") or ""),
             task_images=[
                 _deserialize_image(dict(item))
                 for item in list(raw.get("task_images") or [])
@@ -152,17 +89,13 @@ def _deserialize_step(raw: dict[str, Any]) -> Any:
     elif step_type == "action":
         error_text = str(raw.get("error") or "").strip()
         model_output = str(raw.get("model_output") or "")
-        legacy_blocks = dict(raw.get("model_output_blocks") or {}) if isinstance(raw.get("model_output_blocks"), dict) else {}
-        thought = str(raw.get("thought") or legacy_blocks.get("thought") or _extract_model_output_block(model_output, "thought") or "")
-        code_action = str(raw.get("code_action") or legacy_blocks.get("code") or _extract_model_output_block(model_output, "code") or "")
-        raw_tool_calls = raw.get("tool_calls")
-        tool_calls = (
-            [dict(item) for item in raw_tool_calls if isinstance(item, dict)]
-            if isinstance(raw_tool_calls, list)
-            else _load_legacy_actions(model_output)
-        )
+        thought = str(raw.get("thought") or "")
+        code_action = str(raw.get("code_action") or "")
+        tool_calls = [dict(item) for item in raw.get("tool_calls", []) if isinstance(item, dict)]
         return ActionStep(
             step_num=int(raw.get("step_num") or 0),
+            round_id=str(raw.get("round_id") or ""),
+            step_id=str(raw.get("step_id") or ""),
             model_output=model_output,
             thought=thought,
             tool_calls=tool_calls,
@@ -179,12 +112,7 @@ def _deserialize_step(raw: dict[str, Any]) -> Any:
             observation_limits=list(raw.get("observation_limits") or []),
             request_bytes=int(raw.get("request_bytes") or 0),
             usage=dict(raw.get("usage")) if isinstance(raw.get("usage"), dict) else None,
-            # 已移除的 "yielded"（旧空 actions 语义）按 continue 读取，保证旧 session 可恢复。
-            round_outcome=(
-                "continue"
-                if str(raw.get("round_outcome") or "continue") == "yielded"
-                else str(raw.get("round_outcome") or "continue")
-            ),
+            round_outcome=str(raw.get("round_outcome") or "continue"),
             output=raw.get("output"),
         )
 
@@ -252,10 +180,26 @@ def deserialize_exploration_path(data: dict[str, Any]) -> ExplorationPath:
     )
 
 
+def serialize_context_transcript(tree: ContextTree) -> list[dict[str, Any]]:
+    """导出当前选中分支的完整对话，供历史显示与会话标题共用。
+
+    ``to_linear_steps()`` 服务于模型上下文，会在压缩摘要处裁掉旧步骤；
+    历史查看则需要保留这些祖先节点。沿选中叶子的父链读取，既保留压缩前
+    的对话，也不会把其它候选分支中未执行的回答混入历史。该操作只读。
+    """
+
+    if tree.active_leaf_ids:
+        node_ids = tree.get_path_to_node(tree.active_leaf_ids[0])
+    else:
+        path = tree.get_best_path()
+        node_ids = path.node_ids if path else ([tree.root_id] if tree.root_id else [])
+    return [_serialize_step(tree.nodes[node_id].step) for node_id in node_ids]
+
+
 def serialize_context_tree(tree: ContextTree) -> dict[str, Any]:
     """序列化 ContextTree"""
     return {
-        "version": "2.0",  # 新版本格式
+        "version": "3.0",
         "tree_id": tree.tree_id,
         "system_prompt": tree.system_prompt,
         "system_prompt_static": tree.system_prompt_static,
@@ -277,11 +221,11 @@ def serialize_context_tree(tree: ContextTree) -> dict[str, Any]:
 
 def deserialize_context_tree(payload: dict[str, Any]) -> ContextTree:
     """反序列化 ContextTree"""
-    version = payload.get("version", "2.0")
+    version = payload.get("version")
 
     # 只支持新版本格式
-    if version != "2.0":
-        raise ValueError(f"不支持的序列化版本: {version}，请升级到 2.0")
+    if version != "3.0":
+        raise ValueError(f"不支持的序列化版本: {version}；旧会话保留在磁盘，请新建会话（当前格式 3.0）")
 
     # 新版本直接反序列化
     tree = ContextTree(
@@ -314,6 +258,7 @@ def deserialize_context_tree(payload: dict[str, Any]) -> ContextTree:
 
 
 __all__ = [
+    "serialize_context_transcript",
     "serialize_context_tree",
     "deserialize_context_tree",
     "serialize_context_node",

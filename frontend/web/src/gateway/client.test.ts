@@ -317,12 +317,12 @@ test("streamMessage routes envelopes only to their matching request", async () =
   (client as any).handleMessage(JSON.stringify({
     id: "unknown",
     type: "stream_step",
-    payload: { kind: "action_step" },
+    payload: { kind: "step_end" },
   }));
   (client as any).handleMessage(JSON.stringify({
     id: "1",
     type: "stream_step",
-    payload: { kind: "action_step" },
+    payload: { kind: "step_end" },
   }));
   (client as any).handleMessage(JSON.stringify({
     id: "1",
@@ -346,7 +346,7 @@ test("empty-id stream events use ambient handler", () => {
   (client as any).handleMessage(JSON.stringify({
     id: "",
     type: "stream_step",
-    payload: { kind: "action_step" },
+    payload: { kind: "step_end" },
   }));
   assert.equal(received.length, 1);
 });

@@ -131,6 +131,10 @@ class WorkflowBuildContext:
     artifacts_dir: Path | None = None
     agent_dispatcher: WorkflowAgentDispatcher | None = None
     owner_agent_name: str = ""
+    owner_agent_id: str = ""
+    workflow_call_id: str = ""
+    round_id: str | None = None
+    step_num: int | None = None
     cancel_event: threading.Event = field(default_factory=threading.Event)
 
 

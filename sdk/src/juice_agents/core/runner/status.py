@@ -44,25 +44,5 @@ def settle_status(
     state["active_round"] = dict(active_round) if isinstance(active_round, dict) else None
 
 
-def settle_async_pending_status(
-    state: RunnerState,
-    *,
-    has_async: bool,
-    waiting_reason: str = "async_pending",
-    idle_reason: str = "round_ended",
-) -> None:
-    """按是否存在未完成后台工作，在 `waiting` 与 `idle` 之间收敛。
 
-    reason 刻意保留为参数：resume 用 `pending_notification`、回合结束用
-    `round_ended`、模式切换用 `reconfigured`，这些措辞是对外可见的审计信息，
-    不能为了"统一"而抹平。
-    """
-
-    settle_status(
-        state,
-        status="waiting" if has_async else "idle",
-        reason=waiting_reason if has_async else idle_reason,
-    )
-
-
-__all__ = ["settle_async_pending_status", "settle_status"]
+__all__ = ["settle_status"]

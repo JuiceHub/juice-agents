@@ -10,19 +10,23 @@ request host.
 from __future__ import annotations
 
 from dataclasses import replace
+from contextlib import aclosing
 import json
 import logging
 from pathlib import Path
 import threading
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from juice_agents.core.agent.tools.runtime.base_tools import Tool
 from juice_agents.core.agent.tools.runtime.executor import (
     ResolvedToolAction,
     ToolExecutionContext,
+    ToolExecutionEvent,
     ToolExecutionResult,
     _ToolExecutionEngine,
 )
+
+from juice_agents.core.runner.execution.async_io import blocking
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +177,21 @@ class ToolManager:
             raise RuntimeError("当前 Agent 未绑定 ToolManager")
         return child.execute_action(action, order=order, context=context)
 
+    def execute_streaming_for_agent(
+        self,
+        *,
+        agent_id: str,
+        actions: Sequence[ResolvedToolAction | Mapping[str, Any] | Tool],
+        context: ToolExecutionContext,
+    ) -> Iterator[ToolExecutionEvent]:
+        """Stream the same manager-owned batch used by non-streaming callers."""
+
+        with self._lock:
+            child = self._agent_managers.get(str(agent_id or "").strip())
+        if child is None:
+            raise RuntimeError("当前 Agent 未绑定 ToolManager")
+        return child.execute_streaming(actions, context=context)
+
     def release_agent(self, agent_id: str) -> None:
         """Release one per-agent executor without affecting other Agents."""
 
@@ -205,11 +224,29 @@ class ToolManager:
         *,
         context: ToolExecutionContext | None = None,
     ) -> list[ToolExecutionResult]:
-        """Execute actions and atomically publish their audit projection.
+        """Execute a batch and return terminal records in action order."""
 
-        Underlying calls may run concurrently, but records are persisted only
-        after the batch has reached a stable ordered result.  This gives
-        recovery consumers a simple invariant: every stored call is terminal.
+        records = [
+            event.result
+            for event in self.execute_streaming(actions, context=context)
+            if event.result is not None
+        ]
+        return sorted(records, key=lambda item: item.order)
+
+    def execute_streaming(
+        self,
+        actions: Sequence[ResolvedToolAction | Mapping[str, Any] | Tool]
+        | ResolvedToolAction
+        | Mapping[str, Any]
+        | Tool,
+        *,
+        context: ToolExecutionContext | None = None,
+    ) -> Iterator[ToolExecutionEvent]:
+        """Stream scheduling events, then persist terminal calls exactly once.
+
+        Guard and scheduling code runs on this request thread. Closing the
+        stream drains already submitted workers before publishing their audit,
+        so interrupted consumers cannot leave invisible calls behind.
         """
 
         with self._lock:
@@ -219,12 +256,13 @@ class ToolManager:
         # model-facing adapter could accidentally retain a context that was
         # created before the RunnerConfig policy was composed.
         effective_context = self._context_with_policy(context)
-        records = self._executor.execute(
+        # The finalizer receives this batch only, including calls drained on
+        # early iterator close. Avoid rescanning all historical audit records.
+        yield from self._executor.execute_streaming(
             self._bind_actions_to_context(actions, effective_context),
             context=effective_context,
+            on_complete=self._persist_records,
         )
-        self._persist_records(records)
-        return records
 
     run = execute
     execute_actions = execute
@@ -260,12 +298,63 @@ class ToolManager:
             self._released = True
             children = list(self._agent_managers.values())
             self._agent_managers.clear()
-            self._executor.close(wait=wait)
+        # 工具的收尾可能回调 Manager；等待线程池时不能持有它需要的锁。
+        self._executor.close(wait=wait)
         for child in children:
             child.release(wait=wait)
         logger.info("tool manager released")
 
     close = release
+
+    async def aexecute(self, actions: Any, **kwargs: Any) -> list[ToolExecutionResult]:
+        results = []
+        async with aclosing(self.aexecute_streaming(actions, **kwargs)) as events:
+            async for event in events:
+                if event.result is not None:
+                    results.append(event.result)
+        return sorted(results, key=lambda item: item.order)
+
+    async def aexecute_for_agent(self, *, agent_id: str, actions: Any, **kwargs: Any) -> list[ToolExecutionResult]:
+        child = self._agent_runtime(agent_id)
+        return await child.aexecute(actions, **kwargs)
+
+    def _agent_runtime(self, agent_id: str) -> "ToolManager":
+        with self._lock:
+            child = self._agent_managers.get(agent_id)
+        if child is None:
+            raise RuntimeError("当前 Agent 未绑定 ToolManager")
+        return child
+
+    async def arun_code_for_agent(self, agent_id: str, execute: Callable, code: str) -> Any:
+        child = self._agent_runtime(agent_id)
+        return await blocking(execute, code, executor=child._executor._affinity_pool,
+                              on_cancel=child.cancel)
+
+    async def aexecute_streaming_for_agent(self, *, agent_id: str, actions: Any, **kwargs: Any):
+        child = self._agent_runtime(agent_id)
+        async with aclosing(child.aexecute_streaming(actions, **kwargs)) as events:
+            async for event in events:
+                yield event
+
+    async def aexecute_streaming(self, actions: Any, **kwargs: Any):
+        with self._lock:
+            self._ensure_open()
+        effective_context = self._context_with_policy(kwargs.pop("context", None))
+        async with aclosing(self._executor.aexecute_streaming(
+            self._bind_actions_to_context(actions, effective_context),
+            context=effective_context, on_complete=self._persist_records, **kwargs,
+        )) as events:
+            try:
+                async for event in events:
+                    yield event
+            except BaseException:
+                # 先发协作信号，再由引擎 finally 等工具真实收尾。
+                if effective_context is not None and effective_context.cancel_event is not None:
+                    effective_context.cancel_event.set()
+                raise
+
+    async def aclose(self, *, wait: bool = True) -> None:
+        await blocking(self.release, wait=wait)
 
     def __enter__(self) -> "ToolManager":
         return self

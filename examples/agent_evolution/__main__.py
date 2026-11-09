@@ -84,7 +84,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None):
-    """Run a real evolution work order through public ``Juice.runners`` APIs."""
+    """Run a real evolution work order through the public ``Runner`` API."""
 
     args = build_parser().parse_args(argv)
     workspace = showcase_workspace(__file__)

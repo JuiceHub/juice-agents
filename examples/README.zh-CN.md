@@ -93,13 +93,13 @@ python examples/agent_tot/__main__.py --strategy greedy
 ## 开发约定
 
 ```text
-默认/自定义任务 → 场景系统指令 → Juice(workspace=示例目录) → Runner stream
+默认/自定义任务 → 场景系统指令 → Runner.create/resume(base_dir=示例目录) → stream
                                                            └── 工作区状态与产物
 ```
 
 - 用户提示词只存放动态任务数据；流程、边界和验收标准写入场景系统指令。
 - 每个 `__main__.py` 提供有用的默认任务，保留直接运行和模块运行。默认任务控制规模，无需用户事先准备外部输入文件。
-- 使用公开的 `Juice(...).runners.create/resume` API，以自身目录作为 workspace，不增加 `--workspace`。通用参数、事件展示和 Runner 清理复用 `examples/_runtime.py`。
+- 使用公开的 `Runner.create/resume(base_dir=...)` API，以自身目录作为 workspace，不增加 `--workspace`；创建和恢复后均通过 `runner.set_ask_handler(...)` 绑定 `console_ask`。通用参数、事件展示和 Runner 清理复用 `examples/_runtime.py`。
 - SDK 的 `Runner.stream` 不解析网关的 `$workflow` 语法；研究入口通过现有 `ManualCapability.install` 显式授权 `deep_research`，无需开启自动工作流。
 - 调用真实配置的模型，不加入 mock、假产物或静默降级。成功和异常路径都调用 `runner.stop()`。
 - 功能测试放在 `tests/examples/`，结束后不遗留生成文件，并更新本 README 和[项目 README](../README.zh-CN.md)。

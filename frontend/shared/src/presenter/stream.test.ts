@@ -1,244 +1,39 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { INTERRUPT_MESSAGE, presentActiveAgent, presentStreamEvent } from "./stream.js";
-import type { ActiveAgentSnapshot, RunnerStreamEvent } from "../gateway/types.js";
+import type { ActiveAgentSnapshot, ActionStep, RunnerStreamEvent } from "../gateway/types.js";
+const step: ActionStep = { step_num: 1, model_output: "", thought: "checking", tool_calls: [], code_action: "", reasoning_content: "", observations: [], observation_images: [], attachments: [], error: null, round_outcome: "submitted", output: "done" };
+const base = { event_id: "event", timestamp: 1, runner_id: "runner", agent_id: "root", agent_name: "root", agent_role: "root", round_id: "round", step_num: 1 };
 
-test("presentStreamEvent keeps action and round-end presentation separate", () => {
-  const event: RunnerStreamEvent = {
-    kind: "action_step",
-    permission_mode: "default",
-    agent_mode: "agent",
-    runner_id: "abc",
-    agent_name: "root",
-    agent_role: "root",
-    step_num: 1,
-    round_id: "round-1",
-    team_event: null,
-    action_step: {
-      step_num: 1,
-      model_output: "<thought>checking</thought>",
-      thought: "checking",
-      tool_calls: [],
-      code_action: "",
-      reasoning_content: "",
-      observations: ["done"],
-      observation_images: [],
-      attachments: [],
-      error: null,
-      round_outcome: "submitted",
-      output: "done",
-    },
-  };
-
-  assert.deepEqual(presentStreamEvent(event), [{ kind: "thinking", text: "checking" }]);
-  assert.deepEqual(
-    presentStreamEvent({
-      ...event,
-      kind: "round_end",
-      action_step: null,
-      step_num: null,
-      outcome: "submitted",
-      output: "done",
-    }),
-    [{ kind: "final", text: "done" }]
-  );
+test("committed steps and round results have distinct stable presentation identities", () => {
+  const blocks = presentStreamEvent({ ...base, kind: "step_end", data: { step } });
+  assert.equal(blocks[0].kind, "thinking");
+  assert.equal(blocks[0].text, "checking");
+  assert.ok(blocks[0].id);
+  const final = presentStreamEvent({ ...base, kind: "round_end", data: { result: { round_id: "round", status: "completed", output: "done", reason: "", error: null } } });
+  assert.equal(final[0].kind, "final");
+  assert.equal(final[0].text, "done");
 });
-
-test("presentStreamEvent renders stream cancellation marker", () => {
-  const event: RunnerStreamEvent = {
-    kind: "stream_cancelled",
-    permission_mode: "default",
-    agent_mode: "agent",
-    runner_id: "abc",
-    agent_name: "root",
-    agent_role: "root",
-    step_num: null,
-    round_id: "round-2",
-    team_event: null,
-    action_step: null,
-    stop_reason: "user_cancelled",
-  };
-
-  assert.deepEqual(presentStreamEvent(event), [{ kind: "system", text: INTERRUPT_MESSAGE }]);
+test("cancelled and failed results never become successful answers", () => {
+  const event: RunnerStreamEvent = { ...base, kind: "round_end", data: { result: { round_id: "round", status: "cancelled", output: null, reason: "user", error: null } } };
+  assert.equal(presentStreamEvent(event)[0].text, INTERRUPT_MESSAGE);
+  event.data.result = { ...event.data.result, status: "failed", reason: "max_steps_exceeded" };
+  assert.deepEqual(presentStreamEvent(event).map(({ kind, text }) => ({ kind, text })), [{ kind: "error", text: "max_steps_exceeded" }]);
 });
-
-test("presentStreamEvent keeps lifecycle progress out of the transcript", () => {
-  const event: RunnerStreamEvent = {
-    kind: "runner_lifecycle",
-    permission_mode: "default",
-    agent_mode: "agent",
-    runner_id: "abc",
-    agent_name: "root",
-    agent_role: "root",
-    step_num: null,
-    round_id: "round-3",
-    team_event: null,
-    lifecycle_event: {
-      scope: "workflow",
-      event: "node_started",
-      node: "research_topic",
-      completed: 0,
-      total: 2,
-    },
-    action_step: null,
-  };
-
-  assert.deepEqual(presentStreamEvent(event), []);
+test("workflow progress stays outside the transcript", () => {
+  assert.deepEqual(presentStreamEvent({ ...base, kind: "workflow_progress", data: { scope: "workflow", event: "node_started", call_id: "workflow", node: "fetch" } }), []);
 });
-
-test("presentActiveAgent renders actor task, action, and status", () => {
-  const actor: ActiveAgentSnapshot = {
-    agent_id: "runner:researcher",
-    agent_name: "researcher",
-    agent_kind: "teammate",
-    agent_role: "worker",
-    status: "active",
-    is_root: false,
-    current_async_task_id: "teammate_researcher_0001",
-    metadata: {},
-    session: {},
-    steps: [
-      { type: "task", task: "research async state" },
-      {
-        type: "action",
-        step_num: 1,
-        model_output: "<thought>reading store</thought>",
-        thought: "reading store",
-        tool_calls: [],
-        code_action: "",
-        reasoning_content: "",
-        observations: [],
-        observation_images: [],
-        attachments: [],
-        error: null,
-        round_outcome: "continue",
-        output: null,
-      },
-      { type: "summary", content: "worker summary" },
-    ],
-  };
-
-  assert.deepEqual(presentActiveAgent(actor), [
-    { kind: "system", text: "researcher: active · teammate · teammate_researcher_0001" },
-    { kind: "user", text: "research async state" },
-    { kind: "thinking", text: "reading store" },
-    { kind: "system", text: "worker summary", title: "Summary" },
-  ]);
+test("restored Agent history retains task, tool results and submitted output", () => {
+  const actor: ActiveAgentSnapshot = { agent_id: "root", agent_name: "root", agent_kind: "persistent", agent_role: "root", status: "idle", is_root: true, current_async_task_id: "", metadata: {}, session: {}, steps: [
+    { type: "task", task: "read the file" }, { ...step, type: "action", tool_calls: [{ name: "read", args: { path: "README.md" }, mode: "foreground", status: "completed", call_id: "read", observation_index: 0, is_terminal: false }], observations: ["contents"] },
+  ] };
+  const blocks = presentActiveAgent(actor);
+  assert.equal(blocks.find((block) => block.kind === "user")?.text, "read the file");
+  assert.equal(blocks.find((block) => block.kind === "tool")?.toolCall?.observation, "contents");
+  assert.equal(blocks.at(-1)?.text, "done");
 });
-
-test("presentStreamEvent renders react tool calls and codeact python blocks", () => {
-  const reactBlocks = presentStreamEvent({
-    kind: "action_step",
-    permission_mode: "default",
-    agent_mode: "agent",
-    runner_id: "abc",
-    agent_name: "root",
-    agent_role: "root",
-    step_num: 2,
-    round_id: "round-4",
-    team_event: null,
-    action_step: {
-      step_num: 2,
-      model_output: "",
-      thought: "running shell",
-      tool_calls: [
-        {
-          name: "shell",
-          args: { command: "pwd", workdir: "/tmp", background: false },
-          mode: "sync",
-          status: "success",
-          observation_index: 0,
-          is_terminal: false,
-        },
-      ],
-      code_action: "",
-      reasoning_content: "",
-      observations: ["ok"],
-      observation_images: [],
-      attachments: [],
-      error: null,
-      round_outcome: "continue",
-      output: null,
-    },
-  });
-
-  assert.deepEqual(reactBlocks, [
-    { kind: "thinking", text: "running shell" },
-    {
-      kind: "tool",
-      title: "Ran shell",
-      text: "Ran shell (command: pwd)",
-      toolCall: {
-        name: "shell",
-        mode: "sync",
-        status: "success",
-        parameters: { command: "pwd", workdir: "/tmp", background: "false" },
-      },
-    },
-  ]);
-
-  const codeBlocks = presentStreamEvent({
-    kind: "action_step",
-    permission_mode: "default",
-    agent_mode: "agent",
-    runner_id: "abc",
-    agent_name: "root",
-    agent_role: "root",
-    step_num: 3,
-    round_id: "round-5",
-    team_event: null,
-    action_step: {
-      step_num: 3,
-      model_output: "",
-      thought: "",
-      tool_calls: [],
-      code_action: "print('hi')",
-      reasoning_content: "",
-      observations: ["hi"],
-      observation_images: [],
-      attachments: [],
-      error: null,
-      round_outcome: "continue",
-      output: null,
-    },
-  });
-
-  assert.equal(codeBlocks[0]?.kind, "tool");
-  assert.equal(codeBlocks[0]?.toolCall?.name, "Python");
-});
-
-test("presentStreamEvent surfaces observation images as clickable path text", () => {
-  const blocks = presentStreamEvent({
-    kind: "action_step",
-    permission_mode: "default",
-    agent_mode: "agent",
-    runner_id: "abc",
-    agent_name: "root",
-    agent_role: "root",
-    step_num: 4,
-    round_id: "round-6",
-    team_event: null,
-    action_step: {
-      step_num: 4,
-      model_output: "",
-      thought: "",
-      tool_calls: [],
-      code_action: "",
-      reasoning_content: "",
-      observations: [],
-      observation_images: [{ image_url: ".juice/runners/abc/observation_images/out.png", description: "generated" }],
-      attachments: [],
-      error: null,
-      round_outcome: "continue",
-      output: null,
-    },
-  });
-
-  assert.deepEqual(blocks, [
-    {
-      kind: "assistant",
-      title: "Image",
-      text: "generated\n.juice/runners/abc/observation_images/out.png",
-    },
-  ]);
+test("committed images remain visible as portable path text", () => {
+  const blocks = presentStreamEvent({ ...base, kind: "step_end", data: { step: { ...step, thought: "", observation_images: [{ image_url: ".juice/result.png", description: "Generated image" }] } } });
+  assert.equal(blocks[0].text, "Generated image\n.juice/result.png");
+  assert.ok(blocks[0].id);
 });

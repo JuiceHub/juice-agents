@@ -74,12 +74,13 @@ def test_pending_breadth_applies_on_first_stream_and_after_mode_change(tmp_path:
         for index, mode in enumerate(["agent", "plan"]):
             if mode != runtime.agent_mode:
                 runtime.switch_agent_mode(mode)
-            events = list(runtime.stream_message("hello"))
+            response = runtime.stream_message("hello")
             root = runtime._resolve_root_agent()
             assert isinstance(root.exploration_strategy, TreeOfThoughtsStrategy)
             assert root.exploration_strategy.breadth == 3
             assert root.exploration_strategy.reward_model is None
-            assert next(event for event in events if event["kind"] == "round_end")["output"] == "done"
+            assert response["result"]["status"] == "completed"
+            assert response["result"]["output"] == "done"
             assert model.calls == index + 1  # no scorer => one generation per step
     finally:
         runtime._close_runner(reason="test_finished")
@@ -90,11 +91,11 @@ def test_lazy_live_runner_accepts_strategy_and_reset(tmp_path: Path, model: _Mod
     try:
         runtime.start_session()
         assert runtime.switch_strategy({"breadth": 4})["status"] == "pending"
-        list(runtime.stream_message("first"))
+        runtime.stream_message("first")
         result = runtime.switch_strategy({"reset": True})
         assert result["status"] == "applied"
         assert isinstance(runtime._resolve_root_agent().exploration_strategy, GreedyStrategy)
-        list(runtime.stream_message("second"))
+        runtime.stream_message("second")
         assert model.calls == 2
     finally:
         runtime._close_runner(reason="test_finished")
@@ -107,7 +108,7 @@ def test_live_breadth_change_preserves_injected_scorer(tmp_path: Path, model: _M
 
     runtime = DirectRunnerRuntime(base_dir=tmp_path)
     try:
-        list(runtime.stream_message("first"))
+        runtime.stream_message("first")
         scorer = Scorer()
         root = runtime._resolve_root_agent()
         root.set_exploration_strategy(TreeOfThoughtsStrategy(breadth=2, reward_model=scorer))
@@ -143,7 +144,7 @@ def test_rpc_pending_strategy_survives_start_or_resume(
         else:
             handlers.handle_start_session({"base_dir": str(tmp_path)})
         assert not handlers._runtime._runner.agent_manager.live_agents
-        list(handlers.handle_stream_message({"message": "hello"}))
+        handlers.handle_stream_message({"message": "hello"})
         root = handlers._runtime._resolve_root_agent()
         assert root.exploration_strategy.breadth == 5
         assert root.exploration_strategy.reward_model is None

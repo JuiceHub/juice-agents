@@ -1,8 +1,12 @@
-"""Executor mixin: _run_async_task and failure summary builder."""
+"""Executor mixin: _arun_async_task and failure summary builder."""
 
 from __future__ import annotations
 
 import copy
+import asyncio
+import inspect
+
+from ..execution.async_io import blocking, cancel_and_drain
 import logging
 import time
 from pathlib import Path
@@ -19,8 +23,7 @@ logger = logging.getLogger(__name__)
 def _coerce_jsonable(value: Any) -> Any:
     try:
         import json
-        json.dumps(value, ensure_ascii=False, default=str)
-        return value
+        return json.loads(json.dumps(value, ensure_ascii=False, default=str))
     except Exception:
         return str(value)
 
@@ -66,16 +69,17 @@ class _AsyncTaskExecutorMixin:
             async_task["status"] = status
             async_task["finished_at"] = finished_at
 
-            # 只更新内存快照，不在 notification 之前暴露终态。
-            # _emit_notification 会把二者合并为同一次持久化提交。
-            self._store_async_task_locked(async_task)
-            self._emit_notification(
+            # Commit terminal state and the exact notification together. Deliver
+            # only after releasing the lock: inbox callbacks may acknowledge it.
+            event = self._prepare_notification_locked(
                 async_task,
                 status=status,
                 summary=summary,
                 extra_payload=extra_payload,
             )
-            return async_task
+            self._persist_locked()
+        self._deliver_notification(async_task, event)
+        return async_task
 
     def _build_async_task_failure_summary(self, async_task: InternalAsyncTaskState) -> str:
         public_type = to_public_kind(async_task.get("kind"))
@@ -94,44 +98,71 @@ class _AsyncTaskExecutorMixin:
             return "local_workflow 任务执行失败"
         return f"{public_type} 任务执行失败"
 
-    def _run_async_task(
+    async def _arun_async_task(
         self,
         async_task_id: str,
         runner: Callable[[InternalAsyncTaskState, Path], Any],
         summary_builder: Callable[[Any], str],
     ) -> Any:
-        with self._lock:
-            async_task = copy.deepcopy(self._async_tasks[async_task_id])
-            if str(async_task.get("status") or "").strip() == "killed":
-                return None
-            async_task["status"] = "running"
-            async_task["started_at"] = time.time()
-            self._store_async_task_locked(async_task)
-            self._persist_locked()
-        output_dir = Path(str(async_task["output_dir"]))
-        self._append_async_task_output(
-            output_dir,
-            {"async_task_id": async_task_id, "event": "started", "created_at": async_task["started_at"]},
-        )
+        def prepare():
+            with self._lock:
+                async_task = copy.deepcopy(self._async_tasks[async_task_id])
+                if str(async_task.get("status") or "").strip() == "killed":
+                    return None
+                async_task["status"] = "running"
+                async_task["started_at"] = time.time()
+                self._store_async_task_locked(async_task)
+                self._persist_locked()
+            output_dir = Path(str(async_task["output_dir"]))
+            self._append_async_task_output(
+                output_dir,
+                {"async_task_id": async_task_id, "event": "started", "created_at": async_task["started_at"]},
+            )
+            return async_task, output_dir
+        prepared = await blocking(prepare)
+        if prepared is None:
+            return None
+        async_task, output_dir = prepared
+        cancel_event = self.cancel_event_for(async_task_id)
         try:
-            result = runner(copy.deepcopy(async_task), output_dir)
+            async def request():
+                if inspect.iscoroutinefunction(runner):
+                    return await runner(copy.deepcopy(async_task), output_dir)
+                result = await blocking(runner, copy.deepcopy(async_task), output_dir,
+                                        on_cancel=cancel_event.set)
+                return await result if inspect.isawaitable(result) else result
+
+            operation = asyncio.create_task(request())
+            try:
+                while not operation.done() and not cancel_event.is_set():
+                    await asyncio.wait((operation,), timeout=0.02)
+                if cancel_event.is_set():
+                    await cancel_and_drain(operation)
+                result = await asyncio.shield(operation)
+            finally:
+                if not operation.done():
+                    await cancel_and_drain(operation)
+                    await asyncio.gather(operation, return_exceptions=True)
             finished_at = time.time()
             jsonable_result = _coerce_jsonable(result)
-            self._commit_terminal_async_task(
+            await blocking(self._commit_terminal_async_task,
                 async_task_id=async_task_id,
                 status="completed",
                 finished_at=finished_at,
                 output_event={"event": "completed", "result": jsonable_result},
-                summary=summary_builder(result),
+                summary=await blocking(summary_builder, result),
                 state_updates={"closed_reason": "", "error": ""},
                 extra_payload={"result": jsonable_result},
             )
             return result
+        except asyncio.CancelledError:
+            cancel_event.set()
+            return None
         except Exception as exc:
             finished_at = time.time()
             error_text = str(exc)
             logger.exception("后台 async task 执行失败: async_task_id=%s", async_task_id)
-            self._commit_terminal_async_task(
+            await blocking(self._commit_terminal_async_task,
                 async_task_id=async_task_id,
                 status="failed",
                 finished_at=finished_at,

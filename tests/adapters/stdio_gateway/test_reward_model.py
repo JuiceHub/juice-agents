@@ -33,12 +33,20 @@ class _Judge:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
 
-    def create(self, *, messages: Any, **kwargs: Any) -> Any:
+    async def create(self, *, messages: Any, **kwargs: Any) -> Any:
         payload = json.loads(messages[1]["content"])
         self.calls.append(payload)
         # Prefer the last candidate. Selection must happen before execution.
         content = json.dumps({"scores": list(range(len(payload["candidates"])))})
+        if kwargs.get("stream"):
+            async def chunks():
+                yield SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=content))])
+
+            return chunks()
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+
+    async def close(self):
+        pass
 
 
 @pytest.fixture
@@ -55,7 +63,9 @@ def providers(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(registry_module, "resolve_runtime_model", lambda **kwargs: generator)
     monkeypatch.setattr(model_catalog, "load_runtime_model_config", resolve)
-    monkeypatch.setattr(openai, "OpenAI", lambda **kwargs: SimpleNamespace(chat=SimpleNamespace(completions=judge)))
+    monkeypatch.setattr(openai, "AsyncOpenAI", lambda **kwargs: SimpleNamespace(
+        chat=SimpleNamespace(completions=judge), close=judge.close,
+    ))
     monkeypatch.setattr(runtime_module, "list_runtime_models", lambda **kwargs: [{"model_name": "judge"}])
     return generator, judge, resolutions
 
@@ -152,8 +162,9 @@ def test_cold_reward_and_breadth_survive_start_or_resume(
         runtime = handlers._runtime
         assert not runtime._runner.agent_manager.live_agents
         assert resolutions == []
-        events = list(handlers.handle_stream_message({"message": "finish"}))
-        assert next(event for event in events if event["kind"] == "round_end")["output"] == "answer-3"
+        response = handlers.handle_stream_message({"message": "finish"})
+        assert response["result"]["status"] == "completed"
+        assert response["result"]["output"] == "answer-3"
         assert generator.calls == 3 and len(judge.calls) == 1
         assert len(resolutions) == 1
         configuration = resolutions[0]
@@ -162,11 +173,11 @@ def test_cold_reward_and_breadth_survive_start_or_resume(
 
         # Mode changes reacquire root; the same explicit scorer must bind there.
         runtime.switch_agent_mode("plan")
-        list(runtime.stream_message("finish again"))
+        runtime.stream_message("finish again")
         assert generator.calls == 6 and len(judge.calls) == 2
         assert len(resolutions) == 1
         runtime.configure_reward_model({"reset": True})
-        list(runtime.stream_message("linear again"))
+        runtime.stream_message("linear again")
         assert generator.calls == 7 and len(judge.calls) == 2
     finally:
         handlers._runtime._close_runner(reason="test_finished")
@@ -178,8 +189,9 @@ def test_reward_model_uses_the_same_project_and_workspace_catalog(tmp_path: Path
     workspace = tmp_path / "workspace"
     (workspace / ".juice").mkdir(parents=True)
     (workspace / ".juice" / "config.yaml").write_text(
-        "models:\n  local_judge:\n    backend: openai\n    api_base: https://example.test/v1\n"
-        "    api_key_env: UNUSED_TEST_KEY\n    provider_model_name: judge-provider\n", encoding="utf-8",
+        "providers:\n  local:\n    backend: openai\n    api_base: https://example.test/v1\n"
+        "    api_key_env: UNUSED_TEST_KEY\nmodels:\n  local_judge:\n    provider: local\n"
+        "    provider_model_name: judge-provider\n", encoding="utf-8",
     )
     runtime = DirectRunnerRuntime(base_dir=workspace, runtime_config_path=project)
     names = [entry["model_name"] for entry in runtime.list_models()]
@@ -209,7 +221,7 @@ def test_existing_session_keeps_reward_choice_when_replaced(
         handlers.handle_switch_strategy({"base_dir": str(tmp_path), "breadth": 3})
         handlers.handle_configure_reward_model({"base_dir": str(tmp_path), "model_name": "judge"})
         if root_acquired:
-            list(original.stream_message("finish"))
+            original.stream_message("finish")
         expected = original.describe_reward_model()
         if resume:
             handlers.handle_resume_session({"base_dir": str(tmp_path), "runner_id": status["runner_id"]})

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import unittest
 
-from juice_agents.core.runner.status import settle_async_pending_status, settle_status
+from juice_agents.core.runner.status import settle_status
 
 
 def _stale_state() -> dict:
@@ -66,41 +66,6 @@ class SettleStatusTests(unittest.TestCase):
         state = _stale_state()
         settle_status(state, status="idle", reason="round_ended", active_round="garbage")  # type: ignore[arg-type]
         self.assertIsNone(state["active_round"])
-
-
-class SettleAsyncPendingStatusTests(unittest.TestCase):
-    def test_waiting_when_async_work_outstanding(self) -> None:
-        state = _stale_state()
-        settle_async_pending_status(state, has_async=True)
-        self.assertEqual(state["status"], "waiting")
-        self.assertEqual(state["status_reason"], "async_pending")
-        self.assertIsNone(state["active_round"])
-
-    def test_idle_when_nothing_outstanding(self) -> None:
-        state = _stale_state()
-        settle_async_pending_status(state, has_async=False)
-        self.assertEqual(state["status"], "idle")
-        self.assertEqual(state["status_reason"], "round_ended")
-
-    def test_reasons_stay_parameterizable(self) -> None:
-        """resume 用 pending_notification/resumed，是对外可见的审计措辞，不能被抹平。"""
-
-        state: dict = {}
-        settle_async_pending_status(
-            state,
-            has_async=True,
-            waiting_reason="pending_notification",
-            idle_reason="resumed",
-        )
-        self.assertEqual(state["status_reason"], "pending_notification")
-
-        settle_async_pending_status(
-            state,
-            has_async=False,
-            waiting_reason="pending_notification",
-            idle_reason="resumed",
-        )
-        self.assertEqual(state["status_reason"], "resumed")
 
 
 class StatusPersistenceContractTests(unittest.TestCase):

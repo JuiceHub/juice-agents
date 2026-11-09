@@ -29,6 +29,7 @@ import {
 import { InteractiveSelector } from "./components/InteractiveSelector.js";
 import { AsyncTasksDialog, sortAsyncTasks } from "./components/AsyncTasksDialog.js";
 import { useTasksDialog } from "./hooks/useTasksDialog.js";
+import { useCronPolling } from "./hooks/useCronPolling.js";
 import type { AsyncTaskOutput } from "@juice-agents/shared/gateway/types";
 import { AskPrompt } from "./components/AskPrompt.js";
 import {
@@ -51,9 +52,11 @@ import { useInteractiveSelector } from "./hooks/useInteractiveSelector.js";
 import { createComposerController, type ComposerController } from "./lib/composer.js";
 import { executeCommand, modelConfigPatch, runtimeFromSession, type CommandResult } from "./lib/commands.js";
 import { openRewardModelSelector } from "./lib/rewardModelSelector.js";
+import { openImageModelSelector } from "./lib/imageModelSelector.js";
 import {
   getCommandExecutionPolicy,
   getCommandToken,
+  isGlobalCommand,
   shouldQueueSubmission,
 } from "./lib/commandScheduling.js";
 import {
@@ -67,6 +70,7 @@ import {
   buildIntroPanel,
   presentActiveAgent,
   presentAgentTypeConfigSaved,
+  presentStreamEvent,
   shouldShowIntroPanel,
   type MessageBlock,
 } from "./lib/presenter.js";
@@ -406,22 +410,6 @@ export function resolveActiveTranscriptMessages(
   return presentActiveAgent(agent);
 }
 
-function loadHistoryFromActiveAgents(
-  report: ActiveAgentsReport | null
-): MessageBlock[] {
-  if (!report || !report.agents || report.agents.length === 0) {
-    return [];
-  }
-  const rootAgent = report.agents.find((agent) => agent.is_root)
-    || report.agents.find((agent) => agent.agent_name === report.root_agent_name);
-  if (!rootAgent || !rootAgent.steps || rootAgent.steps.length === 0) {
-    return [];
-  }
-  const allBlocks = presentActiveAgent(rootAgent);
-  // Skip the first system block (agent status) to avoid duplication with presentStatus
-  return allBlocks.slice(1);
-}
-
 function findActiveAgent(
   report: ActiveAgentsReport | null,
   agentName: string | null
@@ -496,6 +484,7 @@ export function App({
   const stdout = process.stdout;
   const session = useSession(client);
   const [runtimeModels, setRuntimeModels] = useState<RuntimeModelInfo[]>([]);
+  const [imageModelNames, setImageModelNames] = useState<string[]>([]);
   const [skillNames, setSkillNames] = useState<string[]>([]);
   const [pluginNames, setPluginNames] = useState<string[]>([]);
   // `/agents` completion is driven by the same availability endpoint as the
@@ -505,7 +494,7 @@ export function App({
     () => runtimeModels.map((item) => item.model_name),
     [runtimeModels]
   );
-  const completion = useCompletion(runtimeModelNames, skillNames, pluginNames, availableAgentNames);
+  const completion = useCompletion(runtimeModelNames, skillNames, pluginNames, availableAgentNames, imageModelNames);
   const selector = useInteractiveSelector();
   const tasksDialog = useTasksDialog();
   // 进入 detail 模式后异步加载的 stdout/stderr tail。
@@ -531,9 +520,18 @@ export function App({
   const [composerController, setComposerController] = useState<ComposerController>(() =>
     createComposerController()
   );
-  const [queuedMessages, setQueuedMessages] = useState<string[]>([]);
+  const [queuedMessages, setQueuedMessagesState] = useState<string[]>([]);
+  const queuedMessagesRef = useRef<string[]>([]);
+  const setQueuedMessages = useCallback((update: React.SetStateAction<string[]>) => {
+    // Keep the FIFO barrier visible synchronously. React may batch a /clear
+    // submission and the next input before committing the queued UI state.
+    const next = typeof update === "function" ? update(queuedMessagesRef.current) : update;
+    queuedMessagesRef.current = next;
+    setQueuedMessagesState(next);
+  }, []);
   const [activeAgentsReport, setActiveAgentsReport] = useState<ActiveAgentsReport | null>(null);
   const [activeAgentName, setActiveAgentName] = useState<string | null>(null);
+  const [activeViewCommandError, setActiveViewCommandError] = useState<MessageBlock | null>(null);
   // 仅缓存 active (pending/running) 后台任务，用于计数徽标和 /tasks 面板。
   const [asyncTasks, setAsyncTasks] = useState<AsyncTaskState[]>([]);
   const [pendingAsk, setPendingAsk] = useState<AskRequest | null>(null);
@@ -586,8 +584,21 @@ export function App({
   const modeSwitchInFlightRef = useRef(false);
   const processModeSwitchRef = useRef<() => void>(() => {});
   const sessionStatusRef = useRef<SessionStatus | null>(null);
+  // RPC results belong to the concrete session load, including reloading the
+  // same Runner ID. An old task/Agent response cannot populate a newer view.
+  const sessionRevisionRef = useRef(0);
   const pendingRuntimeRef = useRef(pendingRuntime);
   const streamInFlightRef = useRef(false);
+  // /clear is a FIFO barrier: inputs submitted during creation must wait for
+  // its new Runner instead of entering the old Runner's persistent inbox.
+  const sessionSwitchInFlightRef = useRef(false);
+  const [sessionSwitchInFlight, setSessionSwitchInFlight] = useState(false);
+  const setSessionSwitchBusy = useCallback((busy: boolean) => {
+    sessionSwitchInFlightRef.current = busy;
+    // Wake the FIFO consumer when creation/its first round finishes, even if
+    // the final stream and session updates already rendered while it was busy.
+    setSessionSwitchInFlight(busy);
+  }, []);
 
   const dismissConfigPanel = useCallback(() => {
     // 先推进令牌再关闭，确保正在等待的 Promise 无法在下一帧复活 overlay。
@@ -597,6 +608,7 @@ export function App({
 
   const handleStreamActiveAgentsReport = useCallback(
     (report: ActiveAgentsReport) => {
+      if (report.runner_id !== sessionStatusRef.current?.runner_id) return;
       setActiveAgentsReport(report);
       selector.updateItemsIfOpen(
         ACTIVE_SELECTOR_TITLE,
@@ -624,13 +636,15 @@ export function App({
   );
 
   const messagesHook = useConversationStream(client, {
+    runnerId: session.status?.runner_id ?? "",
+    presentEvent: presentStreamEvent,
     onActiveAgentsReport: handleStreamActiveAgentsReport,
     onAskRequest: handleAskRequest,
   });
   // While a stale mode response is being reconciled, React may still render
   // the previous visible SessionStatus. Do not let that overwrite the
   // transport-authoritative status used to dispatch the latest target.
-  if (!modeSwitchInFlightRef.current && !requestedModeRef.current) {
+  if (!modeSwitchInFlightRef.current && !requestedModeRef.current && !sessionSwitchInFlightRef.current) {
     sessionStatusRef.current = session.status;
   }
   pendingRuntimeRef.current = pendingRuntime;
@@ -675,6 +689,7 @@ export function App({
     // 因此在 stream 进行中也能安全地在 step 边界应用，无需延后。
 
     modeSwitchInFlightRef.current = true;
+    const revision = sessionRevisionRef.current;
     try {
       const status = await client.switchPermissionMode({
         permission_mode: targetMode,
@@ -682,6 +697,7 @@ export function App({
       // 持久化放在 coordinator 而不是各入口：/permissions、selector 与任何
       // 后续入口都经由此处，写在这里才不会有入口漏持久化。
       await persistPermissionMode(client, baseDir, targetMode);
+      if (revision !== sessionRevisionRef.current) return;
       // switch_permission_mode 已返回权威 SessionStatus，复用它可避免在 stream
       // 之后追加 describe_session / actor refresh RPC。
       sessionStatusRef.current = status;
@@ -694,6 +710,7 @@ export function App({
         setPendingMode(null);
       }
     } catch (e: any) {
+      if (revision !== sessionRevisionRef.current) return;
       if (requestedModeRef.current === targetMode) {
         requestedModeRef.current = null;
         setPendingMode(null);
@@ -731,18 +748,22 @@ export function App({
   }, [messagesHook.streamInFlight]);
 
   const refreshCapabilityAliases = useCallback(async () => {
+    const revision = sessionRevisionRef.current;
     const [skills, plugins, agents] = await Promise.all([
       client.listSkills({}),
       client.listPlugins(),
       client.listAvailableAgents({}),
     ]);
+    if (revision !== sessionRevisionRef.current) return;
     setSkillNames(collectSkillAliases(skills.skills || []));
     setPluginNames((plugins.plugins || []).map((plugin) => plugin.name).filter(Boolean));
     setAvailableAgentNames((agents.agents || []).map((agent) => agent.name).filter(Boolean));
   }, [client]);
 
   const refreshActiveAgents = useCallback(async (statusOverride?: SessionStatus | null) => {
-    if (!statusOverride && !session.status) {
+    const runnerId = (statusOverride ?? sessionStatusRef.current)?.runner_id;
+    const revision = sessionRevisionRef.current;
+    if (!runnerId) {
       setActiveAgentsReport(null);
       setAsyncTasks([]);
       return null;
@@ -755,27 +776,71 @@ export function App({
         .listAsyncTasks({ statuses: ["pending", "running"] })
         .catch(() => [] as AsyncTaskState[]),
     ]);
+    if (revision !== sessionRevisionRef.current || runnerId !== sessionStatusRef.current?.runner_id) return null;
+    if (report && report.runner_id !== runnerId) return null;
     if (report) {
+      messagesHook.applySnapshot(report);
       setActiveAgentsReport(report);
     }
     setAsyncTasks(tasks);
     return report;
-  }, [client, session.status]);
+  }, [client]);
 
-  const visibleMessages = useMemo(
-    () => resolveActiveTranscriptMessages(activeAgentsReport, activeAgentName, messagesHook.messages),
-    [activeAgentsReport, activeAgentName, messagesHook.messages]
-  );
+  useEffect(() => { setActiveViewCommandError(null); }, [activeAgentName]);
 
-  // resume / clear-and-load 历史：alt-screen 架构下历史块直接进 messages 数组，
-  // 由 VirtualScrollList 统一摊平渲染（不再 inkWrite 直写 scrollback）。
-  const commitResumedHistory = useCallback(
-    (historyBlocks: MessageBlock[]) => {
-      if (historyBlocks.length === 0) return;
-      messagesHook.addMessages(historyBlocks);
-    },
-    [messagesHook.addMessages]
-  );
+  const visibleMessages = useMemo(() => {
+    const selected = findActiveAgent(activeAgentsReport, activeAgentName || "");
+    const transcript = selected && activeAgentName && activeAgentsReport?.runner_id === sessionStatusRef.current?.runner_id
+      ? messagesHook.agentMessages[selected.agent_id] || resolveActiveTranscriptMessages(activeAgentsReport, activeAgentName, messagesHook.messages)
+      : resolveActiveTranscriptMessages(activeAgentsReport, activeAgentName, messagesHook.messages);
+    // A global /clear error must remain visible while the unchanged child
+    // transcript is selected. Root messages alone are hidden in that view.
+    return activeAgentName && activeViewCommandError
+      ? [...transcript, activeViewCommandError]
+      : transcript;
+  }, [activeAgentsReport, activeAgentName, activeViewCommandError, messagesHook.messages, messagesHook.agentMessages]);
+
+  // 会话替换成功后统一清理旧视图；主记录与子 Agent 视图必须一起切换，
+  // 否则新载入的主对话会被旧的子视图遮住。失败时不调用，保留可读历史。
+  const resetSessionView = useCallback(() => {
+    sessionRevisionRef.current++;
+    setActiveAgentName(null);
+    setActiveViewCommandError(null);
+    setActiveAgentsReport(null);
+    setAsyncTasks([]);
+    setPendingAsk(null);
+    selector.close();
+    tasksDialog.close();
+    setTaskDetailOutput(null);
+    setTaskDetailLoading(false);
+    setTaskDetailError(null);
+    dismissConfigPanel();
+    setSkillsConfigPanel(null);
+    deferredModelSwitchRef.current = null;
+    requestedModeRef.current = null;
+    setPendingMode(null);
+    messagesHook.clearMessages();
+  }, [dismissConfigPanel, messagesHook.clearMessages, selector.close, tasksDialog.close]);
+
+  // Both /resume forms and startup recovery adopt a whole Runner. Keep its
+  // status, root history, child sessions and task projection on one boundary.
+  const activateResumedSession = useCallback(async (status: SessionStatus) => {
+    sessionStatusRef.current = status;
+    messagesHook.bindRunner(status.runner_id);
+    session.setStatus(status);
+    const runtime = runtimeFromSession(status, baseDir);
+    pendingRuntimeRef.current = runtime;
+    setPendingRuntime(runtime);
+    resetSessionView();
+    const revision = sessionRevisionRef.current;
+    const report = await refreshActiveAgents(status);
+    if (revision !== sessionRevisionRef.current) return;
+    if (!report) {
+      messagesHook.addMessage({ kind: "error", text: "Session resumed, but Agent history could not be loaded. Run /resume again." });
+    }
+    if (report) await client.activateSession(status.runner_id);
+    await refreshCapabilityAliases();
+  }, [baseDir, client, messagesHook.addMessage, messagesHook.bindRunner, refreshActiveAgents, refreshCapabilityAliases, resetSessionView, session.setStatus]);
 
   const applyDeferredModelSwitch = useCallback(async (options: { allowWhileStreamInFlight?: boolean } = {}) => {
     const deferred = deferredModelSwitchRef.current;
@@ -816,22 +881,30 @@ export function App({
   }, [baseDir, session.status]);
 
   const ensureSession = useCallback(async () => {
-    if (session.status) {
-      return session.status;
+    if (sessionStatusRef.current?.runner_id) {
+      return sessionStatusRef.current;
     }
 
     // 等 init() 把 workspace 配置填进 pendingRuntime，否则会用初始默认值建 runner。
     await runtimeReadyPromiseRef.current;
+    const runtime = pendingRuntimeRef.current;
 
     const nextStatus = await session.startSession({
       base_dir: baseDir,
-      permission_mode: pendingRuntime.permission_mode,
-      agent_mode: pendingRuntime.agent_mode,
-      agent_type: pendingRuntime.agent_type,
-      model_name: pendingRuntime.model_name || undefined,
-      model_effort: normalizeModelEffort(pendingRuntime.model_effort),
+      permission_mode: runtime.permission_mode,
+      agent_mode: runtime.agent_mode,
+      agent_type: runtime.agent_type,
+      model_name: runtime.model_name || undefined,
+      model_effort: normalizeModelEffort(runtime.model_effort),
       ...(worktree !== undefined ? { worktree } : {}),
     });
+    sessionStatusRef.current = nextStatus;
+    messagesHook.bindRunner(nextStatus.runner_id);
+    const initialReport = await client.describeActiveAgents();
+    messagesHook.applySnapshot(initialReport);
+    await client.activateSession(nextStatus.runner_id);
+    setActiveAgentName(null);
+    setActiveAgentsReport(null);
     setPendingRuntime(runtimeFromSession(nextStatus, baseDir));
     return nextStatus;
   }, [baseDir, pendingRuntime, session, worktree]);
@@ -840,6 +913,9 @@ export function App({
     const init = async () => {
       try {
         const workspaceConfig = await client.loadEffectiveConfig({ base_dir: baseDir });
+        // Completion needs only catalog keys. The picker resolves fresh public
+        // Provider metadata with list_image_models when it opens.
+        setImageModelNames(Object.keys(workspaceConfig.image_models || {}));
         const runtimeConfig = workspaceConfig.runtime || {};
         const runtimeModels = await client.listModels({ base_dir: baseDir });
         setRuntimeModels(runtimeModels);
@@ -851,13 +927,9 @@ export function App({
             model_name: runtimeConfig.model_name,
             model_effort: normalizeModelEffort(runtimeConfig.model_effort),
           });
-          setPendingRuntime(runtimeFromSession(resumedStatus, baseDir));
-          const report = await refreshActiveAgents(resumedStatus);
-          const historyBlocks = loadHistoryFromActiveAgents(report);
-          commitResumedHistory(historyBlocks);
+          await activateResumedSession(resumedStatus);
         } else {
-          setPendingRuntime(
-            buildPendingRuntimeState({
+          const nextRuntime = buildPendingRuntimeState({
               baseDir,
               // 两个维度都继承 workspace 配置；CLI 入参优先，只影响本次启动。
               permissionMode: permissionMode || runtimeConfig.permission_mode || "default",
@@ -867,8 +939,9 @@ export function App({
               modelEffort: runtimeConfig.model_effort,
               modelEffortSource: runtimeModels.find((item) => item.model_name === runtimeConfig.model_name) || runtimeModels[0],
               fallbackModelName: runtimeModels[0]?.model_name,
-            })
-          );
+            });
+          pendingRuntimeRef.current = nextRuntime;
+          setPendingRuntime(nextRuntime);
         }
         await refreshCapabilityAliases();
       } catch (e: any) {
@@ -954,29 +1027,31 @@ export function App({
     async (text: string, fromQueue = false) => {
       const commandToken = getCommandToken(text);
       const executionPolicy = getCommandExecutionPolicy(text);
+      const currentQueue = queuedMessagesRef.current;
+      const sessionSwitchPending = sessionSwitchInFlightRef.current ||
+        currentQueue.some((item) => ["/clear", "/resume"].includes(getCommandToken(item) || ""));
 
       // Safe root-level commands keep their slash-command meaning in an actor
       // transcript, matching the global Ctrl+S/Ctrl+T shortcuts. Other input
       // remains an actor message exactly as before.
-      if (activeAgentName && executionPolicy !== "immediate") {
+      if (activeAgentName && sessionStatusRef.current &&
+          activeAgentsReport?.runner_id === sessionStatusRef.current.runner_id &&
+          !isGlobalCommand(text) && !sessionSwitchPending) {
         try {
           const result = await client.sendAgentMessage({
             agent_name: activeAgentName,
             message: text,
           });
-          const suffix = result.started_async_task_id
-            ? ` · started ${result.started_async_task_id}`
-            : "";
-          messagesHook.addMessage({
-            kind: result.accepted ? "system" : "error",
-            text: result.accepted
-              ? `Sent to ${activeAgentName}${suffix}`
-              : `Agent message rejected for ${activeAgentName}: ${result.error || result.status || "not_live"}`,
+          // Accepted input is displayed by the backend's message_received
+          // event. Transport/rejection errors belong to the selected child.
+          setActiveViewCommandError(result.accepted ? null : {
+            kind: "error",
+            text: `Agent message rejected for ${activeAgentName}: ${result.error || result.status || "not_live"}`,
           });
           const currentStatus = await session.refreshStatus();
           await refreshActiveAgents(currentStatus ?? session.status);
         } catch (e: any) {
-          messagesHook.addMessage({
+          setActiveViewCommandError({
             kind: "error",
             text: `Agent message failed: ${e.message || String(e)}`,
           });
@@ -984,26 +1059,34 @@ export function App({
         return;
       }
 
-      if (shouldQueueSubmission({
+      if ((commandToken || currentQueue.length > 0 || sessionSwitchInFlightRef.current) && shouldQueueSubmission({
         input: text,
         fromQueue,
-        streaming: messagesHook.streaming,
-        queuedCount: queuedMessages.length,
+        streaming: messagesHook.streaming || streamInFlightRef.current || sessionSwitchInFlightRef.current,
+        queuedCount: currentQueue.length,
       })) {
         setQueuedMessages((prev) => [...prev, text]);
         return;
       }
 
       if (commandToken) {
+        // Reserve the FIFO synchronously before command dispatch can await.
+        // This also prevents a following /clear overtaking a forwarded prompt.
+        let ownsSessionCreation = executionPolicy === "fifo";
+        if (ownsSessionCreation) setSessionSwitchBusy(true);
         try {
           if (executionPolicy === "fifo") {
             setCommandStatus(buildCommandStatus(text));
           }
           let result: CommandResult;
           try {
+            // Startup configuration is loaded asynchronously. A cold /clear
+            // still creates immediately, using those resolved launch settings.
+            if (commandToken === "/clear") await runtimeReadyPromiseRef.current;
             result = await executeCommand(text, client, baseDir, {
-              sessionStatus: session.status,
-              pendingRuntime,
+              sessionStatus: sessionStatusRef.current,
+              pendingRuntime: pendingRuntimeRef.current,
+              ...(worktree !== undefined ? { worktree } : {}),
             });
           } finally {
             if (executionPolicy === "fifo") {
@@ -1012,15 +1095,29 @@ export function App({
           }
 
           if (result.pendingRuntime) {
+            pendingRuntimeRef.current = result.pendingRuntime;
             setPendingRuntime(result.pendingRuntime);
+          }
+
+          if ("sessionStatus" in result) {
+            sessionStatusRef.current = result.sessionStatus ?? null;
+            messagesHook.bindRunner(result.sessionStatus?.runner_id ?? "");
+            session.setStatus(result.sessionStatus ?? null);
           }
 
           if (result.permissionModeSwitchRequest) {
             requestModeSwitch(result.permissionModeSwitchRequest.permission_mode);
           }
 
-          if (result.clearMessages) {
-            messagesHook.clearMessages();
+          if (result.clearMessages && !result.loadHistory) {
+            // Commit the new session before dropping any visible history. A
+            // failed creation leaves both root and child transcripts readable.
+            resetSessionView();
+            if (result.sessionStatus) {
+              const initialReport = await client.describeActiveAgents();
+              messagesHook.applySnapshot(initialReport);
+              await client.activateSession(result.sessionStatus.runner_id);
+            }
           }
 
           if (shouldEchoSlashCommand(text, result)) {
@@ -1034,17 +1131,13 @@ export function App({
 
           if (result.blocks.length > 0) {
             messagesHook.addMessages(result.blocks);
+            if (["/clear", "/resume"].includes(commandToken) && activeAgentName && !result.clearMessages) {
+              setActiveViewCommandError(result.blocks.find((block) => block.kind === "error") ?? null);
+            }
           }
 
-          if (result.loadHistory) {
-            try {
-              const currentStatus = await session.refreshStatus();
-              const report = await refreshActiveAgents(currentStatus ?? session.status);
-              const historyBlocks = loadHistoryFromActiveAgents(report);
-              commitResumedHistory(historyBlocks);
-            } catch (e: any) {
-              console.error("Failed to load history:", e);
-            }
+          if (result.loadHistory && result.sessionStatus) {
+            await activateResumedSession(result.sessionStatus);
           }
 
           if (result.exitRequested) {
@@ -1053,16 +1146,37 @@ export function App({
           }
 
           if (result.forwardMessage) {
+            // Some commands (for example /goal) may create the backend session
+            // themselves. Discover that identity before creating one lazily.
+            const forwardedStatus = sessionStatusRef.current || await session.refreshStatus();
+            if (!forwardedStatus?.runner_id) {
+              ownsSessionCreation = true;
+              setSessionSwitchBusy(true);
+            }
+            const currentStatus = forwardedStatus?.runner_id ? forwardedStatus : await ensureSession();
+            sessionStatusRef.current = currentStatus;
             await applyDeferredModelSwitch({ allowWhileStreamInFlight: true });
-            const outcome = await messagesHook.sendMessage(result.forwardMessage, result.forwardAgentMode);
+            streamInFlightRef.current = true;
+            const outcome = await messagesHook.sendMessage(result.forwardMessage, result.forwardAgentMode, currentStatus.runner_id);
             if (outcome === "failed") return "retry" as const;
             if (outcome === "superseded") return;
-            const currentStatus = await session.refreshStatus();
-            await refreshActiveAgents(currentStatus ?? session.status);
+            const refreshedStatus = await session.refreshStatus();
+            await refreshActiveAgents(refreshedStatus ?? currentStatus);
             return;
           }
 
           // Handle interactive actions
+          if (result.interactiveAction === "image-model-selector") {
+            await openImageModelSelector({
+              client,
+              baseDir,
+              selector,
+              addMessages: messagesHook.addMessages,
+              onCatalogLoaded: (models) => setImageModelNames(models.map((model) => model.model_name)),
+            });
+            return;
+          }
+
           if (result.interactiveAction === "reward-model-selector") {
             await openRewardModelSelector({
               client,
@@ -1276,15 +1390,27 @@ export function App({
                 active: s.runner_id === currentRunnerId,
               })),
               async (item) => {
-                await client.resumeSession({
-                  runner_id: item.value,
-                  base_dir: baseDir,
-                });
-                const currentStatus = await session.refreshStatus();
-                messagesHook.clearMessages();
-                const report = await refreshActiveAgents(currentStatus ?? session.status);
-                const historyBlocks = loadHistoryFromActiveAgents(report);
-                commitResumedHistory(historyBlocks);
+                // 选择器确认后会立即关闭；保持 FIFO 屏障直到历史加载完成，
+                // 避免此时的输入仍落到旧 Runner 或旧子 Agent。
+                setSessionSwitchBusy(true);
+                try {
+                  const resumed = await executeCommand(`/resume ${item.value}`, client, baseDir, {
+                    sessionStatus: sessionStatusRef.current,
+                    pendingRuntime: pendingRuntimeRef.current,
+                  });
+                  if (resumed.loadHistory && resumed.sessionStatus) {
+                    await activateResumedSession(resumed.sessionStatus);
+                  } else {
+                    sessionStatusRef.current = resumed.sessionStatus ?? null;
+                    session.setStatus(resumed.sessionStatus ?? null);
+                    messagesHook.addMessages(resumed.blocks);
+                    setActiveViewCommandError(resumed.blocks.find((block) => block.kind === "error") ?? null);
+                  }
+                } catch (e: any) {
+                  messagesHook.addMessage({ kind: "error", text: `Failed to resume session: ${e.message}` });
+                } finally {
+                  setSessionSwitchBusy(false);
+                }
               }
             );
             return;
@@ -1321,30 +1447,57 @@ export function App({
             text: `Command failed: ${e.message}`,
           });
           return "retry" as const;
+        } finally {
+          if (ownsSessionCreation) setSessionSwitchBusy(false);
         }
         return;
       }
 
-      const currentStatus = await ensureSession();
-      await applyDeferredModelSwitch({ allowWhileStreamInFlight: true });
-      const outcome = await messagesHook.sendMessage(text);
-      if (outcome === "failed") return "retry" as const;
-      // A cancelled generation may settle after the next turn already started.
-      // Only the still-current completion is allowed to refresh session state.
-      if (outcome === "completed") {
-        const refreshedStatus = await session.refreshStatus();
-        await refreshActiveAgents(refreshedStatus ?? currentStatus);
+      const createsSession = !sessionStatusRef.current;
+      // Even an already-created session has an await gap before stream dispatch.
+      // Reserve it now so same-tick /clear cannot replace it before this prompt.
+      let ownsDispatchBarrier = true;
+      setSessionSwitchBusy(true);
+      try {
+        // The first prompt owns its session creation through round settlement.
+        // A /clear submitted while start_session is pending cannot overtake it.
+        const currentStatus = await ensureSession();
+        if (activeAgentName && activeAgentsReport?.runner_id !== currentStatus.runner_id) {
+          setActiveAgentName(null);
+          setActiveAgentsReport(null);
+        }
+        await applyDeferredModelSwitch({ allowWhileStreamInFlight: true });
+        streamInFlightRef.current = true;
+        const sending = messagesHook.sendMessage(text, undefined, currentStatus.runner_id);
+        if (!createsSession) {
+          // The synchronous in-flight ref now protects /clear while ordinary
+          // busy messages can keep using the existing persistent inbox.
+          ownsDispatchBarrier = false;
+          setSessionSwitchBusy(false);
+        }
+        const outcome = await sending;
+        if (outcome === "failed") return "retry" as const;
+        // A cancelled generation may settle after the next turn already started.
+        // Only the still-current completion is allowed to refresh session state.
+        if (outcome === "completed") {
+          const refreshedStatus = await session.refreshStatus();
+          await refreshActiveAgents(refreshedStatus ?? currentStatus);
+        }
+      } finally {
+        if (ownsDispatchBarrier) setSessionSwitchBusy(false);
       }
     },
-    [applyDeferredModelSwitch, activeAgentName, baseDir, client, ensureSession, messagesHook, openConfigPanel, pendingRuntime, queuedMessages.length, refreshActiveAgents, refreshCapabilityAliases, requestModeSwitch, runtimeModels, selector, session]
+    [activateResumedSession, applyDeferredModelSwitch, activeAgentName, activeAgentsReport, baseDir, client, ensureSession, messagesHook, openConfigPanel, pendingRuntime, queuedMessages, refreshActiveAgents, refreshCapabilityAliases, requestModeSwitch, resetSessionView, runtimeModels, selector, session, setSessionSwitchBusy, worktree]
   );
 
   const queueFlushInFlight = useRef(false);
-  const cronFireInFlight = useRef(false);
 
   useEffect(() => {
     if (
       messagesHook.streaming ||
+      messagesHook.streamInFlight ||
+      sessionSwitchInFlightRef.current ||
+      selector.isOpen ||
       queuedMessages.length === 0 ||
       queueFlushInFlight.current
     ) {
@@ -1362,79 +1515,24 @@ export function App({
       .finally(() => {
         queueFlushInFlight.current = false;
       });
-  }, [handleSubmit, messagesHook.streaming, queuedMessages]);
+  }, [handleSubmit, messagesHook.streaming, messagesHook.streamInFlight, queuedMessages, selector.isOpen, sessionSwitchInFlight]);
 
-  useEffect(() => {
-    if (
-      !shouldPollCron({
-        exitRequested,
-        streaming: messagesHook.streaming,
-        queuedCount: queuedMessages.length,
-        askPending: Boolean(pendingAsk),
-        configOpen: Boolean(configPanelLoading || configPanel || skillsConfigPanel),
-        selectorOpen: selector.isOpen,
-      })
-    ) {
-      return;
-    }
-
-    const tick = async () => {
-      if (cronFireInFlight.current) {
-        return;
-      }
-      cronFireInFlight.current = true;
-      try {
-        const result = await client.fireDueCronTasks({ base_dir: baseDir });
-        const fired = result.fired || [];
-        if (fired.length === 0) {
-          // 即使 cron 没事可做，也借这次心跳刷新一下任务徽标。
-          // 失败不打扰用户，吞掉异常。
-          try {
-            const tasks = await client.listAsyncTasks({ statuses: ["pending", "running"] });
-            setAsyncTasks(tasks);
-          } catch {
-            // ignore — 下一拍再试
-          }
-          return;
-        }
-        for (const task of fired) {
-          messagesHook.addMessage({
-            kind: "system",
-            title: "Cron",
-            text: `scheduled task fired: ${task.id} · ${task.cron}`,
-          });
-        }
-        setQueuedMessages((prev) => [...prev, ...fired.map((task) => task.prompt).filter(Boolean)]);
-      } catch (e: any) {
-        // 过滤掉锁竞争错误（多实例并发时正常现象，无需展示）
-        if (!e.message?.includes('cron lock is held')) {
-          messagesHook.addMessage({
-            kind: "error",
-            text: `Cron tick failed: ${e.message}`,
-          });
-        }
-      } finally {
-        cronFireInFlight.current = false;
-      }
-    };
-
-    const timer = setInterval(() => {
-      void tick();
-    }, 1000);
-    void tick();
-    return () => clearInterval(timer);
-  }, [
+  useCronPolling({
     baseDir,
     client,
-    configPanel,
-    exitRequested,
-    messagesHook,
-    messagesHook.streaming,
-    pendingAsk,
-    queuedMessages.length,
-    selector.isOpen,
-    skillsConfigPanel,
-  ]);
+    runnerId: session.status?.runner_id ?? "",
+    enabled: shouldPollCron({
+      exitRequested,
+      streaming: messagesHook.streaming || sessionSwitchInFlight,
+      queuedCount: queuedMessages.length,
+      askPending: Boolean(pendingAsk),
+      configOpen: Boolean(configPanelLoading || configPanel || skillsConfigPanel),
+      selectorOpen: selector.isOpen,
+    }),
+    addMessage: messagesHook.addMessage,
+    setAsyncTasks,
+    setQueuedMessages,
+  });
 
   const handleTab = useCallback(
     (cursor: number) => completion.accept(inputValue, cursor),
@@ -1534,8 +1632,10 @@ export function App({
       return;
     }
     tasksDialog.open();
+    const revision = sessionRevisionRef.current;
     try {
       const tasks = await client.listAsyncTasks({ statuses: ["pending", "running"] });
+      if (revision !== sessionRevisionRef.current) return;
       setAsyncTasks(tasks);
     } catch {
       // 静默失败：列表会显示当前缓存的快照，cron 轮询下次还会刷新。
@@ -1872,6 +1972,7 @@ export function App({
       >
         {transcriptWindowSize > 0 ? (
           <VirtualScrollList<RowVM>
+            key={`${session.status?.runner_id ?? "preview"}:${activeAgentName ?? "root"}`}
             rows={transcriptRows}
             viewportHeight={transcriptWindowSize}
             rowKey={(r) => r.key}
@@ -1886,7 +1987,7 @@ export function App({
       <CurrentWorkStatus
         streaming={messagesHook.streaming}
         interactive={currentWorkStatusInteractive}
-        summary={commandStatus?.summary}
+        summary={messagesHook.stopping ? "正在停止…" : commandStatus?.summary}
         items={commandStatus?.items}
         lifecycleEvent={messagesHook.lifecycleEvent}
       />

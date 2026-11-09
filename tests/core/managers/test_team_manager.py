@@ -176,3 +176,78 @@ def test_recovery_keeps_failed_claim_for_root_review(tmp_path: Path) -> None:
     restored.fail_task(task["task_id"], "alice", error="cancelled")
     assert restored.list_tasks()[0]["status"] == "in_progress"
     assert restored.has_pending_work() is True
+
+
+def test_broadcast_freezes_active_peers_with_independent_acknowledgements(tmp_path: Path) -> None:
+    manager = TeamManager(tmp_path / "team", ["alice", "bob", "closed"], team_run_id="run-a")
+    manager.close_member("closed")
+    broadcast = manager.send_message("alice", "*", "Review now")
+    receipts = broadcast["receipts"]
+
+    assert {item["to"] for item in receipts} == {"root", "bob"}
+    assert len({item["message_id"] for item in receipts}) == 2
+    assert {item["broadcast_id"] for item in receipts} == {broadcast["broadcast_id"]}
+    assert all(item["team_run_id"] == "run-a" and item["target_generation"] == 1 for item in receipts)
+    manager.create_member("later")
+    assert manager.pending_messages("later") == []
+    root_copy = manager.pending_messages("root")[0]
+    manager.ack_messages("root", [root_copy["message_id"]])
+    assert manager.pending_messages("root") == []
+    assert len(manager.pending_messages("bob")) == 1
+    restored = TeamManager(tmp_path / "team", team_run_id="run-a")
+    assert restored.pending_messages("bob")[0]["broadcast_id"] == broadcast["broadcast_id"]
+
+
+def test_broadcast_closed_copy_is_not_redirected_and_old_generation_is_failed(tmp_path: Path) -> None:
+    manager = TeamManager(tmp_path / "team", ["alice", "bob"])
+    broadcast = manager.send_message("alice", "*", "Broadcast")
+    bob_copy = next(item for item in broadcast["receipts"] if item["to"] == "bob")
+    manager.close_member("bob")
+    assert len(manager.pending_messages("root")) == 1
+    assert manager.pending_messages("bob") == []
+    closed_copy = next(item for item in manager.snapshot()["messages"] if item["message_id"] == bob_copy["message_id"])
+    assert closed_copy["to"] == "bob"
+    assert closed_copy["delivery_state"] == "failed"
+    assert closed_copy["delivery_error"] == "target_closed"
+    manager.restart_member("bob")
+    assert not manager.message_target_valid(bob_copy)
+    fresh = manager.send_message("root", "bob", "Fresh")
+    assert fresh["target_generation"] == 2
+    manager.restart_member("bob")
+    assert manager.pending_messages("bob") == []
+    failed = next(item for item in manager.snapshot()["messages"] if item["message_id"] == fresh["message_id"])
+    assert failed["delivery_error"] == "target_generation_changed"
+
+
+def test_broadcast_reports_partial_failure_and_empty_snapshot(tmp_path: Path) -> None:
+    manager = TeamManager(tmp_path / "team", ["alice", "bob"])
+
+    def delivery(change: dict) -> None:
+        if change["update"]["type"] != "message_sent":
+            return
+        for message in change["snapshot"]["messages"]:
+            if message["to"] == "bob":
+                manager.mark_message_failed(message["message_id"], "target_corrupt")
+
+    manager._on_change = delivery
+    result = manager.send_message("root", "*", "Hello")
+    assert {item["to"]: item["delivery_state"] for item in result["receipts"]} == {
+        "alice": "pending", "bob": "failed",
+    }
+    assert len(manager.pending_messages("alice")) == 1
+    assert manager.pending_messages("bob") == []
+    alone = TeamManager(tmp_path / "alone")
+    assert alone.send_message("root", "*", "Nobody yet")["receipts"] == []
+
+
+def test_recovery_preserves_claim_when_runner_restores_agent_round(tmp_path: Path) -> None:
+    manager = TeamManager(tmp_path / "team", ["alice"])
+    task = manager.add_task("Resume")
+    manager.claim_task(task["task_id"], "alice")
+    manager.set_member_busy("alice", True)
+    restored = TeamManager(tmp_path / "team")
+    restored.recover(preserve_claims=True)
+    assert restored.snapshot()["members"][1]["busy"] is False
+    assert restored.list_tasks()[0]["status"] == "in_progress"
+    assert restored.list_tasks()[0]["error"] == ""
+    assert restored.pending_messages("root") == []

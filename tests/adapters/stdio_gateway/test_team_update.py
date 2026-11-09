@@ -8,58 +8,24 @@ from juice_agents.core.config.context import ConfigurationContext
 from juice_agents.core.registry import AgentRegistry
 
 
-def test_team_update_serializes_snapshot_into_shared_wire_envelope() -> None:
-    event = serialize_runner_stream_event(
-        {
-            "kind": "team_update",
-            "runner_id": "run-1",
-            "mode_id": "team",
-            "team_name": "alpha",
-            "agent_name": "root",
-            "update": {"type": "task_completed", "task_id": "task-1"},
-            "snapshot": {
-                "tasks": [
-                    {
-                        "task_id": "task-1",
-                        "title": "Review",
-                        "eligible_members": ["writer", "reviewer"],
-                        "claimed_by": "reviewer",
-                        "status": "completed",
-                        "dependencies": [],
-                    }
-                ],
-                "members": [{"name": "writer", "status": "idle"}],
-                "finished": False,
-            },
-        }
-    )
-
-    assert event["agent_mode"] == "team"
-    assert event["agent_name"] == "root"
-    assert event["team_event"] == {
-        "team_name": "alpha",
-        "actor": "root",
+def test_team_update_preserves_public_data_without_a_second_envelope() -> None:
+    data = {
+        "team_name": "alpha", "actor": "root",
         "update": {"type": "task_completed", "task_id": "task-1"},
         "snapshot": {
-            "tasks": [
-                {
-                    "task_id": "task-1",
-                    "title": "Review",
-                    "eligible_members": ["writer", "reviewer"],
-                    "claimed_by": "reviewer",
-                    "status": "completed",
-                    "dependencies": [],
-                }
-            ],
+            "tasks": [{"task_id": "task-1", "claimed_by": "reviewer", "status": "completed"}],
             "members": [{"name": "writer", "status": "idle"}],
             "finished": False,
         },
     }
-
-
-def test_team_update_keeps_existing_envelope() -> None:
-    team_event = {"actor": "root", "update": {"phase": "running"}}
-    assert serialize_runner_stream_event({"kind": "team_update", "team_event": team_event})["team_event"] == team_event
+    event = serialize_runner_stream_event({
+        "kind": "team_update", "event_id": "event-1", "timestamp": 123.5,
+        "runner_id": "run-1", "agent_name": "root", "agent_id": "root-1",
+        "agent_role": "root", "round_id": "round-1", "data": data,
+    })
+    assert event["data"] == data
+    assert event["agent_name"] == "root"
+    assert "team_event" not in event
 
 
 def test_stdio_team_config_defaults_to_empty_members() -> None:

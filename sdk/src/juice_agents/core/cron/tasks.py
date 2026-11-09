@@ -144,11 +144,18 @@ def fire_due_cron_tasks(workspace_dir: str | Path, now: float | None = None) -> 
     """
     Mark due tasks as fired and return prompts to execute.
 
-    The store update happens under a short file lock so concurrent CLI
-    instances do not return the same due task twice.
+    Idle polls only read the store. Due tasks are checked again under a short
+    file lock so concurrent CLI instances do not return the same task twice.
     """
 
     current = time.time() if now is None else float(now)
+    # The unlocked snapshot is only an idle fast path: avoid creating a lock
+    # file (or even .juice/) when there is nothing to claim. Another instance
+    # may claim these tasks before we acquire the lock, so the locked read and
+    # due checks below remain the authoritative decision.
+    if not any(_is_due(task, current) for task in _read_tasks_unlocked(workspace_dir)):
+        return []
+
     with acquire_cron_lock(workspace_dir, owner="cron_fire", timeout_seconds=0.2):
         tasks = _read_tasks_unlocked(workspace_dir)
         fired: list[dict[str, Any]] = []

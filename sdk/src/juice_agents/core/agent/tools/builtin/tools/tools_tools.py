@@ -53,7 +53,6 @@ class ToolConfigToolBase(Tool):
 
 
 class ToolsListTool(ToolConfigToolBase):
-    _execution_mode = "parallel_safe"
     max_observation_chars = LIST_OBSERVATION_CHARS
     name = "tools_list"
     is_read_only = True
@@ -71,7 +70,6 @@ class ToolsListTool(ToolConfigToolBase):
 
 
 class ToolViewTool(ToolConfigToolBase):
-    _execution_mode = "parallel_safe"
     max_observation_chars = CONTENT_OBSERVATION_CHARS
     name = "tool_view"
     is_read_only = True

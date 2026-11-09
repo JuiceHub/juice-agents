@@ -1,7 +1,6 @@
 /**
- * Shared gateway protocol types consumed by the CLI and browser app.
- */
-
+* Shared gateway protocol types consumed by the CLI and browser app.
+*/
 export interface SessionStatus {
   runner_id: string;
   /** 审批策略维度：default | accept */
@@ -20,7 +19,6 @@ export interface SessionStatus {
   goal?: GoalSummary | null;
   worktree?: WorktreeStatus | null;
 }
-
 export interface PendingSessionRuntime {
   base_dir: string;
   permission_mode: string;
@@ -29,13 +27,11 @@ export interface PendingSessionRuntime {
   model_name: string;
   model_effort: string;
 }
-
 /** Per-step candidates; reward model selection is configured independently. */
 export interface StrategyConfiguration {
   breadth?: number;
   reset?: boolean;
 }
-
 /** Reward model state returned by configure_reward_model, including effective execution. */
 export interface RewardModelConfiguration {
   model_name: string | null;
@@ -43,18 +39,18 @@ export interface RewardModelConfiguration {
   breadth: number;
   execution: "linear" | "candidate_selection";
 }
-
 export interface StrategySwitchResult {
   status: "pending" | "applied";
   strategy: {
     type: "greedy" | "exploration";
-    params: { breadth?: number };
+    params: {
+      breadth?: number;
+    };
     execution: "linear" | "candidate_selection";
     scorer_configured: boolean;
   };
   message: string;
 }
-
 export interface WorktreeStatus {
   name: string;
   slug: string;
@@ -69,12 +65,10 @@ export interface WorktreeStatus {
   temporary: boolean;
   error: string;
 }
-
 export interface WorktreeListResponse {
   worktrees: WorktreeStatus[];
   count: number;
 }
-
 export interface GoalSummary {
   objective: string;
   status: "active" | "paused" | "completed" | "budget_limited" | string;
@@ -85,7 +79,6 @@ export interface GoalSummary {
   latest_evaluator_reason: string;
   pause_reason?: string;
 }
-
 export interface RuntimeModelInfo {
   model_name: string;
   backend: string;
@@ -96,7 +89,20 @@ export interface RuntimeModelInfo {
   thinking_mode?: "adaptive" | "manual" | "none" | string;
   supports_budget_tokens?: boolean;
 }
-
+/** Public image catalog metadata; credentials are resolved only by the gateway. */
+export interface RuntimeImageModelInfo {
+  model_name: string;
+  provider: string;
+  backend: string;
+  provider_model_name: string;
+  api_base?: string;
+  api_key_env?: string;
+}
+export interface ImageModelsResponse {
+  image_models: RuntimeImageModelInfo[];
+  current_image_model_name: string;
+  image_enabled: boolean;
+}
 export interface SessionSummary {
   runner_id: string;
   permission_mode: string;
@@ -108,12 +114,10 @@ export interface SessionSummary {
   goal_status?: string;
   goal_objective_preview?: string;
 }
-
 export interface ObservationImage {
   image_url: string;
   description: string;
 }
-
 export interface ToolCallDisplay {
   name: string;
   args: Record<string, any>;
@@ -122,15 +126,22 @@ export interface ToolCallDisplay {
   observation_index: number | null;
   is_terminal: boolean;
   max_observation_chars?: number | null;
+  call_id?: string;
+  task_id?: string;
+  error?: string | null;
+  execution_time?: number | null;
 }
-
 export interface AskOption {
   label: string;
   value: string;
   description?: string;
 }
-
 export interface AskRequest {
+    runner_id?: string;
+    agent_id?: string;
+    round_id?: string | null;
+    /** The synchronous caller whose cancellation also stops this interaction. */
+    cancellation_round_id?: string | null;
   request_id: string;
   question: string;
   options: AskOption[];
@@ -138,7 +149,6 @@ export interface AskRequest {
   allow_custom: boolean;
   timeout_seconds?: number | null;
 }
-
 export interface AskResponse {
   status: "answered" | "cancelled" | "error";
   request_id: string;
@@ -147,8 +157,9 @@ export interface AskResponse {
   custom_response: string;
   error: string;
 }
-
 export interface ActionStep {
+ round_id?: string;
+ step_id?: string;
   step_num: number;
   model_output: string;
   thought: string;
@@ -165,23 +176,18 @@ export interface ActionStep {
   round_outcome: "continue" | "submitted" | "failed";
   output: unknown;
 }
-
-export type ActiveAgentStep =
-  | {
-      type: "task";
-      task: string;
-      task_images?: Record<string, any>[];
-      attachments?: Record<string, any>[];
-    }
-  | ({
-      type: "action";
-    } & ActionStep)
-  | {
-      type: "summary";
-      content: string;
-    }
-  | Record<string, any>;
-
+export type ActiveAgentStep = {
+  type: "task";
+  round_id?: string;
+  task: string;
+  task_images?: Record<string, any>[];
+  attachments?: Record<string, any>[];
+} | ({
+  type: "action";
+} & ActionStep) | {
+  type: "summary";
+  content: string;
+} | Record<string, any>;
 export interface ActiveAgentSnapshot {
   agent_id: string;
   agent_name: string;
@@ -193,8 +199,9 @@ export interface ActiveAgentSnapshot {
   metadata: Record<string, any>;
   session: Record<string, any>;
   steps: ActiveAgentStep[];
+  /** Backend inbox projection for accepted inputs not yet saved in a step. */
+  pending_messages?: Record<string, any>[];
 }
-
 export interface ActiveAgentsReport {
   runner_id: string;
   permission_mode: string;
@@ -202,7 +209,6 @@ export interface ActiveAgentsReport {
   root_agent_name: string;
   agents: ActiveAgentSnapshot[];
 }
-
 export interface SendAgentMessageResponse {
   accepted: boolean;
   agent_name: string;
@@ -212,7 +218,6 @@ export interface SendAgentMessageResponse {
   status?: string;
   error?: string;
 }
-
 export interface InterruptAgentResponse {
   interrupted: boolean;
   agent_name: string;
@@ -220,7 +225,6 @@ export interface InterruptAgentResponse {
   status: "interrupted" | "idle" | "not_live" | string;
   reason: string;
 }
-
 /** Public snapshot returned by the runner async-task control plane. */
 export interface AsyncTaskState {
   async_task_id: string;
@@ -237,7 +241,6 @@ export interface AsyncTaskState {
   error: string;
   metadata: Record<string, any>;
 }
-
 export interface AsyncTaskOutput {
   async_task_id: string;
   output_dir: string;
@@ -248,8 +251,10 @@ export interface AsyncTaskOutput {
   stderr_tail: string;
   max_lines: number;
 }
-
 export interface RunnerLifecycleEvent {
+ round_id?: string;
+ agent_id?: string;
+  call_id?: string;
   scope: string;
   event: string;
   workflow_name?: string;
@@ -260,7 +265,6 @@ export interface RunnerLifecycleEvent {
   total?: number;
   detail?: string;
 }
-
 /** Task eligibility is fixed when the root creates a task; claimed_by records execution. */
 export interface TeamTaskSnapshot {
   task_id: string;
@@ -273,13 +277,11 @@ export interface TeamTaskSnapshot {
   result?: string;
   error?: string;
 }
-
 export interface TeamMemberSnapshot {
   name: string;
   status: string;
   busy?: boolean;
 }
-
 /** TeamManager owns this snapshot; both gateways forward it unchanged. */
 export interface TeamStreamEvent {
   team_name?: string;
@@ -292,71 +294,137 @@ export interface TeamStreamEvent {
     finished?: boolean;
   };
 }
-
-export interface RunnerStreamEvent {
-  kind: "action_step" | "action_event" | "team_update" | "runner_lifecycle" | "round_end" | "stream_cancelled";
-  permission_mode: string;
-  agent_mode: string;
-  runner_id: string;
-  agent_name: string | null;
-  agent_role: string | null;
-  step_num: number | null;
-  action_step: ActionStep | null;
-  // action_event 字段
-  event_type?: string; // "thinking" | "tool_start" | "tool_end" | "step_complete"
-  data?: Record<string, any>;
-  // 原有字段
-  team_event: TeamStreamEvent | null;
-  lifecycle_event?: RunnerLifecycleEvent | null;
+/** Instance state and round outcome are deliberately separate contracts. */
+export type AgentStatus = "idle" | "running" | "released";
+export interface RoundResult {
   round_id: string;
-  outcome?: "submitted" | "failed" | "";
-  output?: unknown;
-  reason?: string;
-  stop_reason?: string;
-  agent_sessions_report?: ActiveAgentsReport | null;
+  status: "completed" | "failed" | "cancelled";
+  output: unknown;
+  reason: string;
+  error: string | null;
 }
-
+export interface AgentStateData {
+  status: AgentStatus;
+  lifecycle?: "persistent" | "functional";
+  is_root?: boolean;
+  round_checkpoint?: {
+    round_id?: string;
+    status?: string;
+    [key: string]: unknown;
+  } | null;
+}
+/** A public event is one typed fact, never a full session/storage projection. */
+export interface RunnerEventData {
+  agent_state: AgentStateData;
+  /** Accepted durable inbox input; delivery may still await a safe boundary. */
+  message_received: {
+    attachments: Record<string, any>[];
+  };
+  round_start: {
+    message_ids?: string[];
+    resumed?: boolean;
+    input?: { task: string; attachments?: Record<string, any>[] };
+    [key: string]: unknown;
+  };
+  round_end: {
+    result: RoundResult;
+  };
+  step_start: Record<string, unknown>;
+  step_end: {
+    step: ActionStep;
+  };
+  model_start: {
+    model_call_id: string;
+    purpose: "generation" | "scoring" | "compression";
+    [key: string]: unknown;
+  };
+  model_end: {
+    model_call_id: string;
+    purpose: "generation" | "scoring" | "compression";
+    status?: string;
+    [key: string]: unknown;
+  };
+  thinking: {
+    thought?: string;
+    content?: string;
+    [key: string]: unknown;
+  };
+  tool_start: {
+    call_id: string;
+    tool_name: string;
+    tool_args?: Record<string, unknown>;
+    execution_mode?: string;
+    [key: string]: any;
+  };
+  tool_end: {
+    call_id: string;
+    tool_name?: string;
+    status: string;
+    observation?: unknown;
+    error?: string | null;
+    [key: string]: any;
+  };
+  workflow_progress: RunnerLifecycleEvent;
+  team_update: TeamStreamEvent;
+  message_deferred: {
+    message_id?: string;
+    message_ids?: string[];
+    [key: string]: unknown;
+  };
+}
+export type RunnerStreamEvent = {
+  [K in keyof RunnerEventData]: {
+    kind: K;
+    data: RunnerEventData[K];
+    event_id: string;
+    timestamp: number;
+    runner_id: string;
+    agent_id: string;
+    agent_name: string;
+    agent_role: string;
+    round_id?: string | null;
+    step_num?: number | null;
+    permission_mode?: string;
+    agent_mode?: string;
+  };
+}[keyof RunnerEventData];
 export interface StreamMessageResult {
   done: true;
-  stopped?: boolean;
-  stop_reason?: string;
+  result: RoundResult;
 }
-
-/** stdio notifications carry the originating JSON-RPC request explicitly. */
+/** Permanent subscriptions omit request_id; scoped notifications identify an RPC. */
 export interface StreamStepNotification {
-  request_id: number | string | null;
+  request_id?: number | string | null;
   event: RunnerStreamEvent;
 }
-
 export interface AskRequestNotification {
-  request_id: number | string | null;
+  request_id?: number | string | null;
   request: AskRequest;
 }
-
 export interface JsonRpcRequest {
   jsonrpc: "2.0";
   id: number | string;
   method: string;
   params: Record<string, any>;
 }
-
 export interface JsonRpcResponse {
   jsonrpc: "2.0";
   id: number | string;
   result?: any;
-  error?: { code: number; message: string };
+  error?: {
+    code: number;
+    message: string;
+  };
 }
-
 export interface JsonRpcNotification {
   jsonrpc: "2.0";
   method: string;
   params: any;
 }
-
 /** Layered read results and sparse project patches share the same YAML shape.
- * load_effective_config reads defaults → user → project → launch overrides;
- * save_workspace_config accepts only fields the user actually changed.
- */
+* load_effective_config reads defaults → user → project → launch overrides;
+* save_workspace_config accepts only fields the user actually changed.
+*/
 export interface WorkspaceRuntimeConfig {
   runtime?: {
     permission_mode?: string;
@@ -376,6 +444,7 @@ export interface WorkspaceRuntimeConfig {
   };
   image?: {
     enabled?: boolean;
+    model_name?: string;
   };
   self_evolution?: {
     enabled?: boolean;
@@ -385,22 +454,19 @@ export interface WorkspaceRuntimeConfig {
   };
   [key: string]: any;
 }
-
 export interface BrowserConfigResponse {
   enabled: boolean;
   runner_id: string;
 }
-
 export interface ImageConfigResponse {
   enabled: boolean;
   runner_id: string;
+  image_model_name: string;
 }
-
 export interface CapabilityConfigResponse {
   success: boolean;
   enabled: boolean;
 }
-
 export interface SkillInfo {
   name: string;
   qualified_name: string;
@@ -415,7 +481,6 @@ export interface SkillInfo {
   conditions?: Record<string, string[]>;
   metadata?: Record<string, any>;
 }
-
 export interface SkillsListResponse {
   success: boolean;
   skills: SkillInfo[];
@@ -424,7 +489,6 @@ export interface SkillsListResponse {
   count: number;
   hint?: string;
 }
-
 export interface PluginInfo {
   schema_version: number;
   name: string;
@@ -438,7 +502,6 @@ export interface PluginInfo {
   skill_names: string[];
   [key: string]: any;
 }
-
 export interface PluginsListResponse {
   success: boolean;
   plugins: PluginInfo[];
@@ -446,7 +509,6 @@ export interface PluginsListResponse {
   count: number;
   hint?: string;
 }
-
 export interface PluginViewResponse {
   success: boolean;
   name: string;
@@ -454,11 +516,10 @@ export interface PluginViewResponse {
   file_path?: string | null;
   content?: string;
 }
-
 /**
- * A declaration visible to the current Runner/mode. Root is deliberately
- * omitted from child discovery even though Registry also resolves its declaration.
- */
+* A declaration visible to the current Runner/mode. Root is deliberately
+* omitted from child discovery even though Registry also resolves its declaration.
+*/
 export interface AvailableAgentInfo {
   name: string;
   description: string;
@@ -467,12 +528,10 @@ export interface AvailableAgentInfo {
   /** Serialized effective AgentConfig, rendered on `/agents <name>`. */
   config: Record<string, unknown>;
 }
-
 export interface AvailableAgentsResponse {
   mode_id: string;
   agents: AvailableAgentInfo[];
 }
-
 /** A read-only summary of a schema-2 Team manifest. */
 export interface TeamInfo {
   team_name: string;
@@ -481,11 +540,9 @@ export interface TeamInfo {
   source: "local" | "builtin";
   manifest_path: string | null;
 }
-
 export interface TeamsListResponse {
   teams: TeamInfo[];
 }
-
 /** Full Team relationship returned by `/teams <name>`. */
 export interface TeamManifest {
   schema_version: number;
@@ -497,11 +554,9 @@ export interface TeamManifest {
   /** Explicit shared Agent sources; omitted by legacy all-shared manifests. */
   shared_agent_names?: Record<string, string>;
 }
-
 export interface SkillConfigInfo extends SkillInfo {
   enabled: boolean;
 }
-
 export interface SkillsConfigStatusResponse {
   success: boolean;
   enabled: boolean;
@@ -509,7 +564,6 @@ export interface SkillsConfigStatusResponse {
   skills: SkillConfigInfo[];
   count: number;
 }
-
 export interface SkillViewResponse {
   success: boolean;
   name?: string;
@@ -523,7 +577,6 @@ export interface SkillViewResponse {
   available_files?: string[];
   error?: string;
 }
-
 export interface MemoryStatusResponse {
   enabled: boolean;
   dream_enabled: boolean;
@@ -536,26 +589,22 @@ export interface MemoryStatusResponse {
   eligible_session_count?: number;
   dream_lock_owner?: string;
 }
-
 export interface MemorySearchHit {
   path: string;
   line: number;
   snippet: string;
 }
-
 export interface MemorySearchResponse {
   enabled?: boolean;
   hits: MemorySearchHit[];
   error?: string;
 }
-
 export interface MemoryViewResponse {
   enabled?: boolean;
   path: string;
   content: string;
   error?: string;
 }
-
 export interface DreamRunResponse {
   status: string;
   async_task_id?: string;
@@ -566,7 +615,6 @@ export interface DreamRunResponse {
   error?: string;
   lock_owner?: string;
 }
-
 export interface CronTask {
   id: string;
   cron: string;
@@ -577,20 +625,16 @@ export interface CronTask {
   next_run_at?: number | null;
   fired_at?: number;
 }
-
 export interface CronTaskListResponse {
   tasks: CronTask[];
 }
-
 export interface CronTaskFireResponse {
   fired: CronTask[];
 }
-
 export interface CronTaskDeleteResponse {
   deleted: boolean;
   id: string;
 }
-
 export interface CronStatusResponse {
   enabled: boolean;
   tasks_path: string;
@@ -599,7 +643,6 @@ export interface CronStatusResponse {
   next_run_at?: number | null;
   lock_present: boolean;
 }
-
 export interface BrowserPreview {
   connected: boolean;
   title: string;
@@ -618,79 +661,39 @@ export interface BrowserPreview {
   };
   stream_state?: "empty" | "artifact" | "live" | "error" | string;
 }
-
 export interface BrowserTabInfo {
   tab_id: string;
   url: string;
   title: string;
   active: boolean;
 }
-
 export interface FileTreeNode {
   name: string;
   path: string;
   type: "directory" | "file";
   children?: FileTreeNode[];
 }
-
 export interface ClientCommand {
   id: string;
-  type:
-    | "start_session"
-    | "resume_session"
-    | "describe_session"
-    | "switch_permission_mode"
-    | "switch_agent_mode"
-    | "switch_model"
-    | "list_models"
-    | "stream_message"
-    | "answer_ask"
-    | "list_sessions"
-    | "archive_runner"
-    | "restore_runner"
-    | "list_archived_sessions"
-    | "stop_session"
-    | "cancel_stream"
-    | "list_skills"
-    | "list_plugins"
-    | "list_available_agents"
-    | "list_team_configs"
-    | "get_team_config"
-    | "view_skill"
-    | "view_plugin"
-    | "skills_config_status"
-    | "set_skills_config"
-    | "self_evolution_config_status"
-    | "set_self_evolution_config"
-    | "workflows_config_status"
-    | "set_workflows_config"
-    | "set_image_config"
-    | "memory_status"
-    | "memory_search"
-    | "memory_view"
-    | "run_dream"
-    | "goal_status"
-    | "set_goal"
-    | "get_goal"
-    | "pause_goal"
-    | "resume_goal"
-    | "clear_goal"
-    | "create_cron_task"
-    | "list_cron_tasks"
-    | "delete_cron_task"
-    | "cron_status"
-    | "list_workflows"
-    | "view_workflow"
-    | "run_workflow"
-    | "permission_status"
-    | "describe_agent_sessions"
-    | "send_agent_message"
-    | "interrupt_agent";
+  type: "start_session" | "resume_session" | "activate_session" | "describe_session" | "switch_permission_mode" | "switch_agent_mode" | "switch_model" | "list_models" | "list_image_models" | "stream_message" | "answer_ask" | "list_sessions" | "archive_runner" | "restore_runner" | "list_archived_sessions" | "stop_session" | "cancel_stream" | "list_skills" | "list_plugins" | "list_available_agents" | "list_team_configs" | "get_team_config" | "view_skill" | "view_plugin" | "skills_config_status" | "set_skills_config" | "self_evolution_config_status" | "set_self_evolution_config" | "workflows_config_status" | "set_workflows_config" | "set_image_config" | "memory_status" | "memory_search" | "memory_view" | "run_dream" | "goal_status" | "set_goal" | "get_goal" | "pause_goal" | "resume_goal" | "clear_goal" | "create_cron_task" | "list_cron_tasks" | "delete_cron_task" | "cron_status" | "list_workflows" | "view_workflow" | "run_workflow" | "permission_status" | "describe_agent_sessions" | "send_agent_message" | "interrupt_agent";
   payload?: Record<string, unknown>;
 }
-
-export type ServerEvent =
-  | { id: string; type: "result"; payload: unknown }
-  | { id: string; type: "error"; error: { message: string } }
-  | { id: string; type: "stream_step"; payload: RunnerStreamEvent }
-  | { id?: string; type: "ask_request"; payload: AskRequest };
+export type ServerEvent = {
+  id: string;
+  type: "result";
+  payload: unknown;
+} | {
+  id: string;
+  type: "error";
+  error: {
+    message: string;
+  };
+} | {
+  id: string;
+  type: "stream_step";
+  payload: RunnerStreamEvent;
+} | {
+  id?: string;
+  type: "ask_request";
+  payload: AskRequest;
+};
